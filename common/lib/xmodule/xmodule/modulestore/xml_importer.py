@@ -588,7 +588,7 @@ def _import_course_draft(
                             sequential = store.get_item(seq_location, depth=0)
 
                             non_draft_location = module.location.map_into_course(target_course_id)
-                            if non_draft_location not in sequential.children:
+                            if not any(child.block_id == module.location.block_id for child in sequential.children):
                                 sequential.children.insert(index, non_draft_location)
                                 store.update_item(sequential, user_id)
 

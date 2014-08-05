@@ -213,9 +213,9 @@ class CourseComparisonTest(unittest.TestCase):
         else:
             revision = None
         actual_items = actual_store.get_items(actual_course_key, revision=revision)
-        self._assertCoursesEqual(expected_items, actual_items, actual_course_key)
+        self._assertCoursesEqual(expected_items, actual_items, actual_course_key, expect_drafts=True)
 
-    def _assertCoursesEqual(self, expected_items, actual_items, actual_course_key):
+    def _assertCoursesEqual(self, expected_items, actual_items, actual_course_key, expect_drafts=False):
         self.assertEqual(len(expected_items), len(actual_items))
 
         actual_item_map = {
@@ -264,7 +264,6 @@ class CourseComparisonTest(unittest.TestCase):
             # compare children
             self.assertEqual(expected_item.has_children, actual_item.has_children)
             if expected_item.has_children:
-                expect_drafts = getattr(expected_item, 'is_draft', getattr(actual_item, 'is_draft', False))
                 expected_children = [
                     course1_item_child.location.map_into_course(actual_item.location.course_key)
                     for course1_item_child in expected_item.get_children()
