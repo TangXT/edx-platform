@@ -328,33 +328,3 @@ class CourseComparisonTest(unittest.TestCase):
 
         self._assertAssetsEqual(expected_course_key, expected_thumbs, actual_course_key, actual_thumbs)
 
-    def compute_real_state(self, store, item):
-        """
-        In draft mongo, compute_published_state can return draft when the draft == published, but in split,
-        it'll return public in that case
-        """
-        supposed_state = store.compute_publish_state(item)
-        if supposed_state == PublishState.draft and isinstance(item.runtime.modulestore, DraftModuleStore):
-            # see if the draft differs from the published
-            published = store.get_item(item.location, revision=ModuleStoreEnum.RevisionOption.published_only)
-            if item.get_explicitly_set_fields_by_scope() != published.get_explicitly_set_fields_by_scope():
-                # checking content: if published differs from item, return draft
-                return supposed_state
-            if item.get_explicitly_set_fields_by_scope(Scope.settings) != published.get_explicitly_set_fields_by_scope(Scope.settings):
-                # checking settings: if published differs from item, return draft
-                return supposed_state
-            if item.has_children and item.children != published.children:
-                # checking children: if published differs from item, return draft
-                return supposed_state
-            # published == item in all respects, so return public
-            return PublishState.public
-        elif supposed_state == PublishState.public and item.location.category in DIRECT_ONLY_CATEGORIES:
-            if not all([
-                store.has_item(child_loc, revision=ModuleStoreEnum.RevisionOption.draft_only)
-                for child_loc in item.children
-            ]):
-                return PublishState.draft
-            else:
-                return supposed_state
-        else:
-            return supposed_state
