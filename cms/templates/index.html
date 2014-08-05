@@ -136,7 +136,7 @@ require(["domReady!", "jquery", "jquery.form", "js/index"], function(doc, $) {
           <h3 class="title">Courses Being Processed</h3>
 
           <ul class="list-courses">
-            %for display_name, org, num, run, state_failed, state_in_progress in sorted(unsucceeded_course_actions, key=lambda s: s[0].lower() if s[0] is not None else ''):
+            %for display_name, org, num, run, state_failed, state_in_progress, dismiss_link in sorted(unsucceeded_course_actions, key=lambda s: s[0].lower() if s[0] is not None else ''):
             <!-- STATE: re-run is processing -->
             %if state_in_progress:
             <li class="wrapper-course has-status">
@@ -210,7 +210,7 @@ require(["domReady!", "jquery", "jquery.form", "js/index"], function(doc, $) {
 
                 <ul  class="status-actions">
                   <li class="action action-dismiss">
-                    <a href="#" class="button dismiss-button">
+                    <a href="#" class="button dismiss-button" data-dismiss-link="${dismiss_link}">
                       <i class="icon icon-remove-sign"></i>
                       <span class="button-copy">${_("Dismiss")}</span>
                     </a>

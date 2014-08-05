@@ -388,6 +388,9 @@ def course_listing(request):
             uca.course_key.run,
             True if uca.state == CourseRerunUIStateManager.State.FAILED else False,
             True if uca.state == CourseRerunUIStateManager.State.IN_PROGRESS else False,
+            reverse_course_url('course_notifications_handler', uca.course_key, kwargs={
+                'action_state_id': uca.id,
+            }) if uca.state == CourseRerunUIStateManager.State.FAILED else ''
         )
 
     # remove any courses in courses that are also in the unsucceeded_course_actions list
@@ -442,7 +445,9 @@ def course_index(request, course_key):
         'new_subsection_category': 'sequential',
         'new_unit_category': 'vertical',
         'category': 'vertical',
-        'rerun_notification_id': current_action.id if current_action else None,
+        'notification_dismiss_url': reverse_course_url('course_notifications_handler', current_action.course_key, kwargs={
+                'action_state_id': current_action.id,
+            }) if current_action else None,
     })
 
 
