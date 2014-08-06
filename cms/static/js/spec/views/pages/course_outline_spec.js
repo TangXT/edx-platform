@@ -575,7 +575,7 @@ define(["jquery", "js/spec_helpers/create_sinon", "js/spec_helpers/view_helpers"
             // Note: most tests for units can be found in Bok Choy
             describe("Unit", function() {
                 var getMockCourseJSON, createCourseOutlinePageAndShowUnit,
-                    verifyPublishButtonIsEnabled;
+                    verifyPublishButton;
 
                 getMockCourseJSON = function (options) {
                     // Contains hard-coded dates because dates are presented in different formats.
@@ -593,9 +593,9 @@ define(["jquery", "js/spec_helpers/create_sinon", "js/spec_helpers/view_helpers"
                     expandItemsAndVerifyState('subsection');
                 };
 
-                verifyPublishButtonIsEnabled = function (test, courseJSON, createOnly) {
+                verifyPublishButton = function (test, courseJSON, createOnly) {
                     createCourseOutlinePageAndShowUnit.apply(this, arguments);
-                    expect(getItemHeaders('unit').find('.publish-button')).not.toHaveClass('is-disabled');
+                    expect(getItemHeaders('unit').find('.publish-button')).toExist();
                 };
 
                 it('can be deleted', function() {
@@ -611,7 +611,10 @@ define(["jquery", "js/spec_helpers/create_sinon", "js/spec_helpers/view_helpers"
                 });
 
                 it('can be published', function() {
-                    var promptSpy = view_helpers.createPromptSpy();
+                    var promptSpy = view_helpers.createPromptSpy(),
+                        mockCourseJSON = getMockCourseJSON({
+                            has_changes: true
+                        });
                     createCourseOutlinePageAndShowUnit(this, mockCourseJSON);
                     getItemHeaders('unit').find('.publish-button').click();
                     view_helpers.confirmPrompt(promptSpy);
@@ -630,7 +633,7 @@ define(["jquery", "js/spec_helpers/create_sinon", "js/spec_helpers/view_helpers"
                         has_changes: false,
                         published: false
                     });
-                    verifyPublishButtonIsEnabled(this, mockCourseJSON);
+                    verifyPublishButton(this, mockCourseJSON);
                 });
 
                 it('should show publish button if the unit is published and changed', function() {
@@ -638,7 +641,7 @@ define(["jquery", "js/spec_helpers/create_sinon", "js/spec_helpers/view_helpers"
                         has_changes: true,
                         published: true
                     });
-                    verifyPublishButtonIsEnabled(this, mockCourseJSON);
+                    verifyPublishButton(this, mockCourseJSON);
                 });
 
                 it('should show publish button if the unit is not published, but changed', function() {
@@ -646,7 +649,7 @@ define(["jquery", "js/spec_helpers/create_sinon", "js/spec_helpers/view_helpers"
                         has_changes: true,
                         published: false
                     });
-                    verifyPublishButtonIsEnabled(this, mockCourseJSON);
+                    verifyPublishButton(this, mockCourseJSON);
                 });
 
                 it('should hide publish button if the unit is not changed, but published', function() {
@@ -655,7 +658,7 @@ define(["jquery", "js/spec_helpers/create_sinon", "js/spec_helpers/view_helpers"
                         published: true
                     });
                     createCourseOutlinePageAndShowUnit(this, mockCourseJSON);
-                    expect(getItemHeaders('unit').find('.publish-button')).toHaveClass('is-disabled');
+                    expect(getItemHeaders('unit').find('.publish-button')).not.toExist;
                 });
 
                 it('has a link to the unit page', function() {
