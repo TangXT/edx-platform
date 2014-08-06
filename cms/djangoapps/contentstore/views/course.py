@@ -24,7 +24,7 @@ from xmodule.contentstore.content import StaticContent
 from xmodule.tabs import PDFTextbookTabs
 from xmodule.partitions.partitions import UserPartition, Group
 
-from xmodule.modulestore.exceptions import ItemNotFoundError, InvalidLocationError
+from xmodule.modulestore.exceptions import ItemNotFoundError, DuplicateCourseError
 from opaque_keys import InvalidKeyError
 from opaque_keys.edx.locations import Location
 from opaque_keys.edx.locator import CourseLocator
@@ -411,7 +411,7 @@ def _create_or_rerun_course(request):
     """
     To be called by requests that create a new destination course (i.e., create_new_course and rerun_course)
     Returns the destination course_key and overriding fields for the new course.
-    Raises InvalidLocationError and InvalidKeyError
+    Raises DuplicateCourseError and InvalidKeyError
     """
     if not auth.has_access(request.user, CourseCreatorRole()):
         raise PermissionDenied()
@@ -430,15 +430,14 @@ def _create_or_rerun_course(request):
                     status=400
                 )
 
-        course_key = CourseLocator(org, number, run)
         fields = {'display_name': display_name} if display_name is not None else {}
 
         if 'source_course_key' in request.json:
-            return _rerun_course(request, course_key, fields)
+            return _rerun_course(request, org, number, run, fields)
         else:
-            return _create_new_course(request, course_key, fields)
+            return _create_new_course(request, org, number, run, fields)
 
-    except InvalidLocationError:
+    except DuplicateCourseError:
         return JsonResponse({
             'ErrMsg': _(
                 'There is already a course defined with the same '
@@ -458,27 +457,27 @@ def _create_or_rerun_course(request):
         )
 
 
-def _create_new_course(request, course_key, fields):
+def _create_new_course(request, org, number, run, fields):
     """
     Create a new course.
     Returns the URL for the course overview page.
-    Raises InvalidLocationError if the course already exists
+    Raises DuplicateCourseError if the course already exists
     """
     # Set a unique wiki_slug for newly created courses. To maintain active wiki_slugs for
     # existing xml courses this cannot be changed in CourseDescriptor.
     # # TODO get rid of defining wiki slug in this org/course/run specific way and reconcile
     # w/ xmodule.course_module.CourseDescriptor.__init__
-    wiki_slug = u"{0}.{1}.{2}".format(course_key.org, course_key.course, course_key.run)
+    wiki_slug = u"{0}.{1}.{2}".format(org, number, run)
     definition_data = {'wiki_slug': wiki_slug}
     fields.update(definition_data)
 
     store = modulestore()
     with store.default_store(settings.FEATURES.get('DEFAULT_STORE_FOR_NEW_COURSE', 'mongo')):
-        # Creating the course raises InvalidLocationError if an existing course with this org/name is found
+        # Creating the course raises DuplicateCourseError if an existing course with this org/name is found
         new_course = modulestore().create_course(
-            course_key.org,
-            course_key.course,
-            course_key.run,
+            org,
+            number,
+            run,
             request.user.id,
             fields=fields,
         )
@@ -494,7 +493,7 @@ def _create_new_course(request, course_key, fields):
     })
 
 
-def _rerun_course(request, destination_course_key, fields):
+def _rerun_course(request, org, number, run, fields):
     """
     Reruns an existing course.
     Returns the URL for the course listing page.
@@ -505,6 +504,15 @@ def _rerun_course(request, destination_course_key, fields):
     if not has_course_access(request.user, source_course_key):
         raise PermissionDenied()
 
+    # create destination course key
+    store = modulestore()
+    with store.default_store('split'):
+        destination_course_key = store.make_course_key(org, number, run)
+
+     # verify org course and run don't already exist
+    if modulestore().has_course(destination_course_key):
+        raise DuplicateCourseError(source_course_key, destination_course_key)
+
     # Make sure user has instructor and staff access to the destination course
     # so the user can see the updated status for that course
     add_instructor(destination_course_key, request.user, request.user)
@@ -513,7 +521,7 @@ def _rerun_course(request, destination_course_key, fields):
     CourseRerunState.objects.initiated(source_course_key, destination_course_key, request.user)
 
     # Rerun the course as a new celery task
-    rerun_course.delay(source_course_key, destination_course_key, request.user.id, fields)
+    rerun_course.delay(unicode(source_course_key), unicode(destination_course_key), request.user.id, fields)
 
     # Return course listing page
     return JsonResponse({'url': reverse_url('course_handler')})
