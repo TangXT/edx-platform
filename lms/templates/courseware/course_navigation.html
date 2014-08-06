@@ -78,7 +78,7 @@ masq = (function(){
 
     el.click(function(){
         if (el.attr("disabled")) {
-           return alert("${_("Course is not yet visible to students.")}");
+           return alert("${_("Since the course is not yet visible to students or beta testers, there's nothing to see here.")}");
         }
         $.ajax({ url: '/masquerade/toggle',
                  type: 'GET',
