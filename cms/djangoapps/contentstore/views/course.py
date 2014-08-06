@@ -231,11 +231,10 @@ def course_handler(request, course_key_string=None):
         return HttpResponseNotFound()
 
 
-def _course_outline_json(request, course_key):
+def _course_outline_json(request, course_module):
     """
     Returns a JSON representation of the course module and recursively all of its children.
     """
-    course_module = _get_course_module(course_key, request.user, depth=None)
     return create_xblock_info(
         course_module,
         include_child_info=True,
@@ -369,10 +368,11 @@ def course_index(request, course_key):
 
     org, course, name: Attributes of the Location for the item to edit
     """
-    course_module = _get_course_module(course_key, request.user, depth=3)
+    # A depth of None implies the whole course
+    course_module = _get_course_module(course_key, request.user, depth=None)
     lms_link = get_lms_link_for_item(course_module.location)
     sections = course_module.get_children()
-    course_structure = _course_outline_json(request, course_key)
+    course_structure = _course_outline_json(request, course_module)
     locator_to_show = request.REQUEST.get('show', None)
 
     try:
