@@ -66,9 +66,9 @@ if (xblockInfo.get('graded')) {
                 <% if (xblockInfo.isVertical()) { %>
                     <li class="action-item action-publish">
                         <% if (published && !hasChanges) { %>
-                            <a href="#" data-tooltip="<%= gettext('The unit has been already published.') %>" class="publish-button action-button is-disabled %>">
+                            <a href="#" data-tooltip="<%= gettext('The unit has been already published.') %>" class="publish-button action-button is-disabled">
                         <% } else { %>
-                            <a href="#" data-tooltip="<%= gettext('Publish') %>" class="publish-button action-button %>">
+                            <a href="#" data-tooltip="<%= gettext('Publish') %>" class="publish-button action-button">
                         <% } %>
                             <i class="icon icon-share"></i>
                             <span class="action-button-text sr"><%= gettext('Publish') %></span>
