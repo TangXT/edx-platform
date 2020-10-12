@@ -1,15 +1,29 @@
-import unittest
-from lxml import etree
+"""
+CAPA HTML rendering tests.
+"""
+
+
 import os
 import textwrap
+import unittest
 
+import ddt
 import mock
+from lxml import etree
 
-from .response_xml_factory import StringResponseXMLFactory, CustomResponseXMLFactory
-from . import test_capa_system, new_loncapa_problem
+# Changes formatting of empty elements; import here to avoid test order dependence
+import xmodule.modulestore.xml  # pylint: disable=unused-import
+from capa.tests.helpers import new_loncapa_problem, test_capa_system
+from openedx.core.djangolib.markup import HTML
+
+from .response_xml_factory import CustomResponseXMLFactory, StringResponseXMLFactory
 
 
+@ddt.ddt
 class CapaHtmlRenderTest(unittest.TestCase):
+    """
+    CAPA HTML rendering tests class.
+    """
 
     def setUp(self):
         super(CapaHtmlRenderTest, self).setUp()
@@ -26,14 +40,14 @@ class CapaHtmlRenderTest(unittest.TestCase):
         problem = new_loncapa_problem(xml_str)
 
         # Render the HTML
-        rendered_html = etree.XML(problem.get_html())
-        # expect that we made it here without blowing up
+        etree.XML(problem.get_html())
+        # TODO: This test should inspect the rendered html and assert one or more things about it
 
     def test_include_html(self):
         # Create a test file to include
         self._create_test_file(
-            'test_include.xml',
-            '<test>Test include</test>'
+            u'test_include.xml',
+            u'<test>Test include</test>'
         )
 
         # Generate some XML with an <include>
@@ -123,47 +137,47 @@ class CapaHtmlRenderTest(unittest.TestCase):
         # Render the HTML
         rendered_html = etree.XML(problem.get_html())
 
-
         # expect the javascript is still present in the rendered html
-        self.assertTrue("<script type=\"text/javascript\">function(){}</script>" in etree.tostring(rendered_html))
-
+        self.assertIn(
+            "<script type=\"text/javascript\">function(){}</script>",
+            etree.tostring(rendered_html).decode('utf-8')
+        )
 
     def test_render_response_xml(self):
         # Generate some XML for a string response
-        kwargs = {'question_text': "Test question",
-                    'explanation_text': "Test explanation",
-                    'answer': 'Test answer',
-                    'hints': [('test prompt', 'test_hint', 'test hint text')]}
+        kwargs = {
+            'question_text': "Test question",
+            'explanation_text': "Test explanation",
+            'answer': 'Test answer',
+            'hints': [('test prompt', 'test_hint', 'test hint text')]
+        }
         xml_str = StringResponseXMLFactory().build_xml(**kwargs)
 
         # Mock out the template renderer
         the_system = test_capa_system()
         the_system.render_template = mock.Mock()
-        the_system.render_template.return_value = "<div>Input Template Render</div>"
+        the_system.render_template.return_value = "<div class='input-template-render'>Input Template Render</div>"
 
         # Create the problem and render the HTML
         problem = new_loncapa_problem(xml_str, capa_system=the_system)
         rendered_html = etree.XML(problem.get_html())
-
         # Expect problem has been turned into a <div>
         self.assertEqual(rendered_html.tag, "div")
 
-        # Expect question text is in a <p> child
-        question_element = rendered_html.find("p")
-        self.assertEqual(question_element.text, "Test question")
+        # Expect that the response has been turned into a <div> with correct attributes
+        response_element = rendered_html.find('div')
 
-        # Expect that the response has been turned into a <span>
-        response_element = rendered_html.find("span")
-        self.assertEqual(response_element.tag, "span")
+        self.assertEqual(response_element.tag, "div")
+        self.assertEqual(response_element.attrib["aria-label"], "Question 1")
 
-        # Expect that the response <span>
+        # Expect that the response div.wrapper-problem-response
         # that contains a <div> for the textline
-        textline_element = response_element.find("div")
+        textline_element = response_element.find('div')
         self.assertEqual(textline_element.text, 'Input Template Render')
 
         # Expect a child <div> for the solution
         # with the rendered template
-        solution_element = rendered_html.find("div")
+        solution_element = rendered_html.xpath('//div[@class="input-template-render"]')[0]
         self.assertEqual(solution_element.text, 'Input Template Render')
 
         # Expect that the template renderer was called with the correct
@@ -172,7 +186,6 @@ class CapaHtmlRenderTest(unittest.TestCase):
         expected_textline_context = {
             'STATIC_URL': '/dummy-static/',
             'status': the_system.STATUS_CLASS('unsubmitted'),
-            'label': '',
             'value': '',
             'preprocessor': None,
             'msg': '',
@@ -182,22 +195,50 @@ class CapaHtmlRenderTest(unittest.TestCase):
             'id': '1_2_1',
             'trailing_text': '',
             'size': None,
+            'response_data': {'label': 'Test question', 'descriptions': {}},
+            'describedby_html': HTML('aria-describedby="status_1_2_1"')
         }
 
         expected_solution_context = {'id': '1_solution_1'}
 
-        expected_calls = [mock.call('textline.html', expected_textline_context),
-                mock.call('solutionspan.html', expected_solution_context),
-                mock.call('textline.html', expected_textline_context),
-                mock.call('solutionspan.html', expected_solution_context)]
+        expected_calls = [
+            mock.call('textline.html', expected_textline_context),
+            mock.call('solutionspan.html', expected_solution_context),
+            mock.call('textline.html', expected_textline_context),
+            mock.call('solutionspan.html', expected_solution_context)
+        ]
 
-        self.assertEqual(the_system.render_template.call_args_list,
-                            expected_calls)
+        self.assertEqual(
+            the_system.render_template.call_args_list,
+            expected_calls
+        )
 
+    def test_correct_aria_label(self):
+        xml = """
+                 <problem>
+                     <choiceresponse>
+                         <checkboxgroup>
+                             <choice correct="true">over-suspicious</choice>
+                             <choice correct="false">funny</choice>
+                         </checkboxgroup>
+                     </choiceresponse>
+                     <choiceresponse>
+                         <checkboxgroup>
+                             <choice correct="true">Urdu</choice>
+                             <choice correct="false">Finnish</choice>
+                         </checkboxgroup>
+                     </choiceresponse>
+                 </problem>
+                 """
+        problem = new_loncapa_problem(xml)
+        rendered_html = etree.XML(problem.get_html())
+        response_elements = rendered_html.findall('div')
+        self.assertEqual(response_elements[0].attrib['aria-label'], 'Question 1')
+        self.assertEqual(response_elements[1].attrib['aria-label'], 'Question 2')
 
     def test_render_response_with_overall_msg(self):
         # CustomResponse script that sets an overall_message
-        script=textwrap.dedent("""
+        script = textwrap.dedent("""
             def check_func(*args):
                 msg = '<p>Test message 1<br /></p><p>Test message 2</p>'
                 return {'overall_message': msg,
@@ -205,18 +246,17 @@ class CapaHtmlRenderTest(unittest.TestCase):
         """)
 
         # Generate some XML for a CustomResponse
-        kwargs = {'script':script, 'cfn': 'check_func'}
+        kwargs = {'script': script, 'cfn': 'check_func'}
         xml_str = CustomResponseXMLFactory().build_xml(**kwargs)
 
         # Create the problem and render the html
         problem = new_loncapa_problem(xml_str)
 
         # Grade the problem
-        correctmap = problem.grade_answers({'1_2_1': 'test'})
+        problem.grade_answers({'1_2_1': 'test'})
 
         # Render the html
         rendered_html = etree.XML(problem.get_html())
-
 
         # Expect that there is a <div> within the response <div>
         # with css class response_message
@@ -231,7 +271,6 @@ class CapaHtmlRenderTest(unittest.TestCase):
 
         self.assertEqual(msg_p_elements[1].tag, "p")
         self.assertEqual(msg_p_elements[1].text, "Test message 2")
-
 
     def test_substitute_python_vars(self):
         # Generate some XML with Python variables defined in a script
@@ -255,9 +294,7 @@ class CapaHtmlRenderTest(unittest.TestCase):
         # Comments and processing instructions should be skipped.
         xml_str = textwrap.dedent("""\
             <?xml version="1.0" encoding="utf-8"?>
-            <!DOCTYPE html [
-                <!ENTITY % wacky "lxml.etree is wacky!">
-            ]>
+            <!DOCTYPE html []>
             <problem>
             <!-- A commment. -->
             <?ignore this processing instruction. ?>
@@ -269,7 +306,7 @@ class CapaHtmlRenderTest(unittest.TestCase):
 
         # Render the HTML
         the_html = problem.get_html()
-        self.assertRegexpMatches(the_html, r"<div>\s+</div>")
+        self.assertRegex(the_html, r"<div>\s*</div>")
 
     def _create_test_file(self, path, content_str):
         test_fp = self.capa_system.filestore.open(path, "w")

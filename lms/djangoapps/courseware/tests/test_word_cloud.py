@@ -1,16 +1,27 @@
 # -*- coding: utf-8 -*-
 """Word cloud integration tests using mongo modulestore."""
 
+
 import json
 from operator import itemgetter
 
-from . import BaseTestXmodule
 from xmodule.x_module import STUDENT_VIEW
+
+from .helpers import BaseTestXmodule
 
 
 class TestWordCloud(BaseTestXmodule):
     """Integration test for word cloud xmodule."""
     CATEGORY = "word_cloud"
+
+    def _get_resource_url(self, item):
+        """
+        Creates a resource URL for a given asset that is compatible with this old XModule testing stuff.
+        """
+        display_name = self.item_descriptor.display_name.replace(' ', '_')
+        return "resource/i4x://{}/{}/word_cloud/{}/{}".format(
+            self.course.id.org, self.course.id.course, display_name, item
+        )
 
     def _get_users_state(self):
         """Return current state for each user:
@@ -22,7 +33,7 @@ class TestWordCloud(BaseTestXmodule):
 
         for user in self.users:
             response = self.clients[user.username].post(self.get_url('get_state'))
-            users_state[user.username] = json.loads(response.content)
+            users_state[user.username] = json.loads(response.content.decode('utf-8'))
 
         return users_state
 
@@ -39,7 +50,7 @@ class TestWordCloud(BaseTestXmodule):
                 {'student_words[]': words},
                 HTTP_X_REQUESTED_WITH='XMLHttpRequest'
             )
-            users_state[user.username] = json.loads(response.content)
+            users_state[user.username] = json.loads(response.content.decode('utf-8'))
 
         return users_state
 
@@ -93,7 +104,7 @@ class TestWordCloud(BaseTestXmodule):
         }
 
         for _, response_content in users_state.items():
-            self.assertEquals(response_content, correct_initial_data)
+            self.assertEqual(response_content, correct_initial_data)
 
     def test_post_words(self):
         """Students can submit data succesfully.
@@ -214,7 +225,7 @@ class TestWordCloud(BaseTestXmodule):
 
         for user in self.users:
             self.assertListEqual(
-                users_state[user.username]['student_words'].keys(),
+                list(users_state[user.username]['student_words'].keys()),
                 correct_words)
 
     def test_handle_ajax_incorrect_dispatch(self):
@@ -226,30 +237,31 @@ class TestWordCloud(BaseTestXmodule):
             for user in self.users
         }
 
-        self.assertEqual(
-            set([
-                response.status_code
-                for _, response in responses.items()
-                ]).pop(),
-            200)
+        status_codes = {response.status_code for response in responses.values()}
+        self.assertEqual(status_codes.pop(), 200)
 
         for user in self.users:
             self.assertDictEqual(
-                json.loads(responses[user.username].content),
+                json.loads(responses[user.username].content.decode('utf-8')),
                 {
                     'status': 'fail',
                     'error': 'Unknown Command!'
-                })
+                }
+            )
 
     def test_word_cloud_constructor(self):
-        """Make sure that all parameters extracted correclty from xml"""
+        """
+        Make sure that all parameters extracted correctly from xml.
+        """
         fragment = self.runtime.render(self.item_descriptor, STUDENT_VIEW)
-
         expected_context = {
-            'ajax_url': self.item_descriptor.xmodule_runtime.ajax_url,
-            'element_class': self.item_descriptor.location.category,
+            'ajax_url': self.item_descriptor.ajax_url,
+            'display_name': self.item_descriptor.display_name,
+            'instructions': self.item_descriptor.instructions,
+            'element_class': self.item_descriptor.location.block_type,
             'element_id': self.item_descriptor.location.html_id(),
             'num_inputs': 5,  # default value
-            'submitted': False  # default value
+            'submitted': False,  # default value,
         }
+
         self.assertEqual(fragment.content, self.runtime.render_template('word_cloud.html', expected_context))

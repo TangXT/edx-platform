@@ -2,78 +2,19 @@
 Fixture to create a course and course components (XBlocks).
 """
 
-import mimetypes
-import json
-import re
+
 import datetime
-import requests
-from textwrap import dedent
+import json
+import mimetypes
 from collections import namedtuple
-from path import path
-from lazy import lazy
+from textwrap import dedent
 
-from . import STUDIO_BASE_URL
+import six
+from opaque_keys.edx.keys import CourseKey
+from path import Path
 
-
-class StudioApiLoginError(Exception):
-    """
-    Error occurred while logging in to the Studio API.
-    """
-    pass
-
-
-class StudioApiFixture(object):
-    """
-    Base class for fixtures that use the Studio restful API.
-    """
-    def __init__(self):
-        # Info about the auto-auth user used to create the course.
-        self.user = {}
-
-    @lazy
-    def session(self):
-        """
-        Log in as a staff user, then return a `requests` `session` object for the logged in user.
-        Raises a `StudioApiLoginError` if the login fails.
-        """
-        # Use auto-auth to retrieve the session for a logged in user
-        session = requests.Session()
-        response = session.get(STUDIO_BASE_URL + "/auto_auth?staff=true")
-
-        # Return the session from the request
-        if response.ok:
-            # auto_auth returns information about the newly created user
-            # capture this so it can be used by by the testcases.
-            user_pattern = re.compile('Logged in user {0} \({1}\) with password {2} and user_id {3}'.format(
-                '(?P<username>\S+)', '(?P<email>[^\)]+)', '(?P<password>\S+)', '(?P<user_id>\d+)'))
-            user_matches = re.match(user_pattern, response.text)
-            if user_matches:
-                self.user = user_matches.groupdict()
-
-            return session
-
-        else:
-            msg = "Could not log in to use Studio restful API.  Status code: {0}".format(response.status_code)
-            raise StudioApiLoginError(msg)
-
-    @lazy
-    def session_cookies(self):
-        """
-        Log in as a staff user, then return the cookies for the session (as a dict)
-        Raises a `StudioApiLoginError` if the login fails.
-        """
-        return {key: val for key, val in self.session.cookies.items()}
-
-    @lazy
-    def headers(self):
-        """
-        Default HTTP headers dict.
-        """
-        return {
-            'Content-type': 'application/json',
-            'Accept': 'application/json',
-            'X-CSRFToken': self.session_cookies.get('csrftoken', '')
-        }
+from common.test.acceptance.fixtures import STUDIO_BASE_URL
+from common.test.acceptance.fixtures.base import FixtureError, XBlockContainerFixture
 
 
 class XBlockFixtureDesc(object):
@@ -81,7 +22,8 @@ class XBlockFixtureDesc(object):
     Description of an XBlock, used to configure a course fixture.
     """
 
-    def __init__(self, category, display_name, data=None, metadata=None, grader_type=None, publish='make_public'):
+    def __init__(self, category, display_name, data=None,
+                 metadata=None, grader_type=None, publish='make_public', **kwargs):
         """
         Configure the XBlock to be created by the fixture.
         These arguments have the same meaning as in the Studio REST API:
@@ -100,11 +42,12 @@ class XBlockFixtureDesc(object):
         self.publish = publish
         self.children = []
         self.locator = None
+        self.fields = kwargs
 
     def add_children(self, *args):
         """
         Add child XBlocks to this XBlock.
-        Each item in `args` is an `XBlockFixtureDescriptor` object.
+        Each item in `args` is an `XBlockFixtureDesc` object.
 
         Returns the `xblock_desc` instance to allow chaining.
         """
@@ -118,20 +61,22 @@ class XBlockFixtureDesc(object):
 
         XBlocks are always set to public visibility.
         """
-        return json.dumps({
+        returned_data = {
             'display_name': self.display_name,
             'data': self.data,
             'metadata': self.metadata,
             'graderType': self.grader_type,
-            'publish': self.publish
-        })
+            'publish': self.publish,
+            'fields': self.fields,
+        }
+        return json.dumps(returned_data)
 
     def __str__(self):
         """
         Return a string representation of the description.
         Useful for error messages.
         """
-        return dedent("""
+        return dedent(u"""
             <XBlockFixtureDescriptor:
                 category={0},
                 data={1},
@@ -153,14 +98,7 @@ class XBlockFixtureDesc(object):
 CourseUpdateDesc = namedtuple("CourseUpdateDesc", ['date', 'content'])
 
 
-class CourseFixtureError(Exception):
-    """
-    Error occurred while installing a course fixture.
-    """
-    pass
-
-
-class CourseFixture(StudioApiFixture):
+class CourseFixture(XBlockContainerFixture):
     """
     Fixture for ensuring that a course exists.
 
@@ -168,7 +106,7 @@ class CourseFixture(StudioApiFixture):
     between tests, you should use unique course identifiers for each fixture.
     """
 
-    def __init__(self, org, number, run, display_name, start_date=None, end_date=None):
+    def __init__(self, org, number, run, display_name, start_date=None, end_date=None, settings=None):
         """
         Configure the course fixture to create a course with
 
@@ -178,8 +116,11 @@ class CourseFixture(StudioApiFixture):
         The default is for the course to have started in the distant past, which is generally what
         we want for testing so students can enroll.
 
+        `settings` can be any additional course settings needs to be enabled. for example
+        to enable entrance exam settings would be a dict like this {"entrance_exam_enabled": "true"}
         These have the same meaning as in the Studio restful API /course end-point.
         """
+        super(CourseFixture, self).__init__()
         self._course_dict = {
             'org': org,
             'number': number,
@@ -199,27 +140,36 @@ class CourseFixture(StudioApiFixture):
         if end_date is not None:
             self._course_details['end_date'] = end_date.isoformat()
 
+        if settings is not None:
+            self._course_details.update(settings)
+
         self._updates = []
         self._handouts = []
-        self.children = []
         self._assets = []
+        self._textbooks = []
         self._advanced_settings = {}
+        self._course_key = None
 
     def __str__(self):
         """
         String representation of the course fixture, useful for debugging.
         """
-        return "<CourseFixture: org='{org}', number='{number}', run='{run}'>".format(**self._course_dict)
+        return u"<CourseFixture: org='{org}', number='{number}', run='{run}'>".format(**self._course_dict)
 
-    def add_children(self, *args):
+    def add_course_details(self, course_details):
         """
-        Add children XBlock to the course.
-        Each item in `args` is an `XBlockFixtureDescriptor` object.
+        Add course details to dict of course details to be updated when configure_course or install is called.
 
-        Returns the course fixture to allow chaining.
+        Arguments:
+            Dictionary containing key value pairs for course updates,
+            e.g. {'start_date': datetime.now() }
         """
-        self.children.extend(args)
-        return self
+        if 'start_date' in course_details:
+            course_details['start_date'] = course_details['start_date'].isoformat()
+        if 'end_date' in course_details:
+            course_details['end_date'] = course_details['end_date'].isoformat()
+
+        self._course_details.update(course_details)
 
     def add_update(self, update):
         """
@@ -240,6 +190,12 @@ class CourseFixture(StudioApiFixture):
         """
         self._assets.extend(asset_name)
 
+    def add_textbook(self, book_title, chapters):
+        """
+        Add textbook to the list of textbooks to be added when the install method is called.
+        """
+        self._textbooks.append({"chapters": chapters, "tab_title": book_title})
+
     def add_advanced_settings(self, settings):
         """
         Adds advanced settings to be set on the course when the install method is called.
@@ -250,12 +206,13 @@ class CourseFixture(StudioApiFixture):
         """
         Create the course and XBlocks within the course.
         This is NOT an idempotent method; if the course already exists, this will
-        raise a `CourseFixtureError`.  You should use unique course identifiers to avoid
+        raise a `FixtureError`.  You should use unique course identifiers to avoid
         conflicts between tests.
         """
         self._create_course()
         self._install_course_updates()
         self._install_course_handouts()
+        self._install_course_textbooks()
         self._configure_course()
         self._upload_assets()
         self._add_advanced_settings()
@@ -263,19 +220,44 @@ class CourseFixture(StudioApiFixture):
 
         return self
 
+    def configure_course(self):
+        """
+        Configure Course Settings, take new course settings from self._course_details dict object
+        """
+        self._configure_course()
+
     @property
-    def _course_key(self):
+    def studio_course_outline_as_json(self):
         """
-        Return the locator string for the course.
+        Retrieves Studio course outline in JSON format.
         """
-        return "{org}/{number}/{run}".format(**self._course_dict)
+        url = STUDIO_BASE_URL + '/course/' + self._course_key + "?format=json"
+        response = self.session.get(url, headers=self.headers)
+
+        if not response.ok:
+            raise FixtureError(
+                u"Could not retrieve course outline json.  Status was {0}".format(
+                    response.status_code))
+
+        try:
+            course_outline_json = response.json()
+        except ValueError:
+            raise FixtureError(
+                u"Could not decode course outline as JSON: '{0}'".format(response)
+            )
+        return course_outline_json
 
     @property
     def _course_location(self):
         """
         Return the locator string for the course.
         """
-        return "i4x://{org}/{number}/course/{run}".format(**self._course_dict)
+        course_key = CourseKey.from_string(self._course_key)
+        if getattr(course_key, 'deprecated', False):
+            block_id = self._course_dict['run']
+        else:
+            block_id = 'course'
+        return six.text_type(course_key.make_usage_key('course', block_id))
 
     @property
     def _assets_url(self):
@@ -289,7 +271,8 @@ class CourseFixture(StudioApiFixture):
         """
         Return the locator string for the course handouts
         """
-        return "i4x://{org}/{number}/course_info/handouts".format(**self._course_dict)
+        course_key = CourseKey.from_string(self._course_key)
+        return six.text_type(course_key.make_usage_key('course_info', 'handouts'))
 
     def _create_course(self):
         """
@@ -307,18 +290,20 @@ class CourseFixture(StudioApiFixture):
             err = response.json().get('ErrMsg')
 
         except ValueError:
-            raise CourseFixtureError(
-                "Could not parse response from course request as JSON: '{0}'".format(
+            raise FixtureError(
+                u"Could not parse response from course request as JSON: '{0}'".format(
                     response.content))
 
         # This will occur if the course identifier is not unique
         if err is not None:
-            raise CourseFixtureError("Could not create course {0}.  Error message: '{1}'".format(self, err))
+            raise FixtureError(u"Could not create course {0}.  Error message: '{1}'".format(self, err))
 
-        if not response.ok:
-            raise CourseFixtureError(
-                "Could not create course {0}.  Status was {1}".format(
-                    self._course_dict, response.status_code))
+        if response.ok:
+            self._course_key = response.json()['course_key']
+        else:
+            raise FixtureError(
+                u"Could not create course {0}.  Status was {1}\nResponse content was: {2}".format(
+                    self._course_dict, response.status_code, response.content))
 
     def _configure_course(self):
         """
@@ -330,15 +315,15 @@ class CourseFixture(StudioApiFixture):
         response = self.session.get(url, headers=self.headers)
 
         if not response.ok:
-            raise CourseFixtureError(
-                "Could not retrieve course details.  Status was {0}".format(
+            raise FixtureError(
+                u"Could not retrieve course details.  Status was {0}".format(
                     response.status_code))
 
         try:
             details = response.json()
         except ValueError:
-            raise CourseFixtureError(
-                "Could not decode course details as JSON: '{0}'".format(details)
+            raise FixtureError(
+                u"Could not decode course details as JSON: '{0}'".format(details)
             )
 
         # Update the old details with our overrides
@@ -351,8 +336,8 @@ class CourseFixture(StudioApiFixture):
         )
 
         if not response.ok:
-            raise CourseFixtureError(
-                "Could not update course details to '{0}' with {1}: Status was {2}.".format(
+            raise FixtureError(
+                u"Could not update course details to '{0}' with {1}: Status was {2}.".format(
                     self._course_details, url, response.status_code))
 
     def _install_course_handouts(self):
@@ -363,24 +348,24 @@ class CourseFixture(StudioApiFixture):
 
         # Construct HTML with each of the handout links
         handouts_li = [
-            '<li><a href="/static/{handout}">Example Handout</a></li>'.format(handout=handout)
+            u'<li><a href="/static/{handout}">Example Handout</a></li>'.format(handout=handout)
             for handout in self._handouts
         ]
-        handouts_html = '<ol class="treeview-handoutsnav">{}</ol>'.format("".join(handouts_li))
+        handouts_html = u'<ol class="treeview-handoutsnav">{}</ol>'.format("".join(handouts_li))
 
         # Update the course's handouts HTML
         payload = json.dumps({
             'children': None,
             'data': handouts_html,
             'id': self._handouts_loc,
-            'metadata': dict()
+            'metadata': dict(),
         })
 
         response = self.session.post(url, data=payload, headers=self.headers)
 
         if not response.ok:
-            raise CourseFixtureError(
-                "Could not update course handouts with {0}.  Status was {1}".format(url, response.status_code))
+            raise FixtureError(
+                u"Could not update course handouts with {0}.  Status was {1}".format(url, response.status_code))
 
     def _install_course_updates(self):
         """
@@ -396,23 +381,23 @@ class CourseFixture(StudioApiFixture):
             response = self.session.post(url, headers=self.headers, data=payload)
 
             if not response.ok:
-                raise CourseFixtureError(
-                    "Could not add update to course: {0} with {1}.  Status was {2}".format(
+                raise FixtureError(
+                    u"Could not add update to course: {0} with {1}.  Status was {2}".format(
                         update, url, response.status_code))
 
     def _upload_assets(self):
         """
         Upload assets
-        :raise CourseFixtureError:
+        :raise FixtureError:
         """
         url = STUDIO_BASE_URL + self._assets_url
 
-        test_dir = path(__file__).abspath().dirname().dirname().dirname()
+        test_dir = Path(__file__).abspath().dirname().dirname().dirname()
 
         for asset_name in self._assets:
             asset_file_path = test_dir + '/data/uploads/' + asset_name
 
-            asset_file = open(asset_file_path)
+            asset_file = open(asset_file_path, mode='rb')  # pylint: disable=open-builtin
             files = {'file': (asset_name, asset_file, mimetypes.guess_type(asset_file_path)[0])}
 
             headers = {
@@ -423,8 +408,23 @@ class CourseFixture(StudioApiFixture):
             upload_response = self.session.post(url, files=files, headers=headers)
 
             if not upload_response.ok:
-                raise CourseFixtureError('Could not upload {asset_name} with {url}. Status code: {code}'.format(
+                raise FixtureError(u'Could not upload {asset_name} with {url}. Status code: {code}'.format(
                     asset_name=asset_name, url=url, code=upload_response.status_code))
+
+    def _install_course_textbooks(self):
+        """
+        Add textbooks to the course, if any are configured.
+        """
+        url = STUDIO_BASE_URL + '/textbooks/' + self._course_key
+
+        for book in self._textbooks:
+            payload = json.dumps(book)
+            response = self.session.post(url, headers=self.headers, data=payload)
+
+            if not response.ok:
+                raise FixtureError(
+                    u"Could not add book to course: {0} with {1}.  Status was {2}".format(
+                        book, url, response.status_code))
 
     def _add_advanced_settings(self):
         """
@@ -439,109 +439,13 @@ class CourseFixture(StudioApiFixture):
         )
 
         if not response.ok:
-            raise CourseFixtureError(
-                "Could not update advanced details to '{0}' with {1}: Status was {2}.".format(
+            raise FixtureError(
+                u"Could not update advanced details to '{0}' with {1}: Status was {2}.".format(
                     self._advanced_settings, url, response.status_code))
 
     def _create_xblock_children(self, parent_loc, xblock_descriptions):
         """
         Recursively create XBlock children.
         """
-        for desc in xblock_descriptions:
-            loc = self.create_xblock(parent_loc, desc)
-            self._create_xblock_children(loc, desc.children)
-
+        super(CourseFixture, self)._create_xblock_children(parent_loc, xblock_descriptions)
         self._publish_xblock(parent_loc)
-
-    def get_nested_xblocks(self, category=None):
-        """
-        Return a list of nested XBlocks for the course that can be filtered by
-        category.
-        """
-        xblocks = self._get_nested_xblocks(self)
-        if category:
-            xblocks = filter(lambda x: x.category == category, xblocks)
-        return xblocks
-
-    def _get_nested_xblocks(self, xblock_descriptor):
-        """
-        Return a list of nested XBlocks for the course.
-        """
-        xblocks = list(xblock_descriptor.children)
-        for child in xblock_descriptor.children:
-            xblocks.extend(self._get_nested_xblocks(child))
-        return xblocks
-
-    def create_xblock(self, parent_loc, xblock_desc):
-        """
-        Create an XBlock with `parent_loc` (the location of the parent block)
-        and `xblock_desc` (an `XBlockFixtureDesc` instance).
-        """
-        create_payload = {
-            'category': xblock_desc.category,
-            'display_name': xblock_desc.display_name,
-        }
-
-        if parent_loc is not None:
-            create_payload['parent_locator'] = parent_loc
-
-        # Create the new XBlock
-        response = self.session.post(
-            STUDIO_BASE_URL + '/xblock/',
-            data=json.dumps(create_payload),
-            headers=self.headers,
-        )
-
-        if not response.ok:
-            msg = "Could not create {0}.  Status was {1}".format(xblock_desc, response.status_code)
-            raise CourseFixtureError(msg)
-
-        try:
-            loc = response.json().get('locator')
-            xblock_desc.locator = loc
-        except ValueError:
-            raise CourseFixtureError("Could not decode JSON from '{0}'".format(response.content))
-
-        # Configure the XBlock
-        response = self.session.post(
-            STUDIO_BASE_URL + '/xblock/' + loc,
-            data=xblock_desc.serialize(),
-            headers=self.headers,
-        )
-
-        if response.ok:
-            return loc
-        else:
-            raise CourseFixtureError(
-                "Could not update {0}.  Status code: {1}".format(
-                    xblock_desc, response.status_code))
-
-    def _publish_xblock(self, locator):
-        """
-        Publish the xblock at `locator`.
-        """
-        self._update_xblock(locator, {'publish': 'make_public'})
-
-    def _update_xblock(self, locator, data):
-        """
-        Update the xblock at `locator`.
-        """
-        # Create the new XBlock
-        response = self.session.put(
-            "{}/xblock/{}".format(STUDIO_BASE_URL, locator),
-            data=json.dumps(data),
-            headers=self.headers,
-        )
-
-        if not response.ok:
-            msg = "Could not update {} with data {}.  Status was {}".format(locator, data, response.status_code)
-            raise CourseFixtureError(msg)
-
-    def _encode_post_dict(self, post_dict):
-        """
-        Encode `post_dict` (a dictionary) as UTF-8 encoded JSON.
-        """
-        return json.dumps({
-            k: v.encode('utf-8') if isinstance(v, basestring) else v
-            for k, v in post_dict.items()
-        })

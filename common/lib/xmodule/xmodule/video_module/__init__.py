@@ -1,10 +1,8 @@
 """
-Container for video module and it's utils.
+Container for video module and its utils.
 """
 
-# Disable wildcard-import warnings.
-# pylint: disable=W0401
-
+from .bumper_utils import *
 from .transcripts_utils import *
-from .video_utils import *
 from .video_module import *
+from .video_utils import *

@@ -1,4 +1,4 @@
-"""
+u"""
 Profile Distributions
 
 Aggregate sums for values of fields in students profiles.
@@ -21,7 +21,9 @@ The distribution in a course for gender might look like:
 }
 """
 
+
 from django.db.models import Count
+
 from student.models import CourseEnrollment, UserProfile
 
 # choices with a restricted domain, e.g. level_of_education
@@ -92,9 +94,9 @@ def profile_distribution(course_id, feature):
     data types are EASY_CHOICE or OPEN_CHOICE
     """
 
-    if not feature in AVAILABLE_PROFILE_FEATURES:
+    if feature not in AVAILABLE_PROFILE_FEATURES:
         raise ValueError(
-            "unsupported feature requested for distribution '{}'".format(
+            u"unsupported feature requested for distribution u'{}'".format(
                 feature)
         )
 
@@ -123,6 +125,7 @@ def profile_distribution(course_id, feature):
             """ Get the count of enrolled students matching the feature value. """
             return CourseEnrollment.objects.filter(
                 course_id=course_id,
+                is_active=True,
                 **get_filter(feature, value)
             ).count()
 
@@ -141,7 +144,8 @@ def profile_distribution(course_id, feature):
     elif feature in _OPEN_CHOICE_FEATURES:
         prd.type = 'OPEN_CHOICE'
         profiles = UserProfile.objects.filter(
-            user__courseenrollment__course_id=course_id
+            user__courseenrollment__course_id=course_id,
+            user__courseenrollment__is_active=True
         )
         query_distribution = profiles.values(
             feature).annotate(Count(feature)).order_by()

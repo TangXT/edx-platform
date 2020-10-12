@@ -1,92 +1,91 @@
-(function (undefined) {
-    describe('Video', function () {
-        var oldOTBD;
-
-        beforeEach(function () {
-            jasmine.stubRequests();
-        });
-
-        afterEach(function () {
+(function(undefined) {
+    describe('Video', function() {
+        afterEach(function() {
             $('source').remove();
             window.VideoState = {};
             window.VideoState.id = {};
+            window.YT = jasmine.YT;
         });
 
-        describe('constructor', function () {
-            describe('YT', function () {
-                beforeEach(function () {
+        describe('constructor', function() {
+            describe('YT', function() {
+                var state;
+
+                beforeEach(function() {
                     loadFixtures('video.html');
-                    $.cookie.andReturn('0.50');
+                    $.cookie.and.returnValue('0.50');
                 });
 
-                describe('by default', function () {
-                    beforeEach(function () {
-                        this.state = new window.Video('#example');
+                describe('by default', function() {
+                    beforeEach(function() {
+                        state = jasmine.initializePlayerYouTube('video_html5.html');
                     });
 
-                    it('check videoType', function () {
-                        expect(this.state.videoType).toEqual('youtube');
+                    afterEach(function() {
+                        state.storage.clear();
+                        state.videoPlayer.destroy();
                     });
 
-                    it('set the elements', function () {
-                        expect(this.state.el).toBe('#video_id');
+                    it('check videoType', function() {
+                        expect(state.videoType).toEqual('youtube');
                     });
 
-                    it('parse the videos', function () {
-                        expect(this.state.videos).toEqual({
+                    it('set the elements', function() {
+                        expect(state.el).toEqual($('#video_id'));
+                    });
+
+                    it('parse the videos', function() {
+                        expect(state.videos).toEqual({
                             '0.50': '7tqY6eQzVhE',
                             '1.0': 'cogebirgzzM',
                             '1.50': 'abcdefghijkl'
                         });
                     });
 
-                    it('parse available video speeds', function () {
-                        expect(this.state.speeds).toEqual(['0.50', '1.0', '1.50']);
+                    it('parse available video speeds', function() {
+                        expect(state.speeds).toEqual(['0.50', '1.0', '1.50']);
                     });
 
-                    it('set current video speed via cookie', function () {
-                        expect(this.state.speed).toEqual('1.50');
+                    it('set current video speed via cookie', function() {
+                        expect(state.speed).toEqual('1.50');
                     });
                 });
             });
 
-            describe('HTML5', function () {
+            describe('HTML5', function() {
                 var state;
 
-                beforeEach(function () {
-                    loadFixtures('video_html5.html');
-                    $.cookie.andReturn('0.75');
+                beforeEach(function() {
+                    $.cookie.and.returnValue('0.75');
+                    state = jasmine.initializePlayer('video_html5.html');
                 });
 
-                describe('by default', function () {
-                    beforeEach(function () {
-                        state = new window.Video('#example');
-                    });
+                afterEach(function() {
+                    state.storage.clear();
+                    state.videoPlayer.destroy();
+                });
 
-                    afterEach(function () {
-                        state = undefined;
-                    });
-
-                    it('check videoType', function () {
+                describe('by default', function() {
+                    it('check videoType', function() {
                         expect(state.videoType).toEqual('html5');
                     });
 
-                    it('set the elements', function () {
-                        expect(state.el).toBe('#video_id');
+                    it('set the elements', function() {
+                        expect(state.el).toEqual($('#video_id'));
                     });
 
-                    it('doesn\'t have `videos` dictionary', function () {
+                    it('doesn\'t have `videos` dictionary', function() {
                         expect(state.videos).toBeUndefined();
                     });
 
-                    it('parse available video speeds', function () {
+                    it('parse available video speeds', function() {
                         var speeds = jasmine.stubbedHtml5Speeds;
 
                         expect(state.speeds).toEqual(speeds);
                     });
 
-                    it('set current video speed via cookie', function () {
-                        expect(state.speed).toEqual('1.50');
+                    it('set current video speed via cookie', function() {
+                        expect(state.speed).toEqual(1.5);
                     });
                 });
 
@@ -94,43 +93,43 @@
                 // handled by Require JS. When state.videoPlayer is created,
                 // the stand alone HTML5 player object is already loaded, so no
                 // further testing in that case is required.
-                describe('HTML5 API is available', function () {
-                    beforeEach(function () {
-                        state = new Video('#example');
-                    });
-
-                    afterEach(function () {
-                        state = null;
-                    });
-
-                    it('create the Video Player', function () {
+                describe('HTML5 API is available', function() {
+                    it('create the Video Player', function() {
                         expect(state.videoPlayer.player).not.toBeUndefined();
                     });
                 });
             });
         });
 
-        describe('YouTube API is not loaded', function () {
-            beforeEach(function () {
+        describe('YouTube API is not loaded', function() {
+            var state;
+            beforeEach(function() {
                 window.YT = undefined;
-
-                state = jasmine.initializePlayerYouTube('video.html');
+                state = jasmine.initializePlayerYouTube();
             });
 
-            it('callback, to be called after YouTube API loads, exists and is called', function () {
-                waitsFor(function () {
-                    return state.youtubeApiAvailable === true;
-                }, 'YouTube API is loaded', 3000);
+            afterEach(function() {
+                state.storage.clear();
+                state.videoPlayer.destroy();
+            });
 
-                runs(function () {
+            it('callback, to be called after YouTube API loads, exists and is called', function(done) {
+                window.YT = jasmine.YT;
+                // Call the callback that must be called when YouTube API is
+                // loaded. By specification.
+                window.onYouTubeIframeAPIReady();
+                jasmine.waitUntil(function() {
+                    return state.youtubeApiAvailable === true;
+                }).done(function() {
                     // If YouTube API is not loaded, then the code will should create
                     // a global callback that will be called by API once it is loaded.
                     expect(window.onYouTubeIframeAPIReady).not.toBeUndefined();
-                });
+                }).always(done);
             });
         });
 
-        describe('checking start and end times', function () {
+        describe('checking start and end times', function() {
+            var state;
             var miniTestSuite = [
                 {
                     itDescription: 'both times are proper',
@@ -159,26 +158,23 @@
                 }
             ];
 
-            beforeEach(function () {
-                loadFixtures('video.html');
-
+            afterEach(function() {
+                state.storage.clear();
+                state.videoPlayer.destroy();
             });
 
-            $.each(miniTestSuite, function (index, test) {
+            $.each(miniTestSuite, function(index, test) {
                 itFabrique(test.itDescription, test.data, test.expectData);
             });
 
             return;
 
             function itFabrique(itDescription, data, expectData) {
-                it(itDescription, function () {
-                    $('#example').find('.video')
-                        .data({
-                            'start': data.start,
-                            'end': data.end
-                        });
-
-                    state = new Video('#example');
+                it(itDescription, function() {
+                    state = jasmine.initializePlayer('video.html', {
+                        start: data.start,
+                        end: data.end
+                    });
 
                     expect(state.config.startTime).toBe(expectData.start);
                     expect(state.config.endTime).toBe(expectData.end);
@@ -187,10 +183,10 @@
         });
 
         // Disabled 11/25/13 due to flakiness in master
-        xdescribe('multiple YT on page', function () {
+        xdescribe('multiple YT on page', function() {
             var state1, state2, state3;
 
-            beforeEach(function () {
+            beforeEach(function() {
                 loadFixtures('video_yt_multiple.html');
 
                 spyOn($, 'ajaxWithPrefix');
@@ -211,53 +207,31 @@
 
             it(
                 'check for YT availability is performed only once',
-                function ()
-            {
-                var numAjaxCalls = 0;
+                function() {
+                    var numAjaxCalls = 0;
 
                 // Total ajax calls made.
-                numAjaxCalls = $.ajax.calls.length;
+                    numAjaxCalls = $.ajax.calls.length;
 
                 // Subtract ajax calls to get captions via
                 // state.videoCaption.fetchCaption() function.
-                numAjaxCalls -= $.ajaxWithPrefix.calls.length;
+                    numAjaxCalls -= $.ajaxWithPrefix.calls.length;
 
                 // Subtract ajax calls to get metadata for each video via
                 // state.getVideoMetadata() function.
-                numAjaxCalls -= 3;
+                    numAjaxCalls -= 3;
 
                 // Subtract ajax calls to log event 'pause_video' via
                 // state.videoPlayer.log() function.
-                numAjaxCalls -= 3;
+                    numAjaxCalls -= 3;
 
                 // This should leave just one call. It was made to check
                 // for YT availability. This is done in state.initialize()
                 // function. SPecifically, with the statement
                 //
                 //     this.youtubeXhr = this.getVideoMetadata();
-                expect(numAjaxCalls).toBe(1);
-            });
-        });
-
-        describe('log', function () {
-            beforeEach(function () {
-                loadFixtures('video_html5.html');
-                state = new Video('#example');
-                spyOn(Logger, 'log');
-                state.videoPlayer.log('someEvent', {
-                    currentTime: 25,
-                    speed: '1.0'
+                    expect(numAjaxCalls).toBe(1);
                 });
-            });
-
-            it('call the logger with valid extra parameters', function () {
-                expect(Logger.log).toHaveBeenCalledWith('someEvent', {
-                    id: 'id',
-                    code: 'html5',
-                    currentTime: 25,
-                    speed: '1.0'
-                });
-            });
         });
     });
 }).call(this);

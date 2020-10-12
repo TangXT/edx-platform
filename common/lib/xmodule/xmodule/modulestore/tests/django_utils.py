@@ -3,48 +3,86 @@
 Modulestore configuration for test cases.
 """
 
-from uuid import uuid4
+
+import copy
+import functools
+import os
+from contextlib import contextmanager
+from enum import Enum
+
+from django.conf import settings
+from django.contrib.auth.models import AnonymousUser, User
 from django.test import TestCase
-from django.contrib.auth.models import User
+from django.test.utils import override_settings
+from mock import patch
+from six.moves import range
+
+from lms.djangoapps.courseware.tests.factories import StaffFactory
+from lms.djangoapps.courseware.field_overrides import OverrideFieldData
+from openedx.core.djangolib.testing.utils import CacheIsolationMixin, CacheIsolationTestCase, FilteredQueryCountMixin
+from openedx.core.lib.tempdir import mkdtemp_clean
+from student.models import CourseEnrollment
+from student.tests.factories import AdminFactory, UserFactory
 from xmodule.contentstore.django import _CONTENTSTORE
-from xmodule.modulestore.django import modulestore, clear_existing_modulestores
 from xmodule.modulestore import ModuleStoreEnum
-import datetime
-import pytz
-from xmodule.tabs import CoursewareTab, CourseInfoTab, StaticTab, DiscussionTab, ProgressTab, WikiTab
-from xmodule.modulestore.tests.sample_courses import default_block_info_tree, TOY_BLOCK_INFO_TREE
+from xmodule.modulestore.django import SignalHandler, clear_existing_modulestores, modulestore
+from xmodule.modulestore.tests.factories import XMODULE_FACTORY_LOCK
+from xmodule.modulestore.tests.mongo_connection import MONGO_HOST, MONGO_PORT_NUM
 
 
-def mixed_store_config(data_dir, mappings):
+class CourseUserType(Enum):
+    """
+    Types of users to be used when testing a course.
+    """
+    ANONYMOUS = 'anonymous'
+    COURSE_STAFF = 'course_staff'
+    ENROLLED = 'enrolled'
+    GLOBAL_STAFF = 'global_staff'
+    UNENROLLED = 'unenrolled'
+    UNENROLLED_STAFF = 'unenrolled_staff'
+
+
+class StoreConstructors(object):
+    """Enumeration of store constructor types."""
+    draft, split = list(range(2))
+
+
+def mixed_store_config(data_dir, mappings, store_order=None):
     """
     Return a `MixedModuleStore` configuration, which provides
-    access to both Mongo- and XML-backed courses.
+    access to both Mongo-backed courses.
 
-    `data_dir` is the directory from which to load XML-backed courses.
-    `mappings` is a dictionary mapping course IDs to modulestores, for example:
+    Args:
+        data_dir (string): the directory from which to load XML-backed courses.
+        mappings (string): a dictionary mapping course IDs to modulestores, for example:
 
-        {
-            'MITx/2.01x/2013_Spring': 'xml',
-            'edx/999/2013_Spring': 'default'
-        }
+            {
+                'MITx/2.01x/2013_Spring': 'xml',
+                'edx/999/2013_Spring': 'default'
+            }
 
-    where 'xml' and 'default' are the two options provided by this configuration,
-    mapping (respectively) to XML-backed and Mongo-backed modulestores..
+        where 'xml' and 'default' are the two options provided by this configuration,
+        mapping (respectively) to XML-backed and Mongo-backed modulestores..
+
+    Keyword Args:
+
+        store_order (list): List of StoreConstructors providing order of modulestores
+            to use in creating courses.
     """
-    draft_mongo_config = draft_mongo_store_config(data_dir)
-    xml_config = xml_store_config(data_dir)
-    split_mongo = split_mongo_store_config(data_dir)
+    if store_order is None:
+        store_order = [StoreConstructors.draft, StoreConstructors.split]
+
+    store_constructors = {
+        StoreConstructors.split: split_mongo_store_config(data_dir)['default'],
+        StoreConstructors.draft: draft_mongo_store_config(data_dir)['default'],
+    }
 
     store = {
         'default': {
             'ENGINE': 'xmodule.modulestore.mixed.MixedModuleStore',
             'OPTIONS': {
                 'mappings': mappings,
-                'stores': [
-                    draft_mongo_config['default'],
-                    split_mongo['default'],
-                    xml_config['default'],
-                ]
+                'stores': [store_constructors[store] for store in store_order],
             }
         }
     }
@@ -67,9 +105,10 @@ def draft_mongo_store_config(data_dir):
             'NAME': 'draft',
             'ENGINE': 'xmodule.modulestore.mongo.draft.DraftModuleStore',
             'DOC_STORE_CONFIG': {
-                'host': 'localhost',
-                'db': 'test_xmodule',
-                'collection': 'modulestore{0}'.format(uuid4().hex[:5]),
+                'host': MONGO_HOST,
+                'port': MONGO_PORT_NUM,
+                'db': 'test_xmodule_{}'.format(os.getpid()),
+                'collection': 'modulestore',
             },
             'OPTIONS': modulestore_options
         }
@@ -93,9 +132,10 @@ def split_mongo_store_config(data_dir):
             'NAME': 'draft',
             'ENGINE': 'xmodule.modulestore.split_mongo.split_draft.DraftVersioningModuleStore',
             'DOC_STORE_CONFIG': {
-                'host': 'localhost',
-                'db': 'test_xmodule',
-                'collection': 'modulestore{0}'.format(uuid4().hex[:5]),
+                'host': MONGO_HOST,
+                'port': MONGO_PORT_NUM,
+                'db': 'test_xmodule_{}'.format(os.getpid()),
+                'collection': 'modulestore',
             },
             'OPTIONS': modulestore_options
         }
@@ -104,27 +144,308 @@ def split_mongo_store_config(data_dir):
     return store
 
 
-def xml_store_config(data_dir):
+def contentstore_config():
     """
-    Defines default module store using XMLModuleStore.
+    Return a new configuration for the contentstore that is isolated
+    from other such configurations.
     """
-    store = {
-        'default': {
-            'NAME': 'xml',
-            'ENGINE': 'xmodule.modulestore.xml.XMLModuleStore',
-            'OPTIONS': {
-                'data_dir': data_dir,
-                'default_class': 'xmodule.hidden_module.HiddenDescriptor',
+    return {
+        'ENGINE': 'xmodule.contentstore.mongo.MongoContentStore',
+        'DOC_STORE_CONFIG': {
+            'host': MONGO_HOST,
+            'db': 'test_xcontent_{}'.format(os.getpid()),
+            'port': MONGO_PORT_NUM,
+        },
+        # allow for additional options that can be keyed on a name, e.g. 'trashcan'
+        'ADDITIONAL_OPTIONS': {
+            'trashcan': {
+                'bucket': 'trash_fs'
             }
         }
     }
 
-    return store
+
+@patch('xmodule.modulestore.django.create_modulestore_instance', autospec=True)
+def drop_mongo_collections(mock_create):
+    """
+    If using a Mongo-backed modulestore & contentstore, drop the collections.
+    """
+    # Do not create the modulestore if it does not exist.
+    mock_create.return_value = None
+
+    module_store = modulestore()
+    if hasattr(module_store, '_drop_database'):
+        module_store._drop_database(database=False)  # pylint: disable=protected-access
+    _CONTENTSTORE.clear()
+    if hasattr(module_store, 'close_connections'):
+        module_store.close_connections()
 
 
+TEST_DATA_DIR = settings.COMMON_TEST_DATA_ROOT
+
+# This modulestore will provide a mixed mongo editable modulestore.
+# If your test uses the 'toy' course, use the the ToyCourseFactory to construct it.
+# If your test needs a closed course to test against, import the common/test/data/2014
+#   test course into this modulestore.
+# If your test needs a graded course to test against, import the common/test/data/graded
+#   test course into this modulestore.
+TEST_DATA_MIXED_MODULESTORE = functools.partial(
+    mixed_store_config,
+    TEST_DATA_DIR,
+    {}
+)
+
+# All store requests now go through mixed
+# Use this modulestore if you specifically want to test mongo and not a mocked modulestore.
+TEST_DATA_MONGO_MODULESTORE = functools.partial(mixed_store_config, mkdtemp_clean(), {})
+
+# All store requests now go through mixed
+# Use this modulestore if you specifically want to test split-mongo and not a mocked modulestore.
+TEST_DATA_SPLIT_MODULESTORE = functools.partial(
+    mixed_store_config,
+    mkdtemp_clean(),
+    {},
+    store_order=[StoreConstructors.split, StoreConstructors.draft]
+)
 
 
-class ModuleStoreTestCase(TestCase):
+class SignalIsolationMixin(object):
+    """
+    Simple utility mixin class to toggle ModuleStore signals on and off. This
+    class operates on `SwitchedSignal` objects on the modulestore's
+    `SignalHandler`.
+    """
+    @classmethod
+    def disable_all_signals(cls):
+        """Disable all signals in the modulestore's SignalHandler."""
+        for signal in SignalHandler.all_signals():
+            signal.disable()
+
+    @classmethod
+    def enable_all_signals(cls):
+        """Enable all signals in the modulestore's SignalHandler."""
+        for signal in SignalHandler.all_signals():
+            signal.enable()
+
+    @classmethod
+    def enable_signals_by_name(cls, *signal_names):
+        """
+        Enable specific signals in the modulestore's SignalHandler.
+
+        Arguments:
+            signal_names (list of `str`): Names of signals to enable.
+        """
+        for signal_name in signal_names:
+            try:
+                signal = SignalHandler.signal_by_name(signal_name)
+            except KeyError:
+                all_signal_names = sorted(s.name for s in SignalHandler.all_signals())
+                err_msg = (
+                    "You tried to enable signal '{}', but I don't recognize that "
+                    "signal name. Did you mean one of these?: {}"
+                )
+                raise ValueError(err_msg.format(signal_name, all_signal_names))
+            signal.enable()
+
+
+class ModuleStoreIsolationMixin(CacheIsolationMixin, SignalIsolationMixin):
+    """
+    A mixin to be used by TestCases that want to isolate their use of the
+    Modulestore.
+
+    How to use::
+
+        class MyTestCase(ModuleStoreMixin, TestCase):
+
+            MODULESTORE = <settings for the modulestore to test>
+
+            ENABLED_SIGNALS = ['course_published']
+
+            def my_test(self):
+                self.start_modulestore_isolation()
+                self.addCleanup(self.end_modulestore_isolation)
+
+                modulestore.create_course(...)
+                ...
+
+    """
+    MODULESTORE = functools.partial(mixed_store_config, mkdtemp_clean(), {})
+    CONTENTSTORE = functools.partial(contentstore_config)
+    ENABLED_CACHES = ['default', 'mongo_metadata_inheritance', 'loc_cache']
+
+    # List of modulestore signals enabled for this test. Defaults to an empty
+    # list. The list of signals available is found on the SignalHandler class,
+    # in /common/lib/xmodule/xmodule/modulestore/xmodule_django.py
+    #
+    # You must use the signal itself, and not its name. So for example:
+    #
+    # class MyPublishTestCase(ModuleStoreTestCase):
+    #     ENABLED_SIGNALS = ['course_published', 'pre_publish']
+    #
+    ENABLED_SIGNALS = []
+
+    __settings_overrides = []
+    __old_modulestores = []
+    __old_contentstores = []
+
+    @classmethod
+    def start_modulestore_isolation(cls):
+        """
+        Isolate uses of the modulestore after this call. Once
+        :py:meth:`end_modulestore_isolation` is called, this modulestore will
+        be flushed (all content will be deleted).
+        """
+        cls.disable_all_signals()
+        cls.enable_signals_by_name(*cls.ENABLED_SIGNALS)
+        cls.start_cache_isolation()
+        override = override_settings(
+            MODULESTORE=cls.MODULESTORE(),
+            CONTENTSTORE=cls.CONTENTSTORE(),
+        )
+
+        cls.__old_modulestores.append(copy.deepcopy(settings.MODULESTORE))
+        cls.__old_contentstores.append(copy.deepcopy(settings.CONTENTSTORE))
+        override.__enter__()
+        cls.__settings_overrides.append(override)
+        XMODULE_FACTORY_LOCK.enable()
+        clear_existing_modulestores()
+        cls.store = modulestore()
+
+    @classmethod
+    def end_modulestore_isolation(cls):
+        """
+        Delete all content in the Modulestore, and reset the Modulestore
+        settings from before :py:meth:`start_modulestore_isolation` was
+        called.
+        """
+        drop_mongo_collections()  # pylint: disable=no-value-for-parameter
+        XMODULE_FACTORY_LOCK.disable()
+        cls.__settings_overrides.pop().__exit__(None, None, None)
+
+        assert settings.MODULESTORE == cls.__old_modulestores.pop()
+        assert settings.CONTENTSTORE == cls.__old_contentstores.pop()
+        cls.end_cache_isolation()
+        cls.enable_all_signals()
+
+
+class ModuleStoreTestUsersMixin():
+    """
+    A mixin to help manage test users.
+    """
+    TEST_PASSWORD = 'test'
+
+    def create_user_for_course(self, course, user_type=CourseUserType.ENROLLED):
+        """
+        Create a test user for a course.
+        """
+        if user_type is CourseUserType.ANONYMOUS:
+            return AnonymousUser()
+
+        is_enrolled = user_type is CourseUserType.ENROLLED
+        is_unenrolled_staff = user_type is CourseUserType.UNENROLLED_STAFF
+
+        # Set up the test user
+        if is_unenrolled_staff:
+            user = StaffFactory(course_key=course.id, password=self.TEST_PASSWORD)
+        elif user_type is CourseUserType.GLOBAL_STAFF:
+            user = AdminFactory(password=self.TEST_PASSWORD)
+        else:
+            user = UserFactory(password=self.TEST_PASSWORD)
+        self.client.login(username=user.username, password=self.TEST_PASSWORD)
+        if is_enrolled:
+            CourseEnrollment.enroll(user, course.id)
+        return user
+
+
+class SharedModuleStoreTestCase(
+    ModuleStoreTestUsersMixin, FilteredQueryCountMixin, ModuleStoreIsolationMixin, CacheIsolationTestCase
+):
+    """
+    Subclass for any test case that uses a ModuleStore that can be shared
+    between individual tests. This class ensures that the ModuleStore is cleaned
+    before/after the entire test case has run. Use this class if your tests
+    set up one or a small number of courses that individual tests do not modify.
+    If your tests modify contents in the ModuleStore, you should use
+    ModuleStoreTestCase instead.
+
+    How to use::
+
+        from xmodule.modulestore.tests.django_utils import SharedModuleStoreTestCase
+        from student.tests.factories import CourseEnrollmentFactory, UserFactory
+
+        class MyModuleStoreTestCase(SharedModuleStoreTestCase):
+            @classmethod
+            def setUpClass(cls):
+                super(MyModuleStoreTestCase, cls).setUpClass()
+                cls.course = CourseFactory.create()
+
+            def setUp(self):
+                super(MyModuleStoreTestCase, self).setUp()
+                self.user = UserFactory.create()
+                CourseEnrollmentFactory.create(
+                    user=self.user, course_id=self.course.id
+                )
+
+    Important things to note:
+
+    1. You're creating the course in setUpClass(), *not* in setUp().
+    2. Any Django ORM operations should still happen in setUp(). Models created
+       in setUpClass() will *not* be cleaned up, and will leave side-effects
+       that can break other, completely unrelated test cases.
+
+    In Django 1.8, we will be able to use setUpTestData() to do class level init
+    for Django ORM models that will get cleaned up properly.
+    """
+    # Tell Django to clean out all databases, not just default
+    multi_db = True
+
+    @classmethod
+    @contextmanager
+    def setUpClassAndTestData(cls):  # pylint: disable=invalid-name
+        """
+        For use when the test class has a setUpTestData() method that uses variables
+        that are setup during setUpClass() of the same test class.
+        Use it like so:
+        @classmethod
+        def setUpClass(cls):
+            # pylint: disable=super-method-not-called
+            with super(MyTestClass, cls).setUpClassAndTestData():
+                <all the cls.setUpClass() setup code that performs modulestore setup...>
+        @classmethod
+        def setUpTestData(cls):
+            <all the setup code that creates Django models per test class...>
+            <these models can use variables (courses) setup in setUpClass() above>
+        """
+        cls.start_modulestore_isolation()
+        # Now yield to allow the test class to run its setUpClass() setup code.
+        yield
+        # Now call the base class, which calls back into the test class's setUpTestData().
+        super(SharedModuleStoreTestCase, cls).setUpClass()
+
+    @classmethod
+    def setUpClass(cls):
+        """
+        Start modulestore isolation, and then load modulestore specific
+        test data.
+        """
+        super(SharedModuleStoreTestCase, cls).setUpClass()
+        cls.start_modulestore_isolation()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.end_modulestore_isolation()
+        super(SharedModuleStoreTestCase, cls).tearDownClass()
+
+    def setUp(self):
+        # OverrideFieldData.provider_classes is always reset to `None` so
+        # that they're recalculated for every test
+        OverrideFieldData.provider_classes = None
+        super(SharedModuleStoreTestCase, self).setUp()
+
+
+class ModuleStoreTestCase(
+    ModuleStoreTestUsersMixin, FilteredQueryCountMixin, ModuleStoreIsolationMixin, TestCase
+):
     """
     Subclass for any test case that uses a ModuleStore.
     Ensures that the ModuleStore is cleaned before/after each test.
@@ -132,15 +453,14 @@ class ModuleStoreTestCase(TestCase):
     Usage:
 
         1. Create a subclass of `ModuleStoreTestCase`
-        2. Use Django's @override_settings decorator to use
-           the desired modulestore configuration.
+        2. (optional) If you need a specific variety of modulestore, or particular ModuleStore
+           options, set the MODULESTORE class attribute of your test class to the
+           appropriate modulestore config.
 
            For example:
 
-               MIXED_CONFIG = mixed_store_config(data_dir, mappings)
-
-               @override_settings(MODULESTORE=MIXED_CONFIG)
                class FooTest(ModuleStoreTestCase):
+                   MODULESTORE = mixed_store_config(data_dir, mappings)
                    # ...
 
         3. Use factories (e.g. `CourseFactory`, `ItemFactory`) to populate
@@ -162,25 +482,45 @@ class ModuleStoreTestCase(TestCase):
           `clear_existing_modulestores()` directly in
           your `setUp()` method.
     """
-    def setUp(self, **kwargs):
-        """
-        Creates a test User if `create_user` is True.
-        Returns the password for the test User.
 
-        Args:
-            create_user - specifies whether or not to create a test User.  Default is True.
+    CREATE_USER = True
+
+    # Tell Django to clean out all databases, not just default
+    multi_db = True
+
+    @classmethod
+    def setUpClass(cls):
+        super(ModuleStoreTestCase, cls).setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super(ModuleStoreTestCase, cls).tearDownClass()
+
+    def setUp(self):
         """
+        Creates a test User if `self.CREATE_USER` is True.
+        Sets the password as self.user_password.
+        """
+        self.start_modulestore_isolation()
+
+        self.addCleanup(self.end_modulestore_isolation)
+
+        # When testing CCX, we should make sure that
+        # OverrideFieldData.provider_classes is always reset to `None` so
+        # that they're recalculated for every test
+        OverrideFieldData.provider_classes = None
+
         super(ModuleStoreTestCase, self).setUp()
 
         self.store = modulestore()
 
         uname = 'testuser'
         email = 'test+courses@edx.org'
-        password = 'foo'
+        self.user_password = 'foo'
 
-        if kwargs.pop('create_user', True):
+        if self.CREATE_USER:
             # Create the user so we can log them in.
-            self.user = User.objects.create_user(uname, email, password)
+            self.user = User.objects.create_user(uname, email, self.user_password)
 
             # Note that we do not actually need to do anything
             # for registration if we directly mark them active.
@@ -189,8 +529,6 @@ class ModuleStoreTestCase(TestCase):
             # Staff has access to view all courses
             self.user.is_staff = True
             self.user.save()
-
-        return password
 
     def create_non_staff_user(self):
         """
@@ -219,151 +557,3 @@ class ModuleStoreTestCase(TestCase):
             self.store.update_item(course, user_id)
         updated_course = self.store.get_course(course.id)
         return updated_course
-
-    @staticmethod
-    def drop_mongo_collections():
-        """
-        If using a Mongo-backed modulestore & contentstore, drop the collections.
-        """
-        module_store = modulestore()
-        if hasattr(module_store, '_drop_database'):
-            module_store._drop_database()  # pylint: disable=protected-access
-        _CONTENTSTORE.clear()
-
-    @classmethod
-    def setUpClass(cls):
-        """
-        Delete the existing modulestores, causing them to be reloaded.
-        """
-        # Clear out any existing modulestores,
-        # which will cause them to be re-created
-        # the next time they are accessed.
-        clear_existing_modulestores()
-        TestCase.setUpClass()
-
-    def _pre_setup(self):
-        """
-        Flush the ModuleStore.
-        """
-
-        # Flush the Mongo modulestore
-        self.drop_mongo_collections()
-
-        # Call superclass implementation
-        super(ModuleStoreTestCase, self)._pre_setup()
-
-    def _post_teardown(self):
-        """
-        Flush the ModuleStore after each test.
-        """
-        self.drop_mongo_collections()
-        # Clear out the existing modulestores,
-        # which will cause them to be re-created
-        # the next time they are accessed.
-        # We do this at *both* setup and teardown just to be safe.
-        clear_existing_modulestores()
-
-        # Call superclass implementation
-        super(ModuleStoreTestCase, self)._post_teardown()
-
-    def create_sample_course(self, org, course, run, block_info_tree=default_block_info_tree, course_fields=None):
-        """
-        create a course in the default modulestore from the collection of BlockInfo
-        records defining the course tree
-        Returns:
-            course_loc: the CourseKey for the created course
-        """
-        with self.store.branch_setting(ModuleStoreEnum.Branch.draft_preferred, None):
-#             with self.store.bulk_write_operations(self.store.make_course_key(org, course, run)):
-                course = self.store.create_course(org, course, run, self.user.id, fields=course_fields)
-                self.course_loc = course.location
-
-                def create_sub_tree(parent_loc, block_info):
-                    block = self.store.create_child(
-                        self.user.id,
-                        # TODO remove version_agnostic() when we impl the single transaction
-                        parent_loc.version_agnostic(),
-                        block_info.category, block_id=block_info.block_id,
-                        fields=block_info.fields,
-                    )
-                    for tree in block_info.sub_tree:
-                        create_sub_tree(block.location, tree)
-                    setattr(self, block_info.block_id, block.location.version_agnostic())
-
-                for tree in block_info_tree:
-                    create_sub_tree(self.course_loc, tree)
-
-                # remove version_agnostic when bulk write works
-                self.store.publish(self.course_loc.version_agnostic(), self.user.id)
-        return self.course_loc.course_key.version_agnostic()
-
-    def create_toy_course(self, org='edX', course='toy', run='2012_Fall'):
-        """
-        Create an equivalent to the toy xml course
-        """
-#        with self.store.bulk_write_operations(self.store.make_course_key(org, course, run)):
-        self.toy_loc = self.create_sample_course(
-            org, course, run, TOY_BLOCK_INFO_TREE,
-            {
-                "textbooks" : [["Textbook", "https://s3.amazonaws.com/edx-textbooks/guttag_computation_v3/"]],
-                "wiki_slug" : "toy",
-                "display_name" : "Toy Course",
-                "graded" : True,
-                "tabs" : [
-                     CoursewareTab(),
-                     CourseInfoTab(),
-                     StaticTab(name="Syllabus", url_slug="syllabus"),
-                     StaticTab(name="Resources", url_slug="resources"),
-                     DiscussionTab(),
-                     WikiTab(),
-                     ProgressTab(),
-                ],
-                "discussion_topics" : {"General" : {"id" : "i4x-edX-toy-course-2012_Fall"}},
-                "graceperiod" : datetime.timedelta(days=2, seconds=21599),
-                "start" : datetime.datetime(2015, 07, 17, 12, tzinfo=pytz.utc),
-                "xml_attributes" : {"filename" : ["course/2012_Fall.xml", "course/2012_Fall.xml"]},
-                "pdf_textbooks" : [
-                    {
-                        "tab_title" : "Sample Multi Chapter Textbook",
-                        "id" : "MyTextbook",
-                        "chapters" : [
-                             {"url" : "/static/Chapter1.pdf", "title" : "Chapter 1"},
-                             {"url" : "/static/Chapter2.pdf", "title" : "Chapter 2"}
-                        ]
-                     }
-                ],
-                "course_image" : "just_a_test.jpg",
-            }
-        )
-        with self.store.branch_setting(ModuleStoreEnum.Branch.draft_preferred, self.toy_loc):
-            self.store.create_item(
-                self.user.id, self.toy_loc, "about", block_id="short_description",
-                fields={"data" : "A course about toys."}
-            )
-            self.store.create_item(
-                self.user.id, self.toy_loc, "about", block_id="effort",
-                fields={"data": "6 hours"}
-            )
-            self.store.create_item(
-                self.user.id, self.toy_loc, "about", block_id="end_date",
-                fields={"data": "TBD"}
-            )
-            self.store.create_item(
-                self.user.id, self.toy_loc, "about", block_id="overview",
-                fields={
-                    "data": "<section class=\"about\">\n  <h2>About This Course</h2>\n  <p>Include your long course description here. The long course description should contain 150-400 words.</p>\n\n  <p>This is paragraph 2 of the long course description. Add more paragraphs as needed. Make sure to enclose them in paragraph tags.</p>\n</section>\n\n<section class=\"prerequisites\">\n  <h2>Prerequisites</h2>\n  <p>Add information about course prerequisites here.</p>\n</section>\n\n<section class=\"course-staff\">\n  <h2>Course Staff</h2>\n  <article class=\"teacher\">\n    <div class=\"teacher-image\">\n      <img src=\"/static/images/pl-faculty.png\" align=\"left\" style=\"margin:0 20 px 0\" alt=\"Course Staff Image #1\">\n    </div>\n\n    <h3>Staff Member #1</h3>\n    <p>Biography of instructor/staff member #1</p>\n  </article>\n\n  <article class=\"teacher\">\n    <div class=\"teacher-image\">\n      <img src=\"/static/images/pl-faculty.png\" align=\"left\" style=\"margin:0 20 px 0\" alt=\"Course Staff Image #2\">\n    </div>\n\n    <h3>Staff Member #2</h3>\n    <p>Biography of instructor/staff member #2</p>\n  </article>\n</section>\n\n<section class=\"faq\">\n  <section class=\"responses\">\n    <h2>Frequently Asked Questions</h2>\n    <article class=\"response\">\n      <h3>Do I need to buy a textbook?</h3>\n      <p>No, a free online version of Chemistry: Principles, Patterns, and Applications, First Edition by Bruce Averill and Patricia Eldredge will be available, though you can purchase a printed version (published by FlatWorld Knowledge) if you’d like.</p>\n    </article>\n\n    <article class=\"response\">\n      <h3>Question #2</h3>\n      <p>Your answer would be displayed here.</p>\n    </article>\n  </section>\n</section>\n"
-                }
-            )
-            self.store.create_item(
-                self.user.id, self.toy_loc, "course_info", "handouts",
-                fields={"data": "<a href='/static/handouts/sample_handout.txt'>Sample</a>"}
-            )
-            self.store.create_item(
-                self.user.id, self.toy_loc, "static_tab", "resources",
-                fields={"display_name": "Resources"},
-            )
-            self.store.create_item(
-                self.user.id, self.toy_loc, "static_tab", "syllabus",
-                fields={"display_name": "Syllabus"},
-            )
-        return self.toy_loc

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 This config file runs the simplest dev environment using sqlite, and db-based
 sessions. Assumes structure:
@@ -10,43 +11,68 @@ sessions. Assumes structure:
 
 # We intentionally define lots of variables that aren't used, and
 # want to import all variables from base settings files
-# pylint: disable=W0401, W0614
+# pylint: disable=wildcard-import, unused-wildcard-import
 
-from .common import *
+
 import os
-from path import path
-from warnings import filterwarnings, simplefilter
 from uuid import uuid4
 
+from django.utils.translation import ugettext_lazy
+from path import Path as path
+
+from openedx.core.lib.derived import derive_settings
+
+from xmodule.modulestore.modulestore_settings import update_module_store_settings
+
+from .common import *
+
 # import settings from LMS for consistent behavior with CMS
-from lms.envs.test import (WIKI_ENABLED, PLATFORM_NAME, SITE_NAME)
+from lms.envs.test import (  # pylint: disable=wrong-import-order
+    COMPREHENSIVE_THEME_DIRS,
+    DEFAULT_FILE_STORAGE,
+    ECOMMERCE_API_URL,
+    ENABLE_COMPREHENSIVE_THEMING,
+    JWT_AUTH,
+    MEDIA_ROOT,
+    MEDIA_URL,
+    PLATFORM_DESCRIPTION,
+    PLATFORM_NAME,
+    REGISTRATION_EXTRA_FIELDS,
+    GRADES_DOWNLOAD,
+    SITE_NAME,
+    WIKI_ENABLED
+)
 
-# Nose Test Runner
-TEST_RUNNER = 'django_nose.NoseTestSuiteRunner'
 
-_system = 'cms'
-_report_dir = REPO_ROOT / 'reports' / _system
-_report_dir.makedirs_p()
+# Include a non-ascii character in STUDIO_NAME and STUDIO_SHORT_NAME to uncover possible
+# UnicodeEncodeErrors in tests. Also use lazy text to reveal possible json dumps errors
+STUDIO_NAME = ugettext_lazy(u"Your Platform 𝓢𝓽𝓾𝓭𝓲𝓸")
+STUDIO_SHORT_NAME = ugettext_lazy(u"𝓢𝓽𝓾𝓭𝓲𝓸")
 
-NOSE_ARGS = [
-    '--id-file', REPO_ROOT / '.testids' / _system / 'noseids',
-    '--xunit-file', _report_dir / 'nosetests.xml',
+# Allow all hosts during tests, we use a lot of different ones all over the codebase.
+ALLOWED_HOSTS = [
+    '*'
 ]
+
+# mongo connection settings
+MONGO_PORT_NUM = int(os.environ.get('EDXAPP_TEST_MONGO_PORT', '27017'))
+MONGO_HOST = os.environ.get('EDXAPP_TEST_MONGO_HOST', 'localhost')
+
+THIS_UUID = uuid4().hex[:5]
 
 TEST_ROOT = path('test_root')
 
 # Want static files in the same dir for running on jenkins.
 STATIC_ROOT = TEST_ROOT / "staticfiles"
+WEBPACK_LOADER['DEFAULT']['STATS_FILE'] = STATIC_ROOT / "webpack-stats.json"
 
 GITHUB_REPO_ROOT = TEST_ROOT / "data"
+DATA_DIR = TEST_ROOT / "data"
 COMMON_TEST_DATA_ROOT = COMMON_ROOT / "test" / "data"
 
 # For testing "push to lms"
 FEATURES['ENABLE_EXPORT_GIT'] = True
 GIT_REPO_EXPORT_DIR = TEST_ROOT / "export_course_repos"
-
-# Makes the tests run much faster...
-SOUTH_TESTS_MIGRATE = False  # To disable migrations and use syncdb instead
 
 # TODO (cpennington): We need to figure out how envs/test.py can inject things into common.py so that we don't have to repeat this sort of thing
 STATICFILES_DIRS = [
@@ -59,17 +85,15 @@ STATICFILES_DIRS += [
     if os.path.isdir(COMMON_TEST_DATA_ROOT / course_dir)
 ]
 
-# Add split as another store for testing
-MODULESTORE['default']['OPTIONS']['stores'].append(
-    {
-        'NAME': 'split',
-        'ENGINE': 'xmodule.modulestore.split_mongo.split_draft.DraftVersioningModuleStore',
-        'DOC_STORE_CONFIG': DOC_STORE_CONFIG,
-        'OPTIONS': {
-            'render_template': 'edxmako.shortcuts.render_to_string',
-        }
-    },
-)
+# Avoid having to run collectstatic before the unit test suite
+# If we don't add these settings, then Django templates that can't
+# find pipelined assets will raise a ValueError.
+# http://stackoverflow.com/questions/12816941/unit-testing-with-django-pipeline
+STATICFILES_STORAGE = 'pipeline.storage.NonPackagingPipelineStorage'
+STATIC_URL = "/static/"
+
+BLOCK_STRUCTURES_SETTINGS['PRUNING_ACTIVE'] = True
+
 # Update module store settings per defaults for tests
 update_module_store_settings(
     MODULESTORE,
@@ -78,16 +102,19 @@ update_module_store_settings(
         'fs_root': TEST_ROOT / "data",
     },
     doc_store_settings={
-        'db': 'test_xmodule',
-        'collection': 'test_modulestore{0}'.format(uuid4().hex[:5]),
+        'db': 'test_xmodule_{}'.format(THIS_UUID),
+        'host': MONGO_HOST,
+        'port': MONGO_PORT_NUM,
+        'collection': 'test_modulestore',
     },
 )
 
 CONTENTSTORE = {
     'ENGINE': 'xmodule.contentstore.mongo.MongoContentStore',
     'DOC_STORE_CONFIG': {
-        'host': 'localhost',
-        'db': 'test_xcontent',
+        'host': MONGO_HOST,
+        'db': 'test_xcontent_{}'.format(THIS_UUID),
+        'port': MONGO_PORT_NUM,
         'collection': 'dont_trip',
     },
     # allow for additional options that can be keyed on a name, e.g. 'trashcan'
@@ -102,11 +129,15 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': TEST_ROOT / "db" / "cms.db",
+        'ATOMIC_REQUESTS': True,
     },
 }
 
 LMS_BASE = "localhost:8000"
-FEATURES['PREVIEW_LMS_BASE'] = "preview"
+LMS_ROOT_URL = "http://{}".format(LMS_BASE)
+FEATURES['PREVIEW_LMS_BASE'] = "preview.localhost"
+
+COURSE_AUTHORING_MICROFRONTEND_URL = "http://course-authoring-mfe"
 
 CACHES = {
     # This is the cache used for most things. Askbot will not work without a
@@ -132,7 +163,7 @@ CACHES = {
 
     'mongo_metadata_inheritance': {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': '/var/tmp/mongo_metadata_inheritance',
+        'LOCATION': os.path.join(tempfile.gettempdir(), 'mongo_metadata_inheritance'),
         'TIMEOUT': 300,
         'KEY_FUNCTION': 'util.memcache.safe_key',
     },
@@ -140,32 +171,32 @@ CACHES = {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
         'LOCATION': 'edx_location_mem_cache',
     },
-
+    'course_structure_cache': {
+        'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
+    },
 }
 
-# Add external_auth to Installed apps for testing
-INSTALLED_APPS += ('external_auth', )
-
-# hide ratelimit warnings while running tests
-filterwarnings('ignore', message='No request passed to the backend, unable to rate-limit')
-
-# Ignore deprecation warnings (so we don't clutter Jenkins builds/production)
-# https://docs.python.org/2/library/warnings.html#the-warnings-filter
-simplefilter('ignore')  # Change to "default" to see the first instance of each hit
-                        # or "error" to convert all into errors
+############################### BLOCKSTORE #####################################
+# Blockstore tests
+RUN_BLOCKSTORE_TESTS = os.environ.get('EDXAPP_RUN_BLOCKSTORE_TESTS', 'no').lower() in ('true', 'yes', '1')
+BLOCKSTORE_API_URL = os.environ.get('EDXAPP_BLOCKSTORE_API_URL', "http://edx.devstack.blockstore-test:18251/api/v1/")
+BLOCKSTORE_API_AUTH_TOKEN = os.environ.get('EDXAPP_BLOCKSTORE_API_AUTH_TOKEN', 'edxapp-test-key')
 
 ################################# CELERY ######################################
 
 CELERY_ALWAYS_EAGER = True
-CELERY_RESULT_BACKEND = 'cache'
-BROKER_TRANSPORT = 'memory'
+CELERY_RESULT_BACKEND = 'django-cache'
 
+CLEAR_REQUEST_CACHE_ON_TASK_COMPLETION = False
+
+# test_status_cancel in cms/cms_user_tasks/test.py is failing without this
+# @override_setting for BROKER_URL is not working in testcase, so updating here
+BROKER_URL = 'memory://localhost/'
 
 ########################### Server Ports ###################################
 
 # These ports are carefully chosen so that if the browser needs to
 # access them, they will be available through the SauceLabs SSH tunnel
-LETTUCE_SERVER_PORT = 8003
 XQUEUE_PORT = 8040
 YOUTUBE_PORT = 8031
 LTI_PORT = 8765
@@ -174,50 +205,122 @@ VIDEO_SOURCE_PORT = 8777
 
 ################### Make tests faster
 # http://slacy.com/blog/2012/04/make-your-tests-faster-in-django-1-4/
-PASSWORD_HASHERS = (
+PASSWORD_HASHERS = [
     'django.contrib.auth.hashers.SHA1PasswordHasher',
     'django.contrib.auth.hashers.MD5PasswordHasher',
-)
+]
 
-# dummy segment-io key
-SEGMENT_IO_KEY = '***REMOVED***'
+# No segment key
+CMS_SEGMENT_KEY = None
+
+FEATURES['DISABLE_SET_JWT_COOKIES_FOR_TESTS'] = True
 
 FEATURES['ENABLE_SERVICE_STATUS'] = True
-
-# This is to disable a test under the common directory that will not pass when run under CMS
-FEATURES['DISABLE_RESET_EMAIL_TEST'] = True
 
 # Toggles embargo on for testing
 FEATURES['EMBARGO'] = True
 
-# set up some testing for microsites
-MICROSITE_CONFIGURATION = {
-    "test_microsite": {
-        "domain_prefix": "testmicrosite",
-        "university": "test_microsite",
-        "platform_name": "Test Microsite",
-        "logo_image_url": "test_microsite/images/header-logo.png",
-        "email_from_address": "test_microsite@edx.org",
-        "payment_support_email": "test_microsite@edx.org",
-        "ENABLE_MKTG_SITE": False,
-        "SITE_NAME": "test_microsite.localhost",
-        "course_org_filter": "TestMicrositeX",
-        "course_about_show_social_links": False,
-        "css_overrides_file": "test_microsite/css/test_microsite.css",
-        "show_partners": False,
-        "show_homepage_promo_video": False,
-        "course_index_overlay_text": "This is a Test Microsite Overlay Text.",
-        "course_index_overlay_logo_file": "test_microsite/images/header-logo.png",
-        "homepage_overlay_html": "<h1>This is a Test Microsite Overlay HTML</h1>"
-    },
-    "default": {
-        "university": "default_university",
-        "domain_prefix": "www",
-    }
-}
-MICROSITE_ROOT_DIR = COMMON_ROOT / 'test' / 'test_microsites'
-FEATURES['USE_MICROSITES'] = True
+TEST_THEME = COMMON_ROOT / "test" / "test-theme"
 
 # For consistency in user-experience, keep the value of this setting in sync with
 # the one in lms/envs/test.py
 FEATURES['ENABLE_DISCUSSION_SERVICE'] = False
+
+# Enable a parental consent age limit for testing
+PARENTAL_CONSENT_AGE_LIMIT = 13
+
+# Enable certificates for the tests
+FEATURES['CERTIFICATES_HTML_VIEW'] = True
+
+# Enable content libraries code for the tests
+FEATURES['ENABLE_CONTENT_LIBRARIES'] = True
+
+FEATURES['ENABLE_EDXNOTES'] = True
+
+# MILESTONES
+FEATURES['MILESTONES_APP'] = True
+
+# ENTRANCE EXAMS
+FEATURES['ENTRANCE_EXAMS'] = True
+ENTRANCE_EXAM_MIN_SCORE_PCT = 50
+
+VIDEO_CDN_URL = {
+    'CN': 'http://api.xuetangx.com/edx/video?s3_url='
+}
+
+# Courseware Search Index
+FEATURES['ENABLE_COURSEWARE_INDEX'] = True
+FEATURES['ENABLE_LIBRARY_INDEX'] = True
+FEATURES['ENABLE_CONTENT_LIBRARY_INDEX'] = False
+SEARCH_ENGINE = "search.tests.mock_search_engine.MockSearchEngine"
+
+FEATURES['ENABLE_ENROLLMENT_TRACK_USER_PARTITION'] = True
+
+####################### ELASTICSEARCH TESTS #######################
+# Enable this when testing elasticsearch-based code which couldn't be tested using the mock engine
+ENABLE_ELASTICSEARCH_FOR_TESTS = os.environ.get(
+    'EDXAPP_ENABLE_ELASTICSEARCH_FOR_TESTS', 'no').lower() in ('true', 'yes', '1')
+
+TEST_ELASTICSEARCH_USE_SSL = os.environ.get(
+    'EDXAPP_TEST_ELASTICSEARCH_USE_SSL', 'no').lower() in ('true', 'yes', '1')
+TEST_ELASTICSEARCH_HOST = os.environ.get('EDXAPP_TEST_ELASTICSEARCH_HOST', 'edx.devstack.elasticsearch')
+TEST_ELASTICSEARCH_PORT = int(os.environ.get('EDXAPP_TEST_ELASTICSEARCH_PORT', '9200'))
+
+########################## AUTHOR PERMISSION #######################
+FEATURES['ENABLE_CREATOR_GROUP'] = False
+
+# teams feature
+FEATURES['ENABLE_TEAMS'] = True
+
+# Dummy secret key for dev/test
+SECRET_KEY = '85920908f28904ed733fe576320db18cabd7b6cd'
+
+######### custom courses #########
+INSTALLED_APPS.append('openedx.core.djangoapps.ccxcon.apps.CCXConnectorConfig')
+FEATURES['CUSTOM_COURSES_EDX'] = True
+
+########################## VIDEO IMAGE STORAGE ############################
+VIDEO_IMAGE_SETTINGS = dict(
+    VIDEO_IMAGE_MAX_BYTES=2 * 1024 * 1024,    # 2 MB
+    VIDEO_IMAGE_MIN_BYTES=2 * 1024,       # 2 KB
+    STORAGE_KWARGS=dict(
+        location=MEDIA_ROOT,
+        base_url=MEDIA_URL,
+    ),
+    DIRECTORY_PREFIX='video-images/',
+)
+VIDEO_IMAGE_DEFAULT_FILENAME = 'default_video_image.png'
+
+########################## VIDEO TRANSCRIPTS STORAGE ############################
+VIDEO_TRANSCRIPTS_SETTINGS = dict(
+    VIDEO_TRANSCRIPTS_MAX_BYTES=3 * 1024 * 1024,    # 3 MB
+    STORAGE_KWARGS=dict(
+        location=MEDIA_ROOT,
+        base_url=MEDIA_URL,
+    ),
+    DIRECTORY_PREFIX='video-transcripts/',
+)
+
+####################### Plugin Settings ##########################
+
+# pylint: disable=wrong-import-position, wrong-import-order
+from edx_django_utils.plugins import add_plugins
+# pylint: disable=wrong-import-position, wrong-import-order
+from openedx.core.djangoapps.plugins.constants import ProjectType, SettingsType
+add_plugins(__name__, ProjectType.CMS, SettingsType.TEST)
+
+########################## Derive Any Derived Settings  #######################
+
+derive_settings(__name__)
+
+############### Settings for edx-rbac  ###############
+SYSTEM_WIDE_ROLE_CLASSES = os.environ.get("SYSTEM_WIDE_ROLE_CLASSES", [])
+
+DEFAULT_MOBILE_AVAILABLE = True
+
+PROCTORING_SETTINGS = {}
+
+##### LOGISTRATION RATE LIMIT SETTINGS #####
+LOGISTRATION_RATELIMIT_RATE = '5/5m'
+
+REGISTRATION_VALIDATION_RATELIMIT = '5/minute'

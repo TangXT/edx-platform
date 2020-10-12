@@ -1,17 +1,21 @@
-import time
+
+
+import datetime
 import logging
 import re
+import time
 
-from xblock.fields import Field
-import datetime
 import dateutil.parser
-
+import six
 from pytz import UTC
+from six import text_type
+from xblock.fields import JSONField
+from xblock.scorable import Score
 
 log = logging.getLogger(__name__)
 
 
-class Date(Field):
+class Date(JSONField):
     '''
     Date fields know how to parse and produce json (iso) compatible formats. Converts to tz aware datetimes.
     '''
@@ -33,7 +37,7 @@ class Date(Field):
         result = dateutil.parser.parse(field, default=self.PREVENT_DEFAULT_DAY_MON_SEED1)
         result_other = dateutil.parser.parse(field, default=self.PREVENT_DEFAULT_DAY_MON_SEED2)
         if result != result_other:
-            log.warning("Field {0} is missing month or day".format(self._name, field))
+            log.warning("Field {0} is missing month or day".format(self.name))
             return None
         if result.tzinfo is None:
             result = result.replace(tzinfo=UTC)
@@ -47,11 +51,11 @@ class Date(Field):
         """
         if field is None:
             return field
-        elif field is "":
+        elif field == "":
             return None
-        elif isinstance(field, basestring):
+        elif isinstance(field, six.string_types):
             return self._parse_date_wo_default_month_day(field)
-        elif isinstance(field, (int, long, float)):
+        elif isinstance(field, six.integer_types) or isinstance(field, float):
             return datetime.datetime.fromtimestamp(field / 1000, UTC)
         elif isinstance(field, time.struct_time):
             return datetime.datetime.fromtimestamp(time.mktime(field), UTC)
@@ -59,7 +63,7 @@ class Date(Field):
             return field
         else:
             msg = "Field {0} has bad value '{1}'".format(
-                self._name, field)
+                self.name, field)
             raise TypeError(msg)
 
     def to_json(self, value):
@@ -73,6 +77,10 @@ class Date(Field):
             return time.strftime('%Y-%m-%dT%H:%M:%SZ', value)
         elif isinstance(value, datetime.datetime):
             if value.tzinfo is None or value.utcoffset().total_seconds() == 0:
+                if value.year < 1900:
+                    # strftime doesn't work for pre-1900 dates, so use
+                    # isoformat instead
+                    return value.isoformat()
                 # isoformat adds +00:00 rather than Z
                 return value.strftime('%Y-%m-%dT%H:%M:%SZ')
             else:
@@ -80,10 +88,12 @@ class Date(Field):
         else:
             raise TypeError("Cannot convert {!r} to json".format(value))
 
+    enforce_type = from_json
+
 TIMEDELTA_REGEX = re.compile(r'^((?P<days>\d+?) day(?:s?))?(\s)?((?P<hours>\d+?) hour(?:s?))?(\s)?((?P<minutes>\d+?) minute(?:s)?)?(\s)?((?P<seconds>\d+?) second(?:s)?)?$')
 
 
-class Timedelta(Field):
+class Timedelta(JSONField):
     # Timedeltas are immutable, see http://docs.python.org/2/library/datetime.html#available-types
     MUTABLE = False
 
@@ -99,17 +109,24 @@ class Timedelta(Field):
         """
         if time_str is None:
             return None
+
+        if isinstance(time_str, datetime.timedelta):
+            return time_str
+
         parts = TIMEDELTA_REGEX.match(time_str)
         if not parts:
             return
         parts = parts.groupdict()
         time_params = {}
-        for (name, param) in parts.iteritems():
+        for (name, param) in six.iteritems(parts):
             if param:
                 time_params[name] = int(param)
         return datetime.timedelta(**time_params)
 
     def to_json(self, value):
+        if value is None:
+            return None
+
         values = []
         for attr in ('days', 'hours', 'minutes', 'seconds'):
             cur_value = getattr(value, attr, 0)
@@ -117,8 +134,17 @@ class Timedelta(Field):
                 values.append("%d %s" % (cur_value, attr))
         return ' '.join(values)
 
+    def enforce_type(self, value):
+        """
+        Ensure that when set explicitly the Field is set to a timedelta
+        """
+        if isinstance(value, datetime.timedelta) or value is None:
+            return value
 
-class RelativeTime(Field):
+        return self.from_json(value)
+
+
+class RelativeTime(JSONField):
     """
     Field for start_time and end_time video module properties.
 
@@ -153,7 +179,7 @@ class RelativeTime(Field):
         except ValueError as e:
             raise ValueError(
                 "Incorrect RelativeTime value {!r} was set in XML or serialized. "
-                "Original parse message is {}".format(value, e.message)
+                "Original parse message is {}".format(value, text_type(e))
             )
         return datetime.timedelta(
             hours=obj_time.tm_hour,
@@ -171,14 +197,17 @@ class RelativeTime(Field):
         if not value:
             return datetime.timedelta(seconds=0)
 
+        if isinstance(value, datetime.timedelta):
+            return value
+
         # We've seen serialized versions of float in this field
         if isinstance(value, float):
             return datetime.timedelta(seconds=value)
 
-        if isinstance(value, basestring):
+        if isinstance(value, six.string_types):
             return self.isotime_to_timedelta(value)
 
-        msg = "RelativeTime Field {0} has bad value '{1!r}'".format(self._name, value)
+        msg = "RelativeTime Field {0} has bad value '{1!r}'".format(self.name, value)
         raise TypeError(msg)
 
     def to_json(self, value):
@@ -219,3 +248,57 @@ class RelativeTime(Field):
         if len(stringified) == 7:
             stringified = '0' + stringified
         return stringified
+
+    def enforce_type(self, value):
+        """
+        Ensure that when set explicitly the Field is set to a timedelta
+        """
+        if isinstance(value, datetime.timedelta) or value is None:
+            return value
+
+        return self.from_json(value)
+
+
+class ScoreField(JSONField):
+    """
+    Field for blocks that need to store a Score. XBlocks that implement
+    the ScorableXBlockMixin may need to store their score separately
+    from their problem state, specifically for use in staff override
+    of problem scores.
+    """
+    MUTABLE = False
+
+    def from_json(self, value):
+        if value is None:
+            return value
+        if isinstance(value, Score):
+            return value
+
+        if set(value) != {'raw_earned', 'raw_possible'}:
+            raise TypeError('Scores must contain only a raw earned and raw possible value. Got {}'.format(
+                set(value)
+            ))
+
+        raw_earned = value['raw_earned']
+        raw_possible = value['raw_possible']
+
+        if raw_possible < 0:
+            raise ValueError(
+                'Error deserializing field of type {0}: Expected a positive number for raw_possible, got {1}.'.format(
+                    self.display_name,
+                    raw_possible,
+                )
+            )
+
+        if not (0 <= raw_earned <= raw_possible):
+            raise ValueError(
+                'Error deserializing field of type {0}: Expected raw_earned between 0 and {1}, got {2}.'.format(
+                    self.display_name,
+                    raw_possible,
+                    raw_earned
+                )
+            )
+
+        return Score(raw_earned, raw_possible)
+
+    enforce_type = from_json

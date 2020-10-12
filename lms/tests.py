@@ -1,11 +1,15 @@
 """Tests for the lms module itself."""
 
+
+import logging
 import mimetypes
 
+from django.conf import settings
 from django.test import TestCase
 
-from edxmako import add_lookup, LOOKUP
-from lms import startup
+from edxmako import LOOKUP, add_lookup
+
+log = logging.getLogger(__name__)
 
 
 class LmsModuleTests(TestCase):
@@ -19,20 +23,9 @@ class LmsModuleTests(TestCase):
             mimetype, _ = mimetypes.guess_type('test.' + extension)
             self.assertIsNotNone(mimetype)
 
-
-class TemplateLookupTests(TestCase):
-    """
-    Tests for TemplateLookup.
-    """
-
-    def test_add_lookup_to_main(self):
-        """Test that any template directories added are not cleared when microsites are enabled."""
-
-        add_lookup('main', 'external_module', __name__)
-        directories = LOOKUP['main'].directories
-        self.assertEqual(len([dir for dir in directories if 'external_module' in dir]), 1)
-
-        # This should not clear the directories list
-        startup.enable_microsites()
-        directories = LOOKUP['main'].directories
-        self.assertEqual(len([dir for dir in directories if 'external_module' in dir]), 1)
+    def test_api_docs(self):
+        """
+        Tests that requests to the `/api-docs/` endpoint do not raise an exception.
+        """
+        response = self.client.get('/api-docs/')
+        self.assertEqual(200, response.status_code)

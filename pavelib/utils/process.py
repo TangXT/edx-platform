@@ -1,13 +1,16 @@
 """
 Helper functions for managing processes.
 """
-from __future__ import print_function
-import sys
-import os
-import subprocess
-import signal
-import psutil
+
+
 import atexit
+import os
+import signal
+import subprocess
+import sys
+
+import psutil
+from paver import tasks
 
 
 def kill_process(proc):
@@ -15,7 +18,6 @@ def kill_process(proc):
     Kill the process `proc` created with `subprocess`.
     """
     p1_group = psutil.Process(proc.pid)
-
     child_pids = p1_group.get_children(recursive=True)
 
     for child_pid in child_pids:
@@ -41,10 +43,19 @@ def run_multi_processes(cmd_list, out_log=None, err_log=None):
         err_log_file = open(err_log, 'w')
         kwargs['stderr'] = err_log_file
 
+    # If the user is performing a dry run of a task, then just log
+    # the command strings and return so that no destructive operations
+    # are performed.
+    if tasks.environment.dry_run:
+        for cmd in cmd_list:
+            tasks.environment.info(cmd)
+        return
+
     try:
         for cmd in cmd_list:
             pids.extend([subprocess.Popen(cmd, **kwargs)])
 
+        # pylint: disable=unused-argument
         def _signal_handler(*args):
             """
             What to do when process is ended
@@ -56,6 +67,7 @@ def run_multi_processes(cmd_list, out_log=None, err_log=None):
         signal.pause()
         print("Processes ending")
 
+    # pylint: disable=broad-except
     except Exception as err:
         print("Error running process {}".format(err), file=sys.stderr)
 
@@ -98,10 +110,12 @@ def run_background_process(cmd, out_log=None, err_log=None, cwd=None):
         killed properly.
         """
         p1_group = psutil.Process(proc.pid)
-
         child_pids = p1_group.get_children(recursive=True)
 
         for child_pid in child_pids:
             os.kill(child_pid.pid, signal.SIGINT)
+
+        # Wait for process to actually finish
+        proc.wait()
 
     atexit.register(exit_handler)

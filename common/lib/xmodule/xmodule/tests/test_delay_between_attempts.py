@@ -3,24 +3,26 @@ Tests the logic of problems with a delay between attempt submissions.
 
 Note that this test file is based off of test_capa_module.py and as
 such, uses the same CapaFactory problem setup to test the functionality
-of the check_problem method of a capa module when the "delay between quiz
+of the submit_problem method of a capa module when the "delay between quiz
 submissions" setting is set to different values
 """
 
-import unittest
-import textwrap
+
 import datetime
+import textwrap
+import unittest
 
 from mock import Mock
-
-import xmodule
-from xmodule.capa_module import CapaModule
-from opaque_keys.edx.locations import Location
+from opaque_keys.edx.locator import BlockUsageLocator, CourseLocator
+from pytz import UTC
 from xblock.field_data import DictFieldData
 from xblock.fields import ScopeIds
+from xblock.scorable import Score
+
+import xmodule
+from xmodule.capa_module import ProblemBlock
 
 from . import get_test_system
-from pytz import UTC
 
 
 class CapaFactoryWithDelay(object):
@@ -58,7 +60,7 @@ class CapaFactoryWithDelay(object):
         """
         Return the input key to use when passing GET parameters
         """
-        return ("input_" + cls.answer_key(input_num))
+        return "input_" + cls.answer_key(input_num)
 
     @classmethod
     def answer_key(cls, input_num=2):
@@ -84,7 +86,8 @@ class CapaFactoryWithDelay(object):
         """
         Optional parameters here are cut down to what we actually use vs. the regular CapaFactory.
         """
-        location = Location("edX", "capa_test", "run", "problem", "SampleProblem{0}".format(cls.next_num()))
+        location = BlockUsageLocator(CourseLocator('edX', 'capa_test', 'run', deprecated=True),
+                                     'problem', 'SampleProblem{0}'.format(cls.next_num()), deprecated=True)
         field_data = {'data': cls.sample_problem_xml}
 
         if max_attempts is not None:
@@ -94,7 +97,6 @@ class CapaFactoryWithDelay(object):
         if submission_wait_seconds is not None:
             field_data['submission_wait_seconds'] = submission_wait_seconds
 
-        descriptor = Mock(weight="1")
         if attempts is not None:
             # converting to int here because I keep putting "0" and "1" in the tests
             # since everything else is a string.
@@ -102,8 +104,7 @@ class CapaFactoryWithDelay(object):
 
         system = get_test_system()
         system.render_template = Mock(return_value="<div>Test Template HTML</div>")
-        module = CapaModule(
-            descriptor,
+        module = ProblemBlock(
             system,
             DictFieldData(field_data),
             ScopeIds(None, None, location, location),
@@ -111,9 +112,9 @@ class CapaFactoryWithDelay(object):
 
         if correct:
             # Could set the internal state formally, but here we just jam in the score.
-            module.get_score = lambda: {'score': 1, 'total': 1}
+            module.score = Score(raw_earned=1, raw_possible=1)
         else:
-            module.get_score = lambda: {'score': 0, 'total': 1}
+            module.score = Score(raw_earned=0, raw_possible=1)
 
         return module
 
@@ -128,7 +129,7 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
                          last_submission_time=None,
                          submission_wait_seconds=None,
                          considered_now=None,
-                         skip_check_problem=False):
+                         skip_submit_problem=False):
         """Unified create and check code for the tests here."""
         module = CapaFactoryWithDelay.create(
             attempts=num_attempts,
@@ -138,12 +139,12 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
         )
         module.done = False
         get_request_dict = {CapaFactoryWithDelay.input_key(): "3.14"}
-        if skip_check_problem:
+        if skip_submit_problem:
             return (module, None)
         if considered_now is not None:
-            result = module.check_problem(get_request_dict, considered_now)
+            result = module.submit_problem(get_request_dict, considered_now)
         else:
-            result = module.check_problem(get_request_dict)
+            result = module.submit_problem(get_request_dict)
         return (module, result)
 
     def test_first_submission(self):
@@ -180,7 +181,7 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
         )
         # You should get a dialog that tells you to wait
         # Also, the number of attempts should not be incremented
-        self.assertRegexpMatches(result['success'], r"You must wait at least.*")
+        self.assertRegex(result['success'], r"You must wait at least.*")
         self.assertEqual(module.attempts, num_attempts)
 
     def test_submit_quiz_too_soon(self):
@@ -188,13 +189,13 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
         num_attempts = 1
         (module, result) = self.create_and_check(
             num_attempts=num_attempts,
-            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36),
+            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36, tzinfo=UTC),
             submission_wait_seconds=180,
-            considered_now=datetime.datetime(2013, 12, 6, 0, 18, 36)
+            considered_now=datetime.datetime(2013, 12, 6, 0, 18, 36, tzinfo=UTC)
         )
         # You should get a dialog that tells you to wait 2 minutes
         # Also, the number of attempts should not be incremented
-        self.assertRegexpMatches(result['success'], r"You must wait at least 3 minutes between submissions. 2 minutes remaining\..*")
+        self.assertRegex(result['success'], r"You must wait at least 3 minutes between submissions. 2 minutes remaining\..*")
         self.assertEqual(module.attempts, num_attempts)
 
     def test_submit_quiz_1_second_too_soon(self):
@@ -202,13 +203,13 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
         num_attempts = 1
         (module, result) = self.create_and_check(
             num_attempts=num_attempts,
-            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36),
+            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36, tzinfo=UTC),
             submission_wait_seconds=180,
-            considered_now=datetime.datetime(2013, 12, 6, 0, 20, 35)
+            considered_now=datetime.datetime(2013, 12, 6, 0, 20, 35, tzinfo=UTC)
         )
         # You should get a dialog that tells you to wait 2 minutes
         # Also, the number of attempts should not be incremented
-        self.assertRegexpMatches(result['success'], r"You must wait at least 3 minutes between submissions. 1 second remaining\..*")
+        self.assertRegex(result['success'], r"You must wait at least 3 minutes between submissions. 1 second remaining\..*")
         self.assertEqual(module.attempts, num_attempts)
 
     def test_submit_quiz_as_soon_as_allowed(self):
@@ -216,9 +217,9 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
         num_attempts = 1
         (module, result) = self.create_and_check(
             num_attempts=num_attempts,
-            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36),
+            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36, tzinfo=UTC),
             submission_wait_seconds=180,
-            considered_now=datetime.datetime(2013, 12, 6, 0, 20, 36)
+            considered_now=datetime.datetime(2013, 12, 6, 0, 20, 36, tzinfo=UTC)
         )
         # Successfully submitted and answered
         # Also, the number of attempts should increment by 1
@@ -230,9 +231,9 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
         num_attempts = 1
         (module, result) = self.create_and_check(
             num_attempts=num_attempts,
-            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36),
+            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36, tzinfo=UTC),
             submission_wait_seconds=180,
-            considered_now=datetime.datetime(2013, 12, 6, 0, 24, 0)
+            considered_now=datetime.datetime(2013, 12, 6, 0, 24, 0, tzinfo=UTC)
         )
         # Successfully submitted and answered
         # Also, the number of attempts should increment by 1
@@ -246,18 +247,18 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
         with self.assertRaises(xmodule.exceptions.NotFoundError):
             (module, unused_result) = self.create_and_check(
                 num_attempts=num_attempts,
-                last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36),
+                last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36, tzinfo=UTC),
                 submission_wait_seconds=180,
-                considered_now=datetime.datetime(2013, 12, 6, 0, 24, 0)
+                considered_now=datetime.datetime(2013, 12, 6, 0, 24, 0, tzinfo=UTC)
             )
 
-        # Now try it without the check_problem
+        # Now try it without the submit_problem
         (module, unused_result) = self.create_and_check(
             num_attempts=num_attempts,
-            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36),
+            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36, tzinfo=UTC),
             submission_wait_seconds=180,
-            considered_now=datetime.datetime(2013, 12, 6, 0, 24, 0),
-            skip_check_problem=True
+            considered_now=datetime.datetime(2013, 12, 6, 0, 24, 0, tzinfo=UTC),
+            skip_submit_problem=True
         )
         # Expect that number of attempts NOT incremented
         self.assertEqual(module.attempts, num_attempts)
@@ -267,13 +268,13 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
         num_attempts = 1
         (module, result) = self.create_and_check(
             num_attempts=num_attempts,
-            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36),
+            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36, tzinfo=UTC),
             submission_wait_seconds=60 * 60 * 2,
-            considered_now=datetime.datetime(2013, 12, 6, 2, 15, 35)
+            considered_now=datetime.datetime(2013, 12, 6, 2, 15, 35, tzinfo=UTC)
         )
         # You should get a dialog that tells you to wait 2 minutes
         # Also, the number of attempts should not be incremented
-        self.assertRegexpMatches(result['success'], r"You must wait at least 2 hours between submissions. 2 minutes 1 second remaining\..*")
+        self.assertRegex(result['success'], r"You must wait at least 2 hours between submissions. 2 minutes 1 second remaining\..*")
         self.assertEqual(module.attempts, num_attempts)
 
     def test_submit_quiz_with_involved_pretty_print(self):
@@ -281,13 +282,13 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
         num_attempts = 1
         (module, result) = self.create_and_check(
             num_attempts=num_attempts,
-            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36),
+            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36, tzinfo=UTC),
             submission_wait_seconds=60 * 60 * 2 + 63,
-            considered_now=datetime.datetime(2013, 12, 6, 1, 15, 40)
+            considered_now=datetime.datetime(2013, 12, 6, 1, 15, 40, tzinfo=UTC)
         )
         # You should get a dialog that tells you to wait 2 minutes
         # Also, the number of attempts should not be incremented
-        self.assertRegexpMatches(result['success'], r"You must wait at least 2 hours 1 minute 3 seconds between submissions. 1 hour 2 minutes 59 seconds remaining\..*")
+        self.assertRegex(result['success'], r"You must wait at least 2 hours 1 minute 3 seconds between submissions. 1 hour 2 minutes 59 seconds remaining\..*")
         self.assertEqual(module.attempts, num_attempts)
 
     def test_submit_quiz_with_nonplural_pretty_print(self):
@@ -295,11 +296,11 @@ class XModuleQuizAttemptsDelayTest(unittest.TestCase):
         num_attempts = 1
         (module, result) = self.create_and_check(
             num_attempts=num_attempts,
-            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36),
+            last_submission_time=datetime.datetime(2013, 12, 6, 0, 17, 36, tzinfo=UTC),
             submission_wait_seconds=60,
-            considered_now=datetime.datetime(2013, 12, 6, 0, 17, 36)
+            considered_now=datetime.datetime(2013, 12, 6, 0, 17, 36, tzinfo=UTC)
         )
         # You should get a dialog that tells you to wait 2 minutes
         # Also, the number of attempts should not be incremented
-        self.assertRegexpMatches(result['success'], r"You must wait at least 1 minute between submissions. 1 minute remaining\..*")
+        self.assertRegex(result['success'], r"You must wait at least 1 minute between submissions. 1 minute remaining\..*")
         self.assertEqual(module.attempts, num_attempts)

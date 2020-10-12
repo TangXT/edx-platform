@@ -2,16 +2,19 @@
 Tests of symbolic math
 """
 
-
-import unittest
-import formula
 import re
+import unittest
+
 from lxml import etree
+
+from . import formula
+
 
 def stripXML(xml):
     xml = xml.replace('\n', '')
     xml = re.sub(r'\> +\<', '><', xml)
     return xml
+
 
 class FormulaTest(unittest.TestCase):
     # for readability later
@@ -19,7 +22,8 @@ class FormulaTest(unittest.TestCase):
     mathml_end = '</mstyle></math>'
 
     def setUp(self):
-        self.formulaInstance = formula.formula('')
+        super(FormulaTest, self).setUp()
+        self.formulaInstance = formula('')
 
     def test_replace_mathvariants(self):
         expr = '''
@@ -39,8 +43,7 @@ class FormulaTest(unittest.TestCase):
         test = etree.tostring(xml)
 
         # success?
-        self.assertEqual(test, expected)
-
+        self.assertEqual(test.decode('utf-8'), expected)
 
     def test_fix_simple_superscripts(self):
         expr = '''
@@ -64,7 +67,7 @@ class FormulaTest(unittest.TestCase):
         test = etree.tostring(xml)
 
         # success?
-        self.assertEqual(test, expected)
+        self.assertEqual(test.decode('utf-8'), expected)
 
     def test_fix_complex_superscripts(self):
         expr = '''
@@ -89,8 +92,7 @@ class FormulaTest(unittest.TestCase):
         test = etree.tostring(xml)
 
         # success?
-        self.assertEqual(test, expected)
-
+        self.assertEqual(test.decode('utf-8'), expected)
 
     def test_fix_msubsup(self):
         expr = '''
@@ -100,7 +102,7 @@ class FormulaTest(unittest.TestCase):
   <mi>c</mi>
 </msubsup>'''
 
-        expected = '<msup><mi>a_b</mi><mi>c</mi></msup>' # which is (a_b)^c
+        expected = '<msup><mi>a_b</mi><mi>c</mi></msup>'  # which is (a_b)^c
 
         # wrap
         expr = stripXML(self.mathml_start + expr + self.mathml_end)
@@ -112,4 +114,4 @@ class FormulaTest(unittest.TestCase):
         test = etree.tostring(xml)
 
         # success?
-        self.assertEqual(test, expected)
+        self.assertEqual(test.decode('utf-8'), expected)

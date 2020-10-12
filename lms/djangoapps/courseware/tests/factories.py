@@ -1,33 +1,36 @@
-# Factories don't have __init__ methods, and are self documenting
-# pylint: disable=W0232, C0111
+# Factories are self documenting
+
+
 import json
 from functools import partial
+
 import factory
+from django.test.client import RequestFactory
 from factory.django import DjangoModelFactory
+from opaque_keys.edx.keys import CourseKey
+from opaque_keys.edx.locator import CourseLocator
 
-# Imported to re-export
-# pylint: disable=unused-import
-from student.tests.factories import UserFactory  # Imported to re-export
-# pylint: enable=unused-import
-
-from student.tests.factories import UserProfileFactory as StudentUserProfileFactory
-from courseware.models import StudentModule, XModuleUserStateSummaryField
-from courseware.models import XModuleStudentInfoField, XModuleStudentPrefsField
+from lms.djangoapps.courseware.models import (
+    StudentModule,
+    XModuleStudentInfoField,
+    XModuleStudentPrefsField,
+    XModuleUserStateSummaryField
+)
 from student.roles import (
+    CourseBetaTesterRole,
     CourseInstructorRole,
     CourseStaffRole,
-    CourseBetaTesterRole,
     GlobalStaff,
-    OrgStaffRole,
     OrgInstructorRole,
+    OrgStaffRole
 )
-
-from opaque_keys.edx.locations import SlashSeparatedCourseKey
-
+# Imported to re-export
+from student.tests.factories import UserFactory  # Imported to re-export
+from student.tests.factories import UserProfileFactory as StudentUserProfileFactory
 
 # TODO fix this (course_id and location are invalid names as constants, and course_id should really be COURSE_KEY)
 # pylint: disable=invalid-name
-course_id = SlashSeparatedCourseKey(u'edX', u'test_course', u'test')
+course_id = CourseKey.from_string('edX/test_course/test')
 location = partial(course_id.make_usage_key, u'problem')
 
 
@@ -123,11 +126,12 @@ class GlobalStaffFactory(UserFactory):
 
 
 class StudentModuleFactory(DjangoModelFactory):
-    FACTORY_FOR = StudentModule
+    class Meta(object):
+        model = StudentModule
 
     module_type = "problem"
     student = factory.SubFactory(UserFactory)
-    course_id = SlashSeparatedCourseKey("MITx", "999", "Robot_Super_Course")
+    course_id = CourseLocator("MITx", "999", "Robot_Super_Course")
     state = None
     grade = None
     max_grade = None
@@ -135,7 +139,8 @@ class StudentModuleFactory(DjangoModelFactory):
 
 
 class UserStateSummaryFactory(DjangoModelFactory):
-    FACTORY_FOR = XModuleUserStateSummaryField
+    class Meta(object):
+        model = XModuleUserStateSummaryField
 
     field_name = 'existing_field'
     value = json.dumps('old_value')
@@ -143,7 +148,8 @@ class UserStateSummaryFactory(DjangoModelFactory):
 
 
 class StudentPrefsFactory(DjangoModelFactory):
-    FACTORY_FOR = XModuleStudentPrefsField
+    class Meta(object):
+        model = XModuleStudentPrefsField
 
     field_name = 'existing_field'
     value = json.dumps('old_value')
@@ -152,8 +158,19 @@ class StudentPrefsFactory(DjangoModelFactory):
 
 
 class StudentInfoFactory(DjangoModelFactory):
-    FACTORY_FOR = XModuleStudentInfoField
+    class Meta(object):
+        model = XModuleStudentInfoField
 
     field_name = 'existing_field'
     value = json.dumps('old_value')
     student = factory.SubFactory(UserFactory)
+
+
+class RequestFactoryNoCsrf(RequestFactory):
+    """
+    RequestFactory, which disables csrf checks.
+    """
+    def request(self, **kwargs):
+        request = super(RequestFactoryNoCsrf, self).request(**kwargs)
+        setattr(request, '_dont_enforce_csrf_checks', True)  # pylint: disable=literal-used-as-attribute
+        return request

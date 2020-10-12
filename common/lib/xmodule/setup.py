@@ -1,71 +1,74 @@
-from setuptools import setup, find_packages
+
+
+from setuptools import find_packages, setup
 
 XMODULES = [
-    "abtest = xmodule.abtest_module:ABTestDescriptor",
     "book = xmodule.backcompat_module:TranslateCustomTagDescriptor",
-    "chapter = xmodule.seq_module:SequenceDescriptor",
-    "combinedopenended = xmodule.combined_open_ended_module:CombinedOpenEndedDescriptor",
+    "chapter = xmodule.seq_module:SectionDescriptor",
     "conditional = xmodule.conditional_module:ConditionalDescriptor",
     "course = xmodule.course_module:CourseDescriptor",
     "customtag = xmodule.template_module:CustomTagDescriptor",
     "discuss = xmodule.backcompat_module:TranslateCustomTagDescriptor",
-    "html = xmodule.html_module:HtmlDescriptor",
     "image = xmodule.backcompat_module:TranslateCustomTagDescriptor",
     "error = xmodule.error_module:ErrorDescriptor",
-    "peergrading = xmodule.peer_grading_module:PeerGradingDescriptor",
+    "nonstaff_error = xmodule.error_module:NonStaffErrorDescriptor",
     "poll_question = xmodule.poll_module:PollDescriptor",
-    "problem = xmodule.capa_module:CapaDescriptor",
     "problemset = xmodule.seq_module:SequenceDescriptor",
     "randomize = xmodule.randomize_module:RandomizeDescriptor",
     "split_test = xmodule.split_test_module:SplitTestDescriptor",
     "section = xmodule.backcompat_module:SemanticSectionDescriptor",
     "sequential = xmodule.seq_module:SequenceDescriptor",
     "slides = xmodule.backcompat_module:TranslateCustomTagDescriptor",
-    "vertical = xmodule.vertical_module:VerticalDescriptor",
-    "video = xmodule.video_module:VideoDescriptor",
-    "videoalpha = xmodule.video_module:VideoDescriptor",
     "videodev = xmodule.backcompat_module:TranslateCustomTagDescriptor",
     "videosequence = xmodule.seq_module:SequenceDescriptor",
-    "discussion = xmodule.discussion_module:DiscussionDescriptor",
-    "course_info = xmodule.html_module:CourseInfoDescriptor",
-    "static_tab = xmodule.html_module:StaticTabDescriptor",
     "custom_tag_template = xmodule.raw_module:RawDescriptor",
-    "about = xmodule.html_module:AboutDescriptor",
-    "wrapper = xmodule.wrapper_module:WrapperDescriptor",
-    "graphical_slider_tool = xmodule.gst_module:GraphicalSliderToolDescriptor",
     "annotatable = xmodule.annotatable_module:AnnotatableDescriptor",
-    "textannotation = xmodule.textannotation_module:TextAnnotationDescriptor",
-    "videoannotation = xmodule.videoannotation_module:VideoAnnotationDescriptor",
-    "imageannotation = xmodule.imageannotation_module:ImageAnnotationDescriptor",
-    "foldit = xmodule.foldit_module:FolditDescriptor",
-    "word_cloud = xmodule.word_cloud_module:WordCloudDescriptor",
     "hidden = xmodule.hidden_module:HiddenDescriptor",
     "raw = xmodule.raw_module:RawDescriptor",
-    "crowdsource_hinter = xmodule.crowdsource_hinter:CrowdsourceHinterDescriptor",
     "lti = xmodule.lti_module:LTIDescriptor",
+]
+XBLOCKS = [
+    "about = xmodule.html_module:AboutBlock",
+    "course_info = xmodule.html_module:CourseInfoBlock",
+    "html = xmodule.html_module:HtmlBlock",
+    "library = xmodule.library_root_xblock:LibraryRoot",
+    "library_content = xmodule.library_content_module:LibraryContentBlock",
+    "library_sourced = xmodule.library_sourced_block:LibrarySourcedBlock",
+    "problem = xmodule.capa_module:ProblemBlock",
+    "static_tab = xmodule.html_module:StaticTabBlock",
+    "unit = xmodule.unit_block:UnitBlock",
+    "vertical = xmodule.vertical_block:VerticalBlock",
+    "video = xmodule.video_module:VideoBlock",
+    "videoalpha = xmodule.video_module:VideoBlock",
+    "word_cloud = xmodule.word_cloud_module:WordCloudBlock",
+    "wrapper = xmodule.wrapper_module:WrapperBlock",
+]
+XBLOCKS_ASIDES = [
+    'tagging_aside = cms.lib.xblock.tagging:StructuredTagsAside',
 ]
 
 setup(
     name="XModule",
-    version="0.1",
+    version="0.1.2",
     packages=find_packages(exclude=["tests"]),
     install_requires=[
-        'distribute',
+        'setuptools',
         'docopt',
         'capa',
         'path.py',
         'webob',
-        'opaque-keys',
+        'edx-opaque-keys>=0.4.0',
     ],
     package_data={
         'xmodule': ['js/module/*'],
     },
 
-    # See http://guide.python-distribute.org/creation.html#entry-points
+    # See https://setuptools.readthedocs.io/en/latest/setuptools.html#dynamic-discovery-of-services-and-plugins
     # for a description of entry_points
     entry_points={
-        'xblock.v1': XMODULES,
+        'xblock.v1': XMODULES + XBLOCKS,
         'xmodule.v1': XMODULES,
+        'xblock_asides.v1': XBLOCKS_ASIDES,
         'console_scripts': [
             'xmodule_assets = xmodule.static_content:main',
         ],

@@ -2,16 +2,19 @@
 Support for inheritance of fields down an XBlock hierarchy.
 """
 
-from datetime import datetime
-from pytz import UTC
 
-from xmodule.partitions.partitions import UserPartition
-from xblock.fields import Scope, Boolean, String, Float, XBlockMixin, Dict, Integer, List
+from django.utils import timezone
+from xblock.core import XBlockMixin
+from xblock.fields import Boolean, Dict, Float, Integer, List, Scope, String
 from xblock.runtime import KeyValueStore, KvsFieldData
 
 from xmodule.fields import Date, Timedelta
+from xmodule.partitions.partitions import UserPartition
+
+from ..course_metadata_utils import DEFAULT_START_DATE
 
 # Make '_' a no-op so we can scrape strings
+# Using lambda instead of `django.utils.translation.ugettext_noop` because Django cannot be imported in this file
 _ = lambda text: text
 
 
@@ -35,21 +38,13 @@ class InheritanceMixin(XBlockMixin):
     )
     start = Date(
         help="Start time when this module is visible",
-        default=datetime(2030, 1, 1, tzinfo=UTC),
+        default=DEFAULT_START_DATE,
         scope=Scope.settings
     )
     due = Date(
         display_name=_("Due Date"),
         help=_("Enter the default date by which problems are due."),
         scope=Scope.settings,
-    )
-    extended_due = Date(
-        help="Date that this problem is due by for a particular student. This "
-             "can be set by an instructor, and will override the global due "
-             "date if it is set to a date that is later than the global due "
-             "date.",
-        default=None,
-        scope=Scope.user_state,
     )
     visible_to_staff_only = Boolean(
         help=_("If true, can be seen only by course staff, regardless of start date."),
@@ -66,39 +61,58 @@ class InheritanceMixin(XBlockMixin):
     giturl = String(
         display_name=_("GIT URL"),
         help=_("Enter the URL for the course data GIT repository."),
-        scope=Scope.settings,
-        deprecated=True  # Deprecated because GIT workflow users do not use Studio.
+        scope=Scope.settings
     )
     xqa_key = String(
         display_name=_("XQA Key"),
         help=_("This setting is not currently supported."), scope=Scope.settings,
         deprecated=True
     )
-    annotation_storage_url = String(
-        help=_("Enter the secret string for annotation storage. The textannotation, videoannotation, and imageannotation advanced modules require this string."),
-        scope=Scope.settings,
-        default="http://your_annotation_storage.com",
-        display_name=_("URL for Annotation Storage")
-    )
-    annotation_token_secret = String(
-        help=_("Enter the location of the annotation storage server. The textannotation, videoannotation, and imageannotation advanced modules require this setting."),
-        scope=Scope.settings,
-        default="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-        display_name=_("Secret Token String for Annotation")
-    )
     graceperiod = Timedelta(
         help="Amount of time after the due date that submissions will be accepted",
         scope=Scope.settings,
     )
+    group_access = Dict(
+        help=_("Enter the ids for the content groups this problem belongs to."),
+        scope=Scope.settings,
+    )
+
     showanswer = String(
         display_name=_("Show Answer"),
-        help=_("Specify when the Show Answer button appears for each problem. Valid values are \"always\", \"answered\", \"attempted\", \"closed\", \"finished\", \"past_due\", and \"never\"."),
+        help=_(
+            # Translators: DO NOT translate the words in quotes here, they are
+            # specific words for the acceptable values.
+            'Specify when the Show Answer button appears for each problem. '
+            'Valid values are "always", "answered", "attempted", "closed", '
+            '"finished", "past_due", "correct_or_past_due", "after_all_attempts", '
+            '"after_all_attempts_or_correct", "attempted_no_past_due", and "never".'
+        ),
         scope=Scope.settings,
         default="finished",
     )
+
+    show_correctness = String(
+        display_name=_("Show Results"),
+        help=_(
+            # Translators: DO NOT translate the words in quotes here, they are
+            # specific words for the acceptable values.
+            'Specify when to show answer correctness and score to learners. '
+            'Valid values are "always", "never", and "past_due".'
+        ),
+        scope=Scope.settings,
+        default="always",
+    )
+
     rerandomize = String(
         display_name=_("Randomization"),
-        help=_("Specify how often variable values in a problem are randomized when a student loads the problem. Valid values are \"always\", \"onreset\", \"never\", and \"per_student\". This setting only applies to problems that have randomly generated numeric values."),
+        help=_(
+            # Translators: DO NOT translate the words in quotes here, they are
+            # specific words for the acceptable values.
+            'Specify the default for how often variable values in a problem are randomized. '
+            'This setting should be set to "never" unless you plan to provide a Python '
+            'script to identify and randomize values in most of the problems in your course. '
+            'Valid values are "always", "onreset", "never", and "per_student".'
+        ),
         scope=Scope.settings,
         default="never",
     )
@@ -114,11 +128,6 @@ class InheritanceMixin(XBlockMixin):
         scope=Scope.settings,
         default='',
     )
-    text_customization = Dict(
-        display_name=_("Text Customization"),
-        help=_("Enter string customization substitutions for particular locations."),
-        scope=Scope.settings,
-    )
     use_latex_compiler = Boolean(
         display_name=_("Enable LaTeX Compiler"),
         help=_("Enter true or false. If true, you can use the LaTeX templates for HTML components and advanced Problem components."),
@@ -127,7 +136,7 @@ class InheritanceMixin(XBlockMixin):
     )
     max_attempts = Integer(
         display_name=_("Maximum Attempts"),
-        help=_("Enter the maximum number of times a student can try to answer problems. This is a course-wide setting, but you can specify a different number when you create an individual problem. To allow unlimited attempts, enter null."),
+        help=_("Enter the maximum number of times a student can try to answer problems. By default, Maximum Attempts is set to null, meaning that students have an unlimited number of attempts for problems. You can override this course-wide setting for individual problems. However, if the course-wide setting is a specific number, you cannot set the Maximum Attempts for individual problems to unlimited."),
         values={"min": 0}, scope=Scope.settings
     )
     matlab_api_key = String(
@@ -142,16 +151,119 @@ class InheritanceMixin(XBlockMixin):
     # This is should be scoped to content, but since it's defined in the policy
     # file, it is currently scoped to settings.
     user_partitions = UserPartitionList(
-        display_name=_("Experiment Group Configurations"),
-        help=_("Enter the configurations that govern how students are grouped for content experiments."),
+        display_name=_("Group Configurations"),
+        help=_("Enter the configurations that govern how students are grouped together."),
         default=[],
         scope=Scope.settings
     )
     video_speed_optimizations = Boolean(
-        help="Enable Video CDN.",
+        display_name=_("Enable video caching system"),
+        help=_("Enter true or false. If true, video caching will be used for HTML5 videos."),
         default=True,
         scope=Scope.settings
     )
+    video_auto_advance = Boolean(
+        display_name=_("Enable video auto-advance"),
+        help=_(
+            "Specify whether to show an auto-advance button in videos. If the student clicks it, when the last video in a unit finishes it will automatically move to the next unit and autoplay the first video."
+        ),
+        scope=Scope.settings,
+        default=False
+    )
+    video_bumper = Dict(
+        display_name=_("Video Pre-Roll"),
+        help=_(
+            "Identify a video, 5-10 seconds in length, to play before course videos. Enter the video ID from "
+            "the Video Uploads page and one or more transcript files in the following format: {format}. "
+            "For example, an entry for a video with two transcripts looks like this: {example}"
+        ),
+        help_format_args=dict(
+            format='{"video_id": "ID", "transcripts": {"language": "/static/filename.srt"}}',
+            example=(
+                '{'
+                '"video_id": "77cef264-d6f5-4cf2-ad9d-0178ab8c77be", '
+                '"transcripts": {"en": "/static/DemoX-D01_1.srt", "uk": "/static/DemoX-D01_1_uk.srt"}'
+                '}'
+            ),
+        ),
+        scope=Scope.settings
+    )
+
+    show_reset_button = Boolean(
+        display_name=_("Show Reset Button for Problems"),
+        help=_(
+            "Enter true or false. If true, problems in the course default to always displaying a 'Reset' button. "
+            "You can override this in each problem's settings. All existing problems are affected when "
+            "this course-wide setting is changed."
+        ),
+        scope=Scope.settings,
+        default=False
+    )
+    edxnotes = Boolean(
+        display_name=_("Enable Student Notes"),
+        help=_("Enter true or false. If true, students can use the Student Notes feature."),
+        default=False,
+        scope=Scope.settings
+    )
+    edxnotes_visibility = Boolean(
+        display_name="Student Notes Visibility",
+        help=_("Indicates whether Student Notes are visible in the course. "
+               "Students can also show or hide their notes in the courseware."),
+        default=True,
+        scope=Scope.user_info
+    )
+
+    in_entrance_exam = Boolean(
+        display_name=_("Tag this module as part of an Entrance Exam section"),
+        help=_("Enter true or false. If true, answer submissions for problem modules will be "
+               "considered in the Entrance Exam scoring/gating algorithm."),
+        scope=Scope.settings,
+        default=False
+    )
+
+    self_paced = Boolean(
+        display_name=_('Self Paced'),
+        help=_(
+            'Set this to "true" to mark this course as self-paced. Self-paced courses do not have '
+            'due dates for assignments, and students can progress through the course at any rate before '
+            'the course ends.'
+        ),
+        default=False,
+        scope=Scope.settings
+    )
+
+    @property
+    def close_date(self):
+        """
+        Return the date submissions should be closed from.
+
+        If graceperiod is present for the course, all the submissions
+        can be submitted till due date and the graceperiod. If no
+        graceperiod, then the close date is same as the due date.
+        """
+        due_date = self.due
+
+        if self.graceperiod is not None and due_date:
+            return due_date + self.graceperiod
+        return due_date
+
+    def is_past_due(self):
+        """
+        Returns the boolean identifying if the submission due date has passed.
+        """
+        return self.close_date is not None and timezone.now() > self.close_date
+
+    def has_deadline_passed(self):
+        """
+        Returns a boolean indicating if the submission is past its deadline.
+
+        If the course is self-paced or no due date has been
+        specified, then the submission can be made. If none of these
+        cases exists, check if the submission due date has passed or not.
+        """
+        if self.self_paced or self.close_date is None:
+            return False
+        return self.is_past_due()
 
 
 def compute_inherited_metadata(descriptor):
@@ -191,8 +303,8 @@ def inherit_metadata(descriptor, inherited_data):
 
 def own_metadata(module):
     """
-    Return a dictionary that contains only non-inherited field keys,
-    mapped to their serialized values
+    Return a JSON-friendly dictionary that contains only non-inherited field
+    keys, mapped to their serialized values
     """
     return module.get_explicitly_set_fields_by_scope(Scope.settings)
 
@@ -209,15 +321,42 @@ class InheritingFieldData(KvsFieldData):
         super(InheritingFieldData, self).__init__(**kwargs)
         self.inheritable_names = set(inheritable_names)
 
+    def has_default_value(self, name):
+        """
+        Return whether or not the field `name` has a default value
+        """
+        has_default_value = getattr(self._kvs, 'has_default_value', False)
+        if callable(has_default_value):
+            return has_default_value(name)
+
+        return has_default_value
+
     def default(self, block, name):
         """
         The default for an inheritable name is found on a parent.
         """
-        if name in self.inheritable_names and block.parent is not None:
-            parent = block.get_parent()
-            if parent:
-                return getattr(parent, name)
-        super(InheritingFieldData, self).default(block, name)
+        if name in self.inheritable_names:
+            # Walk up the content tree to find the first ancestor
+            # that this field is set on. Use the field from the current
+            # block so that if it has a different default than the root
+            # node of the tree, the block's default will be used.
+            field = block.fields[name]
+            ancestor = block.get_parent()
+            # In case, if block's parent is of type 'library_content',
+            # bypass inheritance and use kvs' default instead of reusing
+            # from parent as '_copy_from_templates' puts fields into
+            # defaults.
+            if ancestor and \
+               ancestor.location.block_type == 'library_content' and \
+               self.has_default_value(name):
+                return super(InheritingFieldData, self).default(block, name)
+
+            while ancestor is not None:
+                if field.is_set_on(ancestor):
+                    return field.read_json(ancestor)
+                else:
+                    ancestor = ancestor.get_parent()
+        return super(InheritingFieldData, self).default(block, name)
 
 
 def inheriting_field_data(kvs):
@@ -255,6 +394,8 @@ class InheritanceKeyValueStore(KeyValueStore):
 
     def default(self, key):
         """
-        Check to see if the default should be from inheritance rather than from the field's global default
+        Check to see if the default should be from inheritance. If not
+        inheriting, this will raise KeyError which will cause the caller to use
+        the field's global default.
         """
         return self.inherited_settings[key.field_name]

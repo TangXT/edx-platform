@@ -1,15 +1,17 @@
 """
 Unit tests for instructor_task subtasks.
 """
+
+
 from uuid import uuid4
 
 from mock import Mock, patch
+from six.moves import range
 
+from lms.djangoapps.instructor_task.subtasks import queue_subtasks_for_query
+from lms.djangoapps.instructor_task.tests.factories import InstructorTaskFactory
+from lms.djangoapps.instructor_task.tests.test_base import InstructorTaskCourseTestCase
 from student.models import CourseEnrollment
-
-from instructor_task.subtasks import queue_subtasks_for_query
-from instructor_task.tests.factories import InstructorTaskFactory
-from instructor_task.tests.test_base import InstructorTaskCourseTestCase
 
 
 class TestSubtasks(InstructorTaskCourseTestCase):
@@ -38,22 +40,23 @@ class TestSubtasks(InstructorTaskCourseTestCase):
         )
 
         self._enroll_students_in_course(self.course.id, initial_count)
-        task_queryset = CourseEnrollment.objects.filter(course_id=self.course.id)
+        task_querysets = [CourseEnrollment.objects.filter(course_id=self.course.id)]
 
         def initialize_subtask_info(*args):  # pylint: disable=unused-argument
             """Instead of initializing subtask info enroll some more students into course."""
             self._enroll_students_in_course(self.course.id, extra_count)
             return {}
 
-        with patch('instructor_task.subtasks.initialize_subtask_info') as mock_initialize_subtask_info:
+        with patch('lms.djangoapps.instructor_task.subtasks.initialize_subtask_info') as mock_initialize_subtask_info:
             mock_initialize_subtask_info.side_effect = initialize_subtask_info
             queue_subtasks_for_query(
                 entry=instructor_task,
                 action_name='action_name',
                 create_subtask_fcn=create_subtask_fcn,
-                item_queryset=task_queryset,
+                item_querysets=task_querysets,
                 item_fields=[],
                 items_per_task=items_per_task,
+                total_num_items=initial_count,
             )
 
     def test_queue_subtasks_for_query1(self):

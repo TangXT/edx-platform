@@ -1,17 +1,21 @@
 """Test safe_exec.py"""
 
+
 import hashlib
 import os
 import os.path
-import random
 import textwrap
 import unittest
 
-from nose.plugins.skip import SkipTest
+import pytest
+import random2 as random
+import six
+from codejail.jail_code import is_configured
+from codejail.safe_exec import SafeExecException
+from six import text_type, unichr
+from six.moves import range
 
 from capa.safe_exec import safe_exec, update_hash
-from codejail.safe_exec import SafeExecException
-from codejail.jail_code import is_configured
 
 
 class TestSafeExec(unittest.TestCase):
@@ -35,7 +39,7 @@ class TestSafeExec(unittest.TestCase):
     def test_random_seeding(self):
         g = {}
         r = random.Random(17)
-        rnums = [r.randint(0, 999) for _ in xrange(100)]
+        rnums = [r.randint(0, 999) for _ in range(100)]
 
         # Without a seed, the results are unpredictable
         safe_exec("rnums = [random.randint(0, 999) for _ in xrange(100)]", g)
@@ -48,7 +52,7 @@ class TestSafeExec(unittest.TestCase):
     def test_random_is_still_importable(self):
         g = {}
         r = random.Random(17)
-        rnums = [r.randint(0, 999) for _ in xrange(100)]
+        rnums = [r.randint(0, 999) for _ in range(100)]
 
         # With a seed, the results are predictable even from the random module
         safe_exec(
@@ -69,20 +73,20 @@ class TestSafeExec(unittest.TestCase):
         g = {}
         with self.assertRaises(SafeExecException) as cm:
             safe_exec("1/0", g)
-        self.assertIn("ZeroDivisionError", cm.exception.message)
+        self.assertIn("ZeroDivisionError", text_type(cm.exception))
 
 
 class TestSafeOrNot(unittest.TestCase):
     def test_cant_do_something_forbidden(self):
         # Can't test for forbiddenness if CodeJail isn't configured for python.
         if not is_configured("python"):
-            raise SkipTest
+            pytest.skip()
 
         g = {}
         with self.assertRaises(SafeExecException) as cm:
             safe_exec("import os; files = os.listdir('/')", g)
-        self.assertIn("OSError", cm.exception.message)
-        self.assertIn("Permission denied", cm.exception.message)
+        assert "OSError" in text_type(cm.exception)
+        assert "Permission denied" in text_type(cm.exception)
 
     def test_can_do_something_forbidden_if_run_unsafely(self):
         g = {}
@@ -118,10 +122,10 @@ class TestSafeExecCaching(unittest.TestCase):
         safe_exec("a = int(math.pi)", g, cache=DictCache(cache))
         self.assertEqual(g['a'], 3)
         # A result has been cached
-        self.assertEqual(cache.values()[0], (None, {'a': 3}))
+        self.assertEqual(list(cache.values())[0], (None, {'a': 3}))
 
         # Fiddle with the cache, then try it again.
-        cache[cache.keys()[0]] = (None, {'a': 17})
+        cache[list(cache.keys())[0]] = (None, {'a': 17})
 
         g = {}
         safe_exec("a = int(math.pi)", g, cache=DictCache(cache))
@@ -148,29 +152,29 @@ class TestSafeExecCaching(unittest.TestCase):
 
         # The exception should be in the cache now.
         self.assertEqual(len(cache), 1)
-        cache_exc_msg, cache_globals = cache.values()[0]
+        cache_exc_msg, cache_globals = list(cache.values())[0]
         self.assertIn("ZeroDivisionError", cache_exc_msg)
 
         # Change the value stored in the cache, the result should change.
-        cache[cache.keys()[0]] = ("Hey there!", {})
+        cache[list(cache.keys())[0]] = ("Hey there!", {})
 
         with self.assertRaises(SafeExecException):
             safe_exec(code, g, cache=DictCache(cache))
 
         self.assertEqual(len(cache), 1)
-        cache_exc_msg, cache_globals = cache.values()[0]
+        cache_exc_msg, cache_globals = list(cache.values())[0]
         self.assertEqual("Hey there!", cache_exc_msg)
 
         # Change it again, now no exception!
-        cache[cache.keys()[0]] = (None, {'a': 17})
+        cache[list(cache.keys())[0]] = (None, {'a': 17})
         safe_exec(code, g, cache=DictCache(cache))
         self.assertEqual(g['a'], 17)
 
     def test_unicode_submission(self):
         # Check that using non-ASCII unicode does not raise an encoding error.
-        # Try several non-ASCII unicode characters
-        for code in [129, 500, 2**8 - 1, 2**16 - 1]:
-            code_with_unichr = unicode("# ") + unichr(code)
+        # Try several non-ASCII unicode characters.
+        for code in [129, 500, 2 ** 8 - 1, 2 ** 16 - 1]:
+            code_with_unichr = six.text_type("# ") + unichr(code)
             try:
                 safe_exec(code_with_unichr, {}, cache=DictCache({}))
             except UnicodeEncodeError:
@@ -194,16 +198,19 @@ class TestUpdateHash(unittest.TestCase):
         make them different.
 
         """
-        d1 = {k:1 for k in "abcdefghijklmnopqrstuvwxyz"}
-        d2 = dict(d1)
-        for i in xrange(10000):
+        d1 = {k: 1 for k in "abcdefghijklmnopqrstuvwxyz"}
+        d2 = {k: 1 for k in "bcdefghijklmnopqrstuvwxyza"}
+        # TODO: remove the next lines once we are in python3.8
+        # since python3.8 dict preserve the order of insertion
+        # and therefore d2 and d1 keys are already in different order.
+        for i in range(10000):
             d2[i] = 1
-        for i in xrange(10000):
+        for i in range(10000):
             del d2[i]
 
         # Check that our dicts are equal, but with different key order.
         self.assertEqual(d1, d2)
-        self.assertNotEqual(d1.keys(), d2.keys())
+        self.assertNotEqual(list(d1.keys()), list(d2.keys()))
 
         return d1, d2
 
@@ -216,8 +223,8 @@ class TestUpdateHash(unittest.TestCase):
         self.assertNotEqual(h1, hs1)
 
     def test_list_ordering(self):
-        h1 = self.hash_obj({'a': [1,2,3]})
-        h2 = self.hash_obj({'a': [3,2,1]})
+        h1 = self.hash_obj({'a': [1, 2, 3]})
+        h2 = self.hash_obj({'a': [3, 2, 1]})
         self.assertNotEqual(h1, h2)
 
     def test_dict_ordering(self):
@@ -228,8 +235,8 @@ class TestUpdateHash(unittest.TestCase):
 
     def test_deep_ordering(self):
         d1, d2 = self.equal_but_different_dicts()
-        o1 = {'a':[1, 2, [d1], 3, 4]}
-        o2 = {'a':[1, 2, [d2], 3, 4]}
+        o1 = {'a': [1, 2, [d1], 3, 4]}
+        o2 = {'a': [1, 2, [d2], 3, 4]}
         h1 = self.hash_obj(o1)
         h2 = self.hash_obj(o2)
         self.assertEqual(h1, h2)

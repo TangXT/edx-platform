@@ -1,10 +1,12 @@
+
+
 from django.conf import settings
 from django.test import TestCase
 from django.test.utils import override_settings
+from six.moves import range
 
 import track.tracker as tracker
 from track.backends import BaseBackend
-
 
 SIMPLE_SETTINGS = {
     'default': {
@@ -29,6 +31,7 @@ class TestTrackerInstantiation(TestCase):
     """Test that a helper function can instantiate backends from their name."""
     def setUp(self):
         # pylint: disable=protected-access
+        super(TestTrackerInstantiation, self).setUp()
         self.get_backend = tracker._instantiate_backend_from_name
 
     def test_instatiate_backend(self):
@@ -60,7 +63,7 @@ class TestTrackerInstantiation(TestCase):
 class TestTrackerDjangoInstantiation(TestCase):
     """Test if backends are initialized properly from Django settings."""
 
-    @override_settings(TRACKING_BACKENDS=SIMPLE_SETTINGS)
+    @override_settings(TRACKING_BACKENDS=SIMPLE_SETTINGS.copy())
     def test_django_simple_settings(self):
         """Test configuration of a simple backend"""
 
@@ -70,24 +73,24 @@ class TestTrackerDjangoInstantiation(TestCase):
 
         tracker.send({})
 
-        self.assertEqual(backends.values()[0].count, 1)
+        self.assertEqual(list(backends.values())[0].count, 1)
 
-    @override_settings(TRACKING_BACKENDS=MULTI_SETTINGS)
+    @override_settings(TRACKING_BACKENDS=MULTI_SETTINGS.copy())
     def test_django_multi_settings(self):
         """Test if multiple backends can be configured properly."""
 
-        backends = self._reload_backends().values()
+        backends = list(self._reload_backends().values())
 
         self.assertEqual(len(backends), 2)
 
         event_count = 10
-        for _ in xrange(event_count):
+        for _ in range(event_count):
             tracker.send({})
 
         self.assertEqual(backends[0].count, event_count)
         self.assertEqual(backends[1].count, event_count)
 
-    @override_settings(TRACKING_BACKENDS=MULTI_SETTINGS)
+    @override_settings(TRACKING_BACKENDS=MULTI_SETTINGS.copy())
     def test_django_remove_settings(self):
         """Test if a backend can be remove by setting it to None."""
 
@@ -112,6 +115,5 @@ class DummyBackend(BaseBackend):
         self.flag = options.get('flag', False)
         self.count = 0
 
-    # pylint: disable=unused-argument
     def send(self, event):
         self.count += 1

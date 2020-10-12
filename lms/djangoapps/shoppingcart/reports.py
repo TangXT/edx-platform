@@ -1,12 +1,16 @@
 """ Objects and functions related to generating CSV reports """
 
+
 from decimal import Decimal
+
+import csv
 import unicodecsv
-
 from django.utils.translation import ugettext as _
+import six
+from six import text_type
 
-from courseware.courses import get_course_by_id
 from course_modes.models import CourseMode
+from lms.djangoapps.courseware.courses import get_course_by_id
 from shoppingcart.models import CertificateItem, OrderItem
 from student.models import CourseEnrollment
 from util.query import use_read_replica_if_available
@@ -49,7 +53,10 @@ class Report(object):
         generates a CSV report of the appropriate type.
         """
         items = self.rows()
-        writer = unicodecsv.writer(filelike, encoding="utf-8")
+        if six.PY2:
+            writer = unicodecsv.writer(filelike, encoding="utf-8")
+        else:
+            writer = csv.writer(filelike)
         writer.writerow(self.header())
         for item in items:
             writer.writerow(item)
@@ -118,7 +125,7 @@ class ItemizedPurchaseReport(Report):
         for item in query:
             yield [
                 item.fulfilled_time,
-                item.order_id,  # pylint: disable=no-member
+                item.order_id,
                 item.status,
                 item.qty,
                 item.unit_cost,
@@ -157,8 +164,9 @@ class CertificateStatusReport(Report):
             # it in the report.  These comparisons are unicode-safe.
             cur_course = get_course_by_id(course_id)
             university = cur_course.org
-            course = cur_course.number + " " + cur_course.display_name_with_default  # TODO add term (i.e. Fall 2013)?
-            counts = CourseEnrollment.enrollment_counts(course_id)
+            # TODO add term (i.e. Fall 2013) to course?
+            course = cur_course.number + " " + cur_course.display_name_with_default
+            counts = CourseEnrollment.objects.enrollment_counts(course_id)
             total_enrolled = counts['total']
             audit_enrolled = counts['audit']
             honor_enrolled = counts['honor']
@@ -274,7 +282,7 @@ def course_ids_between(start_word, end_word):
 
     valid_courses = []
     for course in modulestore().get_courses():
-        course_id = course.id.to_deprecated_string()
+        course_id = text_type(course.id)
         if start_word.lower() <= course_id.lower() <= end_word.lower():
             valid_courses.append(course.id)
     return valid_courses

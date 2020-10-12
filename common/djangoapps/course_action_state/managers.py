@@ -1,6 +1,10 @@
 """
 Model Managers for Course Actions
 """
+
+import traceback
+
+import six
 from django.db import models, transaction
 
 
@@ -9,7 +13,7 @@ class CourseActionStateManager(models.Manager):
     An abstract Model Manager class for Course Action State models.
     This abstract class expects child classes to define the ACTION (string) field.
     """
-    class Meta:
+    class Meta(object):
         """Abstract manager class, with subclasses defining the ACTION (string) field."""
         abstract = True
 
@@ -18,7 +22,7 @@ class CourseActionStateManager(models.Manager):
         Finds and returns all entries for this action and the given field names-and-values in kwargs.
         The exclude_args dict allows excluding entries with the field names-and-values in exclude_args.
         """
-        return self.filter(action=self.ACTION, **kwargs).exclude(**(exclude_args or {}))  # pylint: disable=no-member
+        return self.filter(action=self.ACTION, **kwargs).exclude(**(exclude_args or {}))
 
     def find_first(self, exclude_args=None, **kwargs):
         """
@@ -33,7 +37,7 @@ class CourseActionStateManager(models.Manager):
         if len(objects) == 0:
             raise CourseActionStateItemNotFoundError(
                 "No entry found for action {action} with filter {filter}, excluding {exclude}".format(
-                    action=self.ACTION,  # pylint: disable=no-member
+                    action=self.ACTION,
                     filter=kwargs,
                     exclude=exclude_args,
                 ))
@@ -54,7 +58,7 @@ class CourseActionUIStateManager(CourseActionStateManager):
     """
 
     # add transaction protection to revert changes by get_or_create if an exception is raised before the final save.
-    @transaction.commit_on_success
+    @transaction.atomic
     def update_state(
             self, course_key, new_state, should_display=True, message="", user=None, allow_not_found=False, **kwargs
     ):
@@ -64,7 +68,7 @@ class CourseActionUIStateManager(CourseActionStateManager):
         Raises CourseActionStateException if allow_not_found is False and an entry for the given course
             for this Action doesn't exist.
         """
-        state_object, created = self.get_or_create(course_key=course_key, action=self.ACTION)  # pylint: disable=no-member
+        state_object, created = self.get_or_create(course_key=course_key, action=self.ACTION)
 
         if created:
             if allow_not_found:
@@ -72,7 +76,7 @@ class CourseActionUIStateManager(CourseActionStateManager):
             else:
                 raise CourseActionStateItemNotFoundError(
                     "Cannot update non-existent entry for course_key {course_key} and action {action}".format(
-                        action=self.ACTION,  # pylint: disable=no-member
+                        action=self.ACTION,
                         course_key=course_key,
                     ))
 
@@ -86,7 +90,7 @@ class CourseActionUIStateManager(CourseActionStateManager):
 
         # update any additional fields in kwargs
         if kwargs:
-            for key, value in kwargs.iteritems():
+            for key, value in six.iteritems(kwargs):
                 setattr(state_object, key, value)
 
         state_object.save()
@@ -113,7 +117,7 @@ class CourseRerunUIStateManager(CourseActionUIStateManager):
         FAILED = "failed"
         SUCCEEDED = "succeeded"
 
-    def initiated(self, source_course_key, destination_course_key, user):
+    def initiated(self, source_course_key, destination_course_key, user, display_name):
         """
         To be called when a new rerun is initiated for the given course by the given user.
         """
@@ -123,6 +127,7 @@ class CourseRerunUIStateManager(CourseActionUIStateManager):
             user=user,
             allow_not_found=True,
             source_course_key=source_course_key,
+            display_name=display_name,
         )
 
     def succeeded(self, course_key):
@@ -134,14 +139,14 @@ class CourseRerunUIStateManager(CourseActionUIStateManager):
             new_state=self.State.SUCCEEDED,
         )
 
-    def failed(self, course_key, exception):
+    def failed(self, course_key):
         """
-        To be called when an existing rerun for the given course has failed with the given exception.
+        To be called within an exception handler when an existing rerun for the given course has failed.
         """
         self.update_state(
             course_key=course_key,
             new_state=self.State.FAILED,
-            message=exception.message,
+            message=traceback.format_exc()[-self.model.MAX_MESSAGE_LENGTH:],  # truncate to fit
         )
 
 

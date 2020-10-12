@@ -1,19 +1,23 @@
-# pylint: disable=attribute-defined-outside-init
 """
 A mixin class for LTI 2.0 functionality.  This is really just done to refactor the code to
 keep the LTIModule class from getting too big
 """
-import json
-import re
-import mock
-import urllib
-import hashlib
-import base64
-import logging
 
+
+import base64
+import hashlib
+import json
+import logging
+import re
+
+import mock
+import six
+from oauthlib.oauth1 import Client
+from six import text_type
 from webob import Response
 from xblock.core import XBlock
-from oauthlib.oauth1 import Client
+
+from openedx.core.lib.grade_utils import round_away_from_zero
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +68,9 @@ class LTI20ModuleMixin(object):
         if self.system.debug:
             self._log_correct_authorization_header(request)
 
+        if not self.accept_grades_past_due and self.is_past_due():
+            return Response(status=404)  # have to do 404 due to spec, but 400 is better, with error msg in body
+
         try:
             anon_id = self.parse_lti_2_0_handler_suffix(suffix)
         except LTIError:
@@ -102,20 +109,20 @@ class LTI20ModuleMixin(object):
         """
         sha1 = hashlib.sha1()
         sha1.update(request.body)
-        oauth_body_hash = unicode(base64.b64encode(sha1.digest()))  # pylint: disable=too-many-function-args
+        oauth_body_hash = six.text_type(base64.b64encode(sha1.digest()))
         log.debug("[LTI] oauth_body_hash = {}".format(oauth_body_hash))
         client_key, client_secret = self.get_client_key_secret()
         client = Client(client_key, client_secret)
-        params = client.get_oauth_params(None)
-        params.append((u'oauth_body_hash', oauth_body_hash))
         mock_request = mock.Mock(
-            uri=unicode(urllib.unquote(request.url)),
+            uri=six.text_type(six.moves.urllib.parse.unquote(request.url)),
             headers=request.headers,
             body=u"",
             decoded_body=u"",
-            oauth_params=params,
-            http_method=unicode(request.method),
+            http_method=six.text_type(request.method),
         )
+        params = client.get_oauth_params(mock_request)
+        mock_request.oauth_params = params
+        mock_request.oauth_params.append((u'oauth_body_hash', oauth_body_hash))
         sig = client.get_oauth_signature(mock_request)
         mock_request.oauth_params.append((u'oauth_signature', sig))
 
@@ -148,7 +155,7 @@ class LTI20ModuleMixin(object):
         log.info("[LTI]: {}".format(msg))
         raise LTIError(msg)
 
-    def _lti_2_0_result_get_handler(self, request, real_user):  # pylint: disable=unused-argument
+    def _lti_2_0_result_get_handler(self, request, real_user):
         """
         Helper request handler for GET requests to LTI 2.0 result endpoint
 
@@ -167,14 +174,14 @@ class LTI20ModuleMixin(object):
         }
         self.system.rebind_noauth_module_to_user(self, real_user)
         if self.module_score is None:  # In this case, no score has been ever set
-            return Response(json.dumps(base_json_obj), content_type=LTI_2_0_JSON_CONTENT_TYPE)
+            return Response(json.dumps(base_json_obj).encode('utf-8'), content_type=LTI_2_0_JSON_CONTENT_TYPE)
 
         # Fall through to returning grade and comment
-        base_json_obj['resultScore'] = round(self.module_score, 2)
+        base_json_obj['resultScore'] = round_away_from_zero(self.module_score, 2)
         base_json_obj['comment'] = self.score_comment
-        return Response(json.dumps(base_json_obj), content_type=LTI_2_0_JSON_CONTENT_TYPE)
+        return Response(json.dumps(base_json_obj).encode('utf-8'), content_type=LTI_2_0_JSON_CONTENT_TYPE)
 
-    def _lti_2_0_result_del_handler(self, request, real_user):  # pylint: disable=unused-argument
+    def _lti_2_0_result_del_handler(self, request, real_user):
         """
         Helper request handler for DELETE requests to LTI 2.0 result endpoint
 
@@ -204,7 +211,7 @@ class LTI20ModuleMixin(object):
             webob.response:  response to this request.  status 200 if success.  404 if body of PUT request is malformed
         """
         try:
-            (score, comment) = self.parse_lti_2_0_result_json(request.body)
+            (score, comment) = self.parse_lti_2_0_result_json(request.body.decode('utf-8'))
         except LTIError:
             return Response(status=404)  # have to do 404 due to spec, but 400 is better, with error msg in body
 
@@ -228,9 +235,9 @@ class LTI20ModuleMixin(object):
         Returns:
             nothing
         """
-        self.set_user_module_score(user, None, None)
+        self.set_user_module_score(user, None, None, score_deleted=True)
 
-    def set_user_module_score(self, user, score, max_score, comment=u""):
+    def set_user_module_score(self, user, score, max_score, comment=u"", score_deleted=False):
         """
         Sets the module user state, including grades and comments, and also scoring in db's courseware_studentmodule
 
@@ -258,6 +265,7 @@ class LTI20ModuleMixin(object):
                 'value': scaled_score,
                 'max_value': max_score,
                 'user_id': user.id,
+                'score_deleted': score_deleted,
             },
         )
         self.module_score = scaled_score
@@ -286,8 +294,8 @@ class LTI20ModuleMixin(object):
         try:
             self.verify_oauth_body_sign(request, content_type=LTI_2_0_JSON_CONTENT_TYPE)
         except (ValueError, LTIError) as err:
-            log.info("[LTI]: v2.0 result service -- OAuth body verification failed:  {}".format(err.message))
-            raise LTIError(err.message)
+            log.info("[LTI]: v2.0 result service -- OAuth body verification failed:  {}".format(text_type(err)))
+            raise LTIError(text_type(err))
 
     def parse_lti_2_0_result_json(self, json_str):
         """
@@ -318,8 +326,8 @@ class LTI20ModuleMixin(object):
 
         # the standard supports a list of objects, who knows why. It must contain at least 1 element, and the
         # first element must be a dict
-        if type(json_obj) != dict:
-            if type(json_obj) == list and len(json_obj) >= 1 and type(json_obj[0]) == dict:
+        if not isinstance(json_obj, dict):
+            if isinstance(json_obj, list) and len(json_obj) >= 1 and isinstance(json_obj[0], dict):
                 json_obj = json_obj[0]
             else:
                 msg = ("Supplied JSON string is a list that does not contain an object as the first element. {}"
@@ -356,7 +364,7 @@ class LTI20ModuleMixin(object):
                 log.info("[LTI] {}".format(msg))
                 raise LTIError(msg)
         except (TypeError, ValueError) as err:
-            msg = "Could not convert resultScore to float: {}".format(err.message)
+            msg = "Could not convert resultScore to float: {}".format(text_type(err))
             log.info("[LTI] {}".format(msg))
             raise LTIError(msg)
 

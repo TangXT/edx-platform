@@ -2,33 +2,32 @@
 Test instructor.access
 """
 
-from nose.tools import raises
+
+import pytest
+from six.moves import range
+
+from lms.djangoapps.instructor.access import allow_access, list_with_level, revoke_access, update_forum_role
+from openedx.core.djangoapps.ace_common.tests.mixins import EmailTemplateTagMixin
+from openedx.core.djangoapps.django_comment_common.models import FORUM_ROLE_MODERATOR, Role
+from student.roles import CourseBetaTesterRole, CourseCcxCoachRole, CourseStaffRole
 from student.tests.factories import UserFactory
+from xmodule.modulestore.tests.django_utils import SharedModuleStoreTestCase
 from xmodule.modulestore.tests.factories import CourseFactory
-from xmodule.modulestore.tests.django_utils import ModuleStoreTestCase
-
-from django.test.utils import override_settings
-from courseware.tests.modulestore_config import TEST_DATA_MIXED_MODULESTORE
-from student.roles import CourseBetaTesterRole, CourseStaffRole
-
-from django_comment_common.models import (Role,
-                                          FORUM_ROLE_MODERATOR)
-from instructor.access import (allow_access,
-                               revoke_access,
-                               list_with_level,
-                               update_forum_role)
 
 
-@override_settings(MODULESTORE=TEST_DATA_MIXED_MODULESTORE)
-class TestInstructorAccessList(ModuleStoreTestCase):
+class TestInstructorAccessList(SharedModuleStoreTestCase):
     """ Test access listings. """
-    def setUp(self):
-        self.course = CourseFactory.create()
+    @classmethod
+    def setUpClass(cls):
+        super(TestInstructorAccessList, cls).setUpClass()
+        cls.course = CourseFactory.create()
 
-        self.instructors = [UserFactory.create() for _ in xrange(4)]
+    def setUp(self):
+        super(TestInstructorAccessList, self).setUp()
+        self.instructors = [UserFactory.create() for _ in range(4)]
         for user in self.instructors:
             allow_access(self.course, user, 'instructor')
-        self.beta_testers = [UserFactory.create() for _ in xrange(4)]
+        self.beta_testers = [UserFactory.create() for _ in range(4)]
         for user in self.beta_testers:
             allow_access(self.course, user, 'beta')
 
@@ -41,10 +40,16 @@ class TestInstructorAccessList(ModuleStoreTestCase):
         self.assertEqual(set(beta_testers), set(self.beta_testers))
 
 
-@override_settings(MODULESTORE=TEST_DATA_MIXED_MODULESTORE)
-class TestInstructorAccessAllow(ModuleStoreTestCase):
+class TestInstructorAccessAllow(EmailTemplateTagMixin, SharedModuleStoreTestCase):
     """ Test access allow. """
+    @classmethod
+    def setUpClass(cls):
+        super(TestInstructorAccessAllow, cls).setUpClass()
+        cls.course = CourseFactory.create()
+
     def setUp(self):
+        super(TestInstructorAccessAllow, self).setUp()
+
         self.course = CourseFactory.create()
 
     def test_allow(self):
@@ -58,33 +63,41 @@ class TestInstructorAccessAllow(ModuleStoreTestCase):
         allow_access(self.course, user, 'staff')
         self.assertTrue(CourseStaffRole(self.course.id).has_user(user))
 
+    def test_allow_ccx_coach(self):
+        user = UserFactory()
+        allow_access(self.course, user, 'ccx_coach')
+        self.assertTrue(CourseCcxCoachRole(self.course.id).has_user(user))
+
     def test_allow_beta(self):
         """ Test allow beta against list beta. """
         user = UserFactory()
         allow_access(self.course, user, 'beta')
         self.assertTrue(CourseBetaTesterRole(self.course.id).has_user(user))
 
-    @raises(ValueError)
     def test_allow_badlevel(self):
         user = UserFactory()
-        allow_access(self.course, user, 'robot-not-a-level')
+        with pytest.raises(ValueError):
+            allow_access(self.course, user, 'robot-not-a-level')
 
-    @raises(Exception)
     def test_allow_noneuser(self):
         user = None
-        allow_access(self.course, user, 'staff')
+        with pytest.raises(Exception):
+            allow_access(self.course, user, 'staff')
 
 
-@override_settings(MODULESTORE=TEST_DATA_MIXED_MODULESTORE)
-class TestInstructorAccessRevoke(ModuleStoreTestCase):
+class TestInstructorAccessRevoke(SharedModuleStoreTestCase):
     """ Test access revoke. """
-    def setUp(self):
-        self.course = CourseFactory.create()
+    @classmethod
+    def setUpClass(cls):
+        super(TestInstructorAccessRevoke, cls).setUpClass()
+        cls.course = CourseFactory.create()
 
-        self.staff = [UserFactory.create() for _ in xrange(4)]
+    def setUp(self):
+        super(TestInstructorAccessRevoke, self).setUp()
+        self.staff = [UserFactory.create() for _ in range(4)]
         for user in self.staff:
             allow_access(self.course, user, 'staff')
-        self.beta_testers = [UserFactory.create() for _ in xrange(4)]
+        self.beta_testers = [UserFactory.create() for _ in range(4)]
         for user in self.beta_testers:
             allow_access(self.course, user, 'beta')
 
@@ -103,25 +116,28 @@ class TestInstructorAccessRevoke(ModuleStoreTestCase):
         revoke_access(self.course, user, 'beta')
         self.assertFalse(CourseBetaTesterRole(self.course.id).has_user(user))
 
-    @raises(ValueError)
     def test_revoke_badrolename(self):
         user = UserFactory()
-        revoke_access(self.course, user, 'robot-not-a-level')
+        with pytest.raises(ValueError):
+            revoke_access(self.course, user, 'robot-not-a-level')
 
 
-@override_settings(MODULESTORE=TEST_DATA_MIXED_MODULESTORE)
-class TestInstructorAccessForum(ModuleStoreTestCase):
+class TestInstructorAccessForum(SharedModuleStoreTestCase):
     """
     Test forum access control.
     """
-    def setUp(self):
-        self.course = CourseFactory.create()
+    @classmethod
+    def setUpClass(cls):
+        super(TestInstructorAccessForum, cls).setUpClass()
+        cls.course = CourseFactory.create()
 
+    def setUp(self):
+        super(TestInstructorAccessForum, self).setUp()
         self.mod_role = Role.objects.create(
             course_id=self.course.id,
             name=FORUM_ROLE_MODERATOR
         )
-        self.moderators = [UserFactory.create() for _ in xrange(4)]
+        self.moderators = [UserFactory.create() for _ in range(4)]
         for user in self.moderators:
             self.mod_role.users.add(user)
 
@@ -137,10 +153,10 @@ class TestInstructorAccessForum(ModuleStoreTestCase):
         update_forum_role(self.course.id, user, FORUM_ROLE_MODERATOR, 'allow')
         self.assertIn(user, self.mod_role.users.all())
 
-    @raises(Role.DoesNotExist)
     def test_allow_badrole(self):
         user = UserFactory.create()
-        update_forum_role(self.course.id, user, 'robot-not-a-real-role', 'allow')
+        with pytest.raises(Role.DoesNotExist):
+            update_forum_role(self.course.id, user, 'robot-not-a-real-role', 'allow')
 
     def test_revoke(self):
         user = self.moderators[0]
@@ -159,12 +175,12 @@ class TestInstructorAccessForum(ModuleStoreTestCase):
         update_forum_role(self.course.id, user, FORUM_ROLE_MODERATOR, 'revoke')
         self.assertNotIn(user, self.mod_role.users.all())
 
-    @raises(Role.DoesNotExist)
     def test_revoke_badrole(self):
         user = self.moderators[0]
-        update_forum_role(self.course.id, user, 'robot-not-a-real-role', 'allow')
+        with pytest.raises(Role.DoesNotExist):
+            update_forum_role(self.course.id, user, 'robot-not-a-real-role', 'allow')
 
-    @raises(ValueError)
     def test_bad_mode(self):
         user = UserFactory()
-        update_forum_role(self.course.id, user, FORUM_ROLE_MODERATOR, 'robot-not-a-mode')
+        with pytest.raises(ValueError):
+            update_forum_role(self.course.id, user, FORUM_ROLE_MODERATOR, 'robot-not-a-mode')

@@ -3,27 +3,45 @@
 Tests of responsetypes
 """
 
-from datetime import datetime
+
+import io
 import json
 import os
-import pyparsing
-import random
-import unittest
 import textwrap
-import requests
-import mock
+import unittest
+import zipfile
+from datetime import datetime
 
-from . import new_loncapa_problem, test_capa_system, load_fixture
 import calc
-
-from capa.responsetypes import LoncapaProblemError, \
-    StudentInputError, ResponseError
-from capa.correctmap import CorrectMap
-from capa.util import convert_files_to_filenames
-from capa.util import compare_with_tolerance
-from capa.xqueue_interface import dateformat
-
+import mock
+import pyparsing
+import random2 as random
+import requests
+import six
 from pytz import UTC
+from six import text_type
+
+from capa.correctmap import CorrectMap
+from capa.responsetypes import LoncapaProblemError, ResponseError, StudentInputError
+from capa.tests.helpers import load_fixture, new_loncapa_problem, test_capa_system
+from capa.tests.response_xml_factory import (
+    AnnotationResponseXMLFactory,
+    ChoiceResponseXMLFactory,
+    ChoiceTextResponseXMLFactory,
+    CodeResponseXMLFactory,
+    CustomResponseXMLFactory,
+    FormulaResponseXMLFactory,
+    ImageResponseXMLFactory,
+    MultipleChoiceResponseXMLFactory,
+    NumericalResponseXMLFactory,
+    OptionResponseXMLFactory,
+    SchematicResponseXMLFactory,
+    StringResponseXMLFactory,
+    SymbolicResponseXMLFactory,
+    TrueFalseResponseXMLFactory
+)
+from capa.util import convert_files_to_filenames
+from capa.xqueue_interface import dateformat
 
 
 class ResponseTest(unittest.TestCase):
@@ -35,6 +53,7 @@ class ResponseTest(unittest.TestCase):
     maxDiff = None
 
     def setUp(self):
+        super(ResponseTest, self).setUp()
         if self.xml_factory_class:
             self.xml_factory = self.xml_factory_class()
 
@@ -42,18 +61,20 @@ class ResponseTest(unittest.TestCase):
         xml = self.xml_factory.build_xml(**kwargs)
         return new_loncapa_problem(xml, capa_system=capa_system)
 
+    # pylint: disable=missing-function-docstring
     def assert_grade(self, problem, submission, expected_correctness, msg=None):
         input_dict = {'1_2_1': submission}
         correct_map = problem.grade_answers(input_dict)
         if msg is None:
-            self.assertEquals(correct_map.get_correctness('1_2_1'), expected_correctness)
+            self.assertEqual(correct_map.get_correctness('1_2_1'), expected_correctness)
         else:
-            self.assertEquals(correct_map.get_correctness('1_2_1'), expected_correctness, msg)
+            self.assertEqual(correct_map.get_correctness('1_2_1'), expected_correctness, msg)
 
     def assert_answer_format(self, problem):
         answers = problem.get_question_answers()
-        self.assertTrue(answers['1_2_1'] is not None)
+        self.assertIsNotNone(answers['1_2_1'])
 
+    # pylint: disable=missing-function-docstring
     def assert_multiple_grade(self, problem, correct_answers, incorrect_answers):
         for input_str in correct_answers:
             result = problem.grade_answers({'1_2_1': input_str}).get_correctness('1_2_1')
@@ -62,6 +83,23 @@ class ResponseTest(unittest.TestCase):
         for input_str in incorrect_answers:
             result = problem.grade_answers({'1_2_1': input_str}).get_correctness('1_2_1')
             self.assertEqual(result, 'incorrect')
+
+    def assert_multiple_partial(self, problem, correct_answers, incorrect_answers, partial_answers):
+        """
+        Runs multiple asserts for varying correct, incorrect,
+        and partially correct answers, all passed as lists.
+        """
+        for input_str in correct_answers:
+            result = problem.grade_answers({'1_2_1': input_str}).get_correctness('1_2_1')
+            self.assertEqual(result, 'correct')
+
+        for input_str in incorrect_answers:
+            result = problem.grade_answers({'1_2_1': input_str}).get_correctness('1_2_1')
+            self.assertEqual(result, 'incorrect')
+
+        for input_str in partial_answers:
+            result = problem.grade_answers({'1_2_1': input_str}).get_correctness('1_2_1')
+            self.assertEqual(result, 'partially-correct')
 
     def _get_random_number_code(self):
         """Returns code to be used to generate a random result."""
@@ -73,8 +111,7 @@ class ResponseTest(unittest.TestCase):
         return str(rand.randint(0, 1e9))
 
 
-class MultiChoiceResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import MultipleChoiceResponseXMLFactory
+class MultiChoiceResponseTest(ResponseTest):  # pylint: disable=missing-class-docstring
     xml_factory_class = MultipleChoiceResponseXMLFactory
 
     def test_multiple_choice_grade(self):
@@ -85,6 +122,14 @@ class MultiChoiceResponseTest(ResponseTest):
         self.assert_grade(problem, 'choice_1', 'correct')
         self.assert_grade(problem, 'choice_2', 'incorrect')
 
+    def test_partial_multiple_choice_grade(self):
+        problem = self.build_problem(choices=[False, True, 'partial'], credit_type='points')
+
+        # Ensure that we get the expected grades
+        self.assert_grade(problem, 'choice_0', 'incorrect')
+        self.assert_grade(problem, 'choice_1', 'correct')
+        self.assert_grade(problem, 'choice_2', 'partially-correct')
+
     def test_named_multiple_choice_grade(self):
         problem = self.build_problem(choices=[False, True, False],
                                      choice_names=["foil_1", "foil_2", "foil_3"])
@@ -94,9 +139,69 @@ class MultiChoiceResponseTest(ResponseTest):
         self.assert_grade(problem, 'choice_foil_2', 'correct')
         self.assert_grade(problem, 'choice_foil_3', 'incorrect')
 
+    def test_multiple_choice_valid_grading_schemes(self):
+        # Multiple Choice problems only allow one partial credit scheme.
+        # Change this test if that changes.
+        problem = self.build_problem(choices=[False, True, 'partial'], credit_type='points,points')
+        with self.assertRaises(LoncapaProblemError):
+            input_dict = {'1_2_1': 'choice_1'}
+            problem.grade_answers(input_dict)
 
-class TrueFalseResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import TrueFalseResponseXMLFactory
+        # 'bongo' is not a valid grading scheme.
+        problem = self.build_problem(choices=[False, True, 'partial'], credit_type='bongo')
+        with self.assertRaises(LoncapaProblemError):
+            input_dict = {'1_2_1': 'choice_1'}
+            problem.grade_answers(input_dict)
+
+    def test_partial_points_multiple_choice_grade(self):
+        problem = self.build_problem(
+            choices=['partial', 'partial', 'partial'],
+            credit_type='points',
+            points=['1', '0.6', '0']
+        )
+
+        # Ensure that we get the expected number of points
+        # Using assertAlmostEqual to avoid floating point issues
+        correct_map = problem.grade_answers({'1_2_1': 'choice_0'})
+        self.assertAlmostEqual(correct_map.get_npoints('1_2_1'), 1)
+
+        correct_map = problem.grade_answers({'1_2_1': 'choice_1'})
+        self.assertAlmostEqual(correct_map.get_npoints('1_2_1'), 0.6)
+
+        correct_map = problem.grade_answers({'1_2_1': 'choice_2'})
+        self.assertAlmostEqual(correct_map.get_npoints('1_2_1'), 0)
+
+    def test_contextualized_choices(self):
+        script = textwrap.dedent("""
+            a = 2
+            b = 9
+            c = a + b
+
+            ok0 = c % 2 == 0 # check remainder modulo 2
+            text0 = "$a + $b is even"
+
+            ok1 = c % 2 == 1 # check remainder modulo 2
+            text1 = "$a + $b is odd"
+
+            ok2 = "partial"
+            text2 = "infinity may be both"
+        """)
+        choices = ["$ok0", "$ok1", "$ok2"]
+        choice_names = ["$text0 ... (should be $ok0)",
+                        "$text1 ... (should be $ok1)",
+                        "$text2 ... (should be $ok2)"]
+        problem = self.build_problem(script=script,
+                                     choices=choices,
+                                     choice_names=choice_names,
+                                     credit_type='points')
+
+        # Ensure the expected correctness and choice names
+        self.assert_grade(problem, 'choice_2 + 9 is even ... (should be False)', 'incorrect')
+        self.assert_grade(problem, 'choice_2 + 9 is odd ... (should be True)', 'correct')
+        self.assert_grade(problem, 'choice_infinity may be both ... (should be partial)', 'partially-correct')
+
+
+class TrueFalseResponseTest(ResponseTest):   # pylint: disable=missing-class-docstring
     xml_factory_class = TrueFalseResponseXMLFactory
 
     def test_true_false_grade(self):
@@ -134,9 +239,13 @@ class TrueFalseResponseTest(ResponseTest):
         self.assert_grade(problem, 'choice_foil_4', 'incorrect')
         self.assert_grade(problem, 'not_a_choice', 'incorrect')
 
+    def test_single_correct_response(self):
+        problem = self.build_problem(choices=[True, False])
+        self.assert_grade(problem, 'choice_0', 'correct')
+        self.assert_grade(problem, ['choice_0'], 'correct')
 
-class ImageResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import ImageResponseXMLFactory
+
+class ImageResponseTest(ResponseTest):  # pylint: disable=missing-class-docstring
     xml_factory_class = ImageResponseXMLFactory
 
     def test_rectangle_grade(self):
@@ -199,37 +308,8 @@ class ImageResponseTest(ResponseTest):
         self.assert_answer_format(problem)
 
 
-class SymbolicResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import SymbolicResponseXMLFactory
+class SymbolicResponseTest(ResponseTest):  # pylint: disable=missing-class-docstring
     xml_factory_class = SymbolicResponseXMLFactory
-
-    def test_grade_single_input_correct(self):
-        problem = self.build_problem(math_display=True, expect="2*x+3*y")
-
-        # Correct answers
-        correct_inputs = [
-            ('2x+3y', textwrap.dedent("""
-                <math xmlns="http://www.w3.org/1998/Math/MathML">
-                    <mstyle displaystyle="true">
-                    <mn>2</mn><mo>*</mo><mi>x</mi><mo>+</mo><mn>3</mn><mo>*</mo><mi>y</mi>
-                    </mstyle></math>"""),
-             'snuggletex_2x+3y.xml'),
-
-            ('x+x+3y', textwrap.dedent("""
-                <math xmlns="http://www.w3.org/1998/Math/MathML">
-                    <mstyle displaystyle="true">
-                    <mi>x</mi><mo>+</mo><mi>x</mi><mo>+</mo><mn>3</mn><mo>*</mo><mi>y</mi>
-                    </mstyle></math>"""),
-             'snuggletex_x+x+3y.xml'),
-        ]
-
-        for (input_str, input_mathml, server_fixture) in correct_inputs:
-            print "Testing input: {0}".format(input_str)
-            server_resp = load_fixture(server_fixture)
-            self._assert_symbolic_grade(
-                problem, input_str, input_mathml,
-                'correct', snuggletex_resp=server_resp
-            )
 
     def test_grade_single_input_incorrect(self):
         problem = self.build_problem(math_display=True, expect="2*x+3*y")
@@ -246,23 +326,6 @@ class SymbolicResponseTest(ResponseTest):
 
         for (input_str, input_mathml) in incorrect_inputs:
             self._assert_symbolic_grade(problem, input_str, input_mathml, 'incorrect')
-
-    def test_complex_number_grade_correct(self):
-        problem = self.build_problem(
-            math_display=True,
-            expect="[[cos(theta),i*sin(theta)],[i*sin(theta),cos(theta)]]",
-            options=["matrix", "imaginary"]
-        )
-
-        correct_snuggletex = load_fixture('snuggletex_correct.html')
-        dynamath_input = load_fixture('dynamath_input.txt')
-        student_response = "cos(theta)*[[1,0],[0,1]] + i*sin(theta)*[[0,1],[1,0]]"
-
-        self._assert_symbolic_grade(
-            problem, student_response, dynamath_input,
-            'correct',
-            snuggletex_resp=correct_snuggletex
-        )
 
     def test_complex_number_grade_incorrect(self):
 
@@ -317,8 +380,7 @@ class SymbolicResponseTest(ResponseTest):
             )
 
 
-class OptionResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import OptionResponseXMLFactory
+class OptionResponseTest(ResponseTest):  # pylint: disable=missing-class-docstring
     xml_factory_class = OptionResponseXMLFactory
 
     def test_grade(self):
@@ -344,12 +406,31 @@ class OptionResponseTest(ResponseTest):
         self.assert_grade(problem, "hasn\'t", "correct")
         self.assert_grade(problem, "has'nt", "incorrect")
 
+    def test_variable_options(self):
+        """
+        Test that if variable are given in option response then correct map must contain answervariable value.
+        """
+        script = textwrap.dedent("""\
+        a = 1000
+        b = a*2
+        c = a*3
+        """)
+        problem = self.build_problem(
+            options=['$a', '$b', '$c'],
+            correct_option='$a',
+            script=script
+        )
+
+        input_dict = {'1_2_1': '1000'}
+        correct_map = problem.grade_answers(input_dict)
+        self.assertEqual(correct_map.get_correctness('1_2_1'), 'correct')
+        self.assertEqual(correct_map.get_property('1_2_1', 'answervariable'), '$a')
+
 
 class FormulaResponseTest(ResponseTest):
     """
     Test the FormulaResponse class
     """
-    from capa.tests.response_xml_factory import FormulaResponseXMLFactory
     xml_factory_class = FormulaResponseXMLFactory
 
     def test_grade(self):
@@ -399,14 +480,14 @@ class FormulaResponseTest(ResponseTest):
         # Expect to receive a hint  if we add an extra y
         input_dict = {'1_2_1': "x + 2*y + y"}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'),
-                          'Check the coefficient of y')
+        self.assertEqual(correct_map.get_hint('1_2_1'),
+                         'Check the coefficient of y')
 
         # Expect to receive a hint if we leave out x
         input_dict = {'1_2_1': "2*y"}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'),
-                          'Try including the variable x')
+        self.assertEqual(correct_map.get_hint('1_2_1'),
+                         'Try including the variable x')
 
     def test_script(self):
         """
@@ -493,12 +574,11 @@ class FormulaResponseTest(ResponseTest):
             tolerance="1%",
             answer="x"
         )
-        self.assertTrue(problem.responders.values()[0].validate_answer('14*x'))
-        self.assertFalse(problem.responders.values()[0].validate_answer('3*y+2*x'))
+        self.assertTrue(list(problem.responders.values())[0].validate_answer('14*x'))
+        self.assertFalse(list(problem.responders.values())[0].validate_answer('3*y+2*x'))
 
 
-class StringResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import StringResponseXMLFactory
+class StringResponseTest(ResponseTest):  # pylint: disable=missing-class-docstring
     xml_factory_class = StringResponseXMLFactory
 
     def test_backward_compatibility_for_multiple_answers(self):
@@ -564,12 +644,12 @@ class StringResponseTest(ResponseTest):
             "Martin Luther King"
         ]
 
-        problem = self.build_problem(answer="\w*\.?.*Luther King\s*.*", case_sensitive=True, regexp=True)
+        problem = self.build_problem(answer=r"\w*\.?.*Luther King\s*.*", case_sensitive=True, regexp=True)
 
         for answer in answers:
             self.assert_grade(problem, answer, "correct")
 
-        problem = self.build_problem(answer="^(-\|){2,5}$", case_sensitive=False, regexp=True)
+        problem = self.build_problem(answer=r"^(-\|){2,5}$", case_sensitive=False, regexp=True)
         self.assert_grade(problem, "-|-|-|", "correct")
         self.assert_grade(problem, "-|", "incorrect")
         self.assert_grade(problem, "-|-|-|-|-|-|", "incorrect")
@@ -604,9 +684,8 @@ class StringResponseTest(ResponseTest):
         self.assert_grade(problem, u"î", "incorrect")
         self.assert_grade(problem, u"o", "incorrect")
 
-
     def test_backslash_and_unicode_regexps(self):
-        """
+        r"""
         Test some special cases of [unicode] regexps.
 
         One needs to use either r'' strings or write real `repr` of unicode strings, because of the following
@@ -621,18 +700,18 @@ class StringResponseTest(ResponseTest):
             b) regexp is saved to xml and is read in python as repr of that string
             So  a\d in front-end editor will become a\\\\d in xml,  so it will match a1 as student answer.
         """
-        problem = self.build_problem(answer=ur"5\\æ", case_sensitive=False, regexp=True)
-        self.assert_grade(problem, u"5\æ", "correct")
+        problem = self.build_problem(answer=u"5\\\\æ", case_sensitive=False, regexp=True)
+        self.assert_grade(problem, u"5\\æ", "correct")
 
         problem = self.build_problem(answer=u"5\\\\æ", case_sensitive=False, regexp=True)
-        self.assert_grade(problem, u"5\æ", "correct")
+        self.assert_grade(problem, u"5\\æ", "correct")
 
     def test_backslash(self):
         problem = self.build_problem(answer=u"a\\\\c1", case_sensitive=False, regexp=True)
-        self.assert_grade(problem, u"a\c1", "correct")
+        self.assert_grade(problem, u"a\\c1", "correct")
 
     def test_special_chars(self):
-        problem = self.build_problem(answer=ur"a \s1", case_sensitive=False, regexp=True)
+        problem = self.build_problem(answer=u"a \\s1", case_sensitive=False, regexp=True)
         self.assert_grade(problem, u"a  1", "correct")
 
     def test_case_sensitive(self):
@@ -707,6 +786,12 @@ class StringResponseTest(ResponseTest):
         # Other strings and the lowercase version of the string are incorrect
         self.assert_grade(problem, "Other String", "incorrect")
 
+    def test_compatible_non_attribute_additional_answer_xml(self):
+        problem = self.build_problem(answer="Donut", non_attribute_answers=["Sprinkles"])
+        self.assert_grade(problem, "Donut", "correct")
+        self.assert_grade(problem, "Sprinkles", "correct")
+        self.assert_grade(problem, "Meh", "incorrect")
+
     def test_partial_matching(self):
         problem = self.build_problem(answer="a2", case_sensitive=False, regexp=True, additional_answers=['.?\\d.?'])
         self.assert_grade(problem, "a3", "correct")
@@ -716,7 +801,7 @@ class StringResponseTest(ResponseTest):
         problem = self.build_problem(answer="a2", case_sensitive=False, regexp=True, additional_answers=['?\\d?'])
         with self.assertRaises(Exception) as cm:
             self.assert_grade(problem, "a3", "correct")
-        exception_message = cm.exception.message
+        exception_message = text_type(cm.exception)
         self.assertIn("nothing to repeat", exception_message)
 
     def test_hints(self):
@@ -730,27 +815,27 @@ class StringResponseTest(ResponseTest):
             case_sensitive=False,
             hints=hints,
         )
-         # We should get a hint for Wisconsin
+        # We should get a hint for Wisconsin
         input_dict = {'1_2_1': 'Wisconsin'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'),
-                          "The state capital of Wisconsin is Madison")
+        self.assertEqual(correct_map.get_hint('1_2_1'),
+                         "The state capital of Wisconsin is Madison")
 
         # We should get a hint for Minnesota
         input_dict = {'1_2_1': 'Minnesota'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'),
-                          "The state capital of Minnesota is St. Paul")
+        self.assertEqual(correct_map.get_hint('1_2_1'),
+                         "The state capital of Minnesota is St. Paul")
 
         # We should NOT get a hint for Michigan (the correct answer)
         input_dict = {'1_2_1': 'Michigan'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'), "")
+        self.assertEqual(correct_map.get_hint('1_2_1'), "")
 
         # We should NOT get a hint for any other string
         input_dict = {'1_2_1': 'California'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'), "")
+        self.assertEqual(correct_map.get_hint('1_2_1'), "")
 
     def test_hints_regexp_and_answer_regexp(self):
         different_student_answers = [
@@ -782,38 +867,38 @@ class StringResponseTest(ResponseTest):
         # We should get a hint for Wisconsin
         input_dict = {'1_2_1': 'Wisconsin'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'),
-                          "The state capital of Wisconsin is Madison")
+        self.assertEqual(correct_map.get_hint('1_2_1'),
+                         "The state capital of Wisconsin is Madison")
 
         # We should get a hint for Minnesota
         input_dict = {'1_2_1': 'Minnesota'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'),
-                          "The state capital of Minnesota is St. Paul")
+        self.assertEqual(correct_map.get_hint('1_2_1'),
+                         "The state capital of Minnesota is St. Paul")
 
         # We should NOT get a hint for Michigan (the correct answer)
         input_dict = {'1_2_1': 'Michigan'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'), "")
+        self.assertEqual(correct_map.get_hint('1_2_1'), "")
 
         # We should NOT get a hint for any other string
         input_dict = {'1_2_1': 'California'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'), "")
+        self.assertEqual(correct_map.get_hint('1_2_1'), "")
 
         # We should get the same hint for each answer
         for answer in different_student_answers:
             input_dict = {'1_2_1': answer}
             correct_map = problem.grade_answers(input_dict)
-            self.assertEquals(correct_map.get_hint('1_2_1'), "First letter of correct answer is M.")
+            self.assertEqual(correct_map.get_hint('1_2_1'), "First letter of correct answer is M.")
 
         input_dict = {'1_2_1': '59'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'), "Should not end with 9.")
+        self.assertEqual(correct_map.get_hint('1_2_1'), "Should not end with 9.")
 
         input_dict = {'1_2_1': '57'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'), "")
+        self.assertEqual(correct_map.get_hint('1_2_1'), "")
 
     def test_computed_hints(self):
         problem = self.build_problem(
@@ -829,7 +914,7 @@ class StringResponseTest(ResponseTest):
 
         input_dict = {'1_2_1': 'Hello'}
         correct_map = problem.grade_answers(input_dict)
-        self.assertEquals(correct_map.get_hint('1_2_1'), "Hello??")
+        self.assertEqual(correct_map.get_hint('1_2_1'), "Hello??")
 
     def test_hint_function_randomization(self):
         # The hint function should get the seed from the problem.
@@ -847,9 +932,15 @@ class StringResponseTest(ResponseTest):
         hint = correct_map.get_hint('1_2_1')
         self.assertEqual(hint, self._get_random_number_result(problem.seed))
 
+    def test_empty_answer_graded_as_incorrect(self):
+        """
+        Tests that problem should be graded incorrect if blank space is chosen as answer
+        """
+        problem = self.build_problem(answer=" ", case_sensitive=False, regexp=True)
+        self.assert_grade(problem, u" ", "incorrect")
 
-class CodeResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import CodeResponseXMLFactory
+
+class CodeResponseTest(ResponseTest):  # pylint: disable=missing-class-docstring
     xml_factory_class = CodeResponseXMLFactory
 
     def setUp(self):
@@ -880,7 +971,7 @@ class CodeResponseTest(ResponseTest):
             cmap.update(CorrectMap(answer_id=answer_id, queuestate=None))
         self.problem.correct_map.update(cmap)
 
-        self.assertEquals(self.problem.is_queued(), False)
+        self.assertEqual(self.problem.is_queued(), False)
 
         # Now we queue the LCP
         cmap = CorrectMap()
@@ -889,7 +980,7 @@ class CodeResponseTest(ResponseTest):
             cmap.update(CorrectMap(answer_id=answer_ids[i], queuestate=queuestate))
         self.problem.correct_map.update(cmap)
 
-        self.assertEquals(self.problem.is_queued(), True)
+        self.assertEqual(self.problem.is_queued(), True)
 
     def test_update_score(self):
         '''
@@ -918,7 +1009,7 @@ class CodeResponseTest(ResponseTest):
             self.problem.correct_map.update(old_cmap)  # Deep copy
 
             self.problem.update_score(xserver_msgs[correctness], queuekey=0)
-            self.assertEquals(self.problem.correct_map.get_dict(), old_cmap.get_dict())  # Deep comparison
+            self.assertEqual(self.problem.correct_map.get_dict(), old_cmap.get_dict())  # Deep comparison
 
             for answer_id in answer_ids:
                 self.assertTrue(self.problem.correct_map.is_queued(answer_id))  # Should be still queued, since message undelivered
@@ -935,7 +1026,7 @@ class CodeResponseTest(ResponseTest):
                 new_cmap.set(answer_id=answer_id, npoints=npoints, correctness=correctness, msg=grader_msg, queuestate=None)
 
                 self.problem.update_score(xserver_msgs[correctness], queuekey=1000 + i)
-                self.assertEquals(self.problem.correct_map.get_dict(), new_cmap.get_dict())
+                self.assertEqual(self.problem.correct_map.get_dict(), new_cmap.get_dict())
 
                 for j, test_id in enumerate(answer_ids):
                     if j == i:
@@ -955,7 +1046,7 @@ class CodeResponseTest(ResponseTest):
             cmap.update(CorrectMap(answer_id=answer_id, queuestate=None))
         self.problem.correct_map.update(cmap)
 
-        self.assertEquals(self.problem.get_recentmost_queuetime(), None)
+        self.assertEqual(self.problem.get_recentmost_queuetime(), None)
 
         # CodeResponse requires internal CorrectMap state. Build it now in the queued state
         cmap = CorrectMap()
@@ -971,7 +1062,7 @@ class CodeResponseTest(ResponseTest):
             datetime.strftime(latest_timestamp, dateformat), dateformat
         ).replace(tzinfo=UTC)
 
-        self.assertEquals(self.problem.get_recentmost_queuetime(), latest_timestamp)
+        self.assertEqual(self.problem.get_recentmost_queuetime(), latest_timestamp)
 
     def test_convert_files_to_filenames(self):
         '''
@@ -983,9 +1074,9 @@ class CodeResponseTest(ResponseTest):
                                  '1_3_1': ['answer1', 'answer2', 'answer3'],
                                  '1_4_1': [fp, fp]}
             answers_converted = convert_files_to_filenames(answers_with_file)
-            self.assertEquals(answers_converted['1_2_1'], 'String-based answer')
-            self.assertEquals(answers_converted['1_3_1'], ['answer1', 'answer2', 'answer3'])
-            self.assertEquals(answers_converted['1_4_1'], [fp.name, fp.name])
+            self.assertEqual(answers_converted['1_2_1'], 'String-based answer')
+            self.assertEqual(answers_converted['1_3_1'], ['answer1', 'answer2', 'answer3'])
+            self.assertEqual(answers_converted['1_4_1'], [fp.name, fp.name])
 
     def test_parse_score_msg_of_responder(self):
         """
@@ -1004,6 +1095,7 @@ class CodeResponseTest(ResponseTest):
 
         invalid_grader_msgs = [
             '<audio',  # invalid XML and HTML5
+            '<p>\b</p>',  # invalid special character
         ]
 
         answer_ids = sorted(self.problem.get_question_answers())
@@ -1024,7 +1116,7 @@ class CodeResponseTest(ResponseTest):
                 self.problem.correct_map = CorrectMap()
                 self.problem.correct_map.update(old_cmap)
                 output = self.problem.update_score(xserver_msgs['correct'], queuekey=1000 + i)
-                self.assertEquals(output[answer_id]['msg'], grader_msg)
+                self.assertEqual(output[answer_id]['msg'], grader_msg)
 
         for grader_msg in invalid_grader_msgs:
             correct_score_msg = json.dumps({'correct': True, 'score': 1, 'msg': grader_msg})
@@ -1036,13 +1128,10 @@ class CodeResponseTest(ResponseTest):
                 self.problem.correct_map.update(old_cmap)
 
                 output = self.problem.update_score(xserver_msgs['correct'], queuekey=1000 + i)
-                self.assertEquals(output[answer_id]['msg'], u'Invalid grader reply. Please contact the course staff.')
+                self.assertEqual(output[answer_id]['msg'], u'Invalid grader reply. Please contact the course staff.')
 
 
-
-
-class ChoiceResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import ChoiceResponseXMLFactory
+class ChoiceResponseTest(ResponseTest):  # pylint: disable=missing-class-docstring
     xml_factory_class = ChoiceResponseXMLFactory
 
     def test_radio_group_grade(self):
@@ -1072,50 +1161,145 @@ class ChoiceResponseTest(ResponseTest):
         # No choice 3 exists --> mark incorrect
         self.assert_grade(problem, 'choice_3', 'incorrect')
 
-
-class JavascriptResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import JavascriptResponseXMLFactory
-    xml_factory_class = JavascriptResponseXMLFactory
-
-    def test_grade(self):
-        # Compile coffee files into javascript used by the response
-        coffee_file_path = os.path.dirname(__file__) + "/test_files/js/*.coffee"
-        os.system("node_modules/.bin/coffee -c %s" % (coffee_file_path))
-
-        capa_system = test_capa_system()
-        capa_system.can_execute_unsafe_code = lambda: True
+    def test_checkbox_group_valid_grading_schemes(self):
+        # Checkbox-type problems only allow one partial credit scheme.
+        # Change this test if that changes.
         problem = self.build_problem(
-            capa_system=capa_system,
-            generator_src="test_problem_generator.js",
-            grader_src="test_problem_grader.js",
-            display_class="TestProblemDisplay",
-            display_src="test_problem_display.js",
-            param_dict={'value': '4'},
+            choice_type='checkbox',
+            choices=[False, False, True, True],
+            credit_type='edc,halves,bongo'
+        )
+        with self.assertRaises(LoncapaProblemError):
+            input_dict = {'1_2_1': 'choice_1'}
+            problem.grade_answers(input_dict)
+
+        # 'bongo' is not a valid grading scheme.
+        problem = self.build_problem(
+            choice_type='checkbox',
+            choices=[False, False, True, True],
+            credit_type='bongo'
+        )
+        with self.assertRaises(LoncapaProblemError):
+            input_dict = {'1_2_1': 'choice_1'}
+            problem.grade_answers(input_dict)
+
+    def test_checkbox_group_partial_credit_grade(self):
+        # First: Every Decision Counts grading style
+        problem = self.build_problem(
+            choice_type='checkbox',
+            choices=[False, False, True, True],
+            credit_type='edc'
         )
 
-        # Test that we get graded correctly
-        self.assert_grade(problem, json.dumps({0: 4}), "correct")
-        self.assert_grade(problem, json.dumps({0: 5}), "incorrect")
+        # Check that we get the expected results
+        # (correct if and only if BOTH correct choices chosen)
+        # (partially correct if at least one choice is right)
+        # (incorrect if totally wrong)
+        self.assert_grade(problem, ['choice_0', 'choice_1'], 'incorrect')
+        self.assert_grade(problem, ['choice_2', 'choice_3'], 'correct')
+        self.assert_grade(problem, 'choice_0', 'partially-correct')
+        self.assert_grade(problem, 'choice_2', 'partially-correct')
+        self.assert_grade(problem, ['choice_0', 'choice_1', 'choice_2', 'choice_3'], 'partially-correct')
 
-    def test_cant_execute_javascript(self):
-        # If the system says to disallow unsafe code execution, then making
-        # this problem will raise an exception.
-        capa_system = test_capa_system()
-        capa_system.can_execute_unsafe_code = lambda: False
+        # Second: Halves grading style
+        problem = self.build_problem(
+            choice_type='checkbox',
+            choices=[False, False, True, True],
+            credit_type='halves'
+        )
 
-        with self.assertRaises(LoncapaProblemError):
-            self.build_problem(
-                capa_system=capa_system,
-                generator_src="test_problem_generator.js",
-                grader_src="test_problem_grader.js",
-                display_class="TestProblemDisplay",
-                display_src="test_problem_display.js",
-                param_dict={'value': '4'},
-            )
+        # Check that we get the expected results
+        # (correct if and only if BOTH correct choices chosen)
+        # (partially correct on one error)
+        # (incorrect for more errors, at least with this # of choices.)
+        self.assert_grade(problem, ['choice_0', 'choice_1'], 'incorrect')
+        self.assert_grade(problem, ['choice_2', 'choice_3'], 'correct')
+        self.assert_grade(problem, 'choice_2', 'partially-correct')
+        self.assert_grade(problem, ['choice_1', 'choice_2', 'choice_3'], 'partially-correct')
+        self.assert_grade(problem, ['choice_0', 'choice_1', 'choice_2', 'choice_3'], 'incorrect')
+
+        # Third: Halves grading style with more options
+        problem = self.build_problem(
+            choice_type='checkbox',
+            choices=[False, False, True, True, False],
+            credit_type='halves'
+        )
+
+        # Check that we get the expected results
+        # (2 errors allowed with 5+ choices)
+        self.assert_grade(problem, ['choice_0', 'choice_1', 'choice_4'], 'incorrect')
+        self.assert_grade(problem, ['choice_2', 'choice_3'], 'correct')
+        self.assert_grade(problem, 'choice_2', 'partially-correct')
+        self.assert_grade(problem, ['choice_1', 'choice_2', 'choice_3'], 'partially-correct')
+        self.assert_grade(problem, ['choice_0', 'choice_1', 'choice_2', 'choice_3'], 'partially-correct')
+        self.assert_grade(problem, ['choice_0', 'choice_1', 'choice_2', 'choice_3', 'choice_4'], 'incorrect')
+
+    def test_checkbox_group_partial_points_grade(self):
+        # Ensure that we get the expected number of points
+        # Using assertAlmostEqual to avoid floating point issues
+        # First: Every Decision Counts grading style
+        problem = self.build_problem(
+            choice_type='checkbox',
+            choices=[False, False, True, True],
+            credit_type='edc'
+        )
+
+        correct_map = problem.grade_answers({'1_2_1': 'choice_2'})
+        self.assertAlmostEqual(correct_map.get_npoints('1_2_1'), 0.75)
+
+        # Second: Halves grading style
+        problem = self.build_problem(
+            choice_type='checkbox',
+            choices=[False, False, True, True],
+            credit_type='halves'
+        )
+
+        correct_map = problem.grade_answers({'1_2_1': 'choice_2'})
+        self.assertAlmostEqual(correct_map.get_npoints('1_2_1'), 0.5)
+
+        # Third: Halves grading style with more options
+        problem = self.build_problem(
+            choice_type='checkbox',
+            choices=[False, False, True, True, False],
+            credit_type='halves'
+        )
+
+        correct_map = problem.grade_answers({'1_2_1': 'choice_2,choice4'})
+        self.assertAlmostEqual(correct_map.get_npoints('1_2_1'), 0.25)
+
+    def test_grade_with_no_checkbox_selected(self):
+        """
+        Test that answer marked as incorrect if no checkbox selected.
+        """
+        problem = self.build_problem(
+            choice_type='checkbox', choices=[False, False, False]
+        )
+
+        correct_map = problem.grade_answers({})
+        self.assertEqual(correct_map.get_correctness('1_2_1'), 'incorrect')
+
+    def test_contextualized_choices(self):
+        script = textwrap.dedent("""
+            a = 6
+            b = 4
+            c = a + b
+
+            ok0 = c % 2 == 0 # check remainder modulo 2
+            ok1 = c % 3 == 0 # check remainder modulo 3
+            ok2 = c % 5 == 0 # check remainder modulo 5
+            ok3 = not any([ok0, ok1, ok2])
+        """)
+        choices = ["$ok0", "$ok1", "$ok2", "$ok3"]
+        problem = self.build_problem(script=script,
+                                     choice_type='checkbox',
+                                     choices=choices)
+
+        # Ensure the expected correctness
+        self.assert_grade(problem, ['choice_0', 'choice_2'], 'correct')
+        self.assert_grade(problem, ['choice_1', 'choice_3'], 'incorrect')
 
 
-class NumericalResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import NumericalResponseXMLFactory
+class NumericalResponseTest(ResponseTest):  # pylint: disable=missing-class-docstring
     xml_factory_class = NumericalResponseXMLFactory
 
     # We blend the line between integration (using evaluator) and exclusively
@@ -1123,7 +1307,7 @@ class NumericalResponseTest(ResponseTest):
     # For simple things its not worth the effort.
     def test_grade_range_tolerance(self):
         problem_setup = [
-            # [given_asnwer, [list of correct responses], [list of incorrect responses]]
+            # [given_answer, [list of correct responses], [list of incorrect responses]]
             ['[5, 7)', ['5', '6', '6.999'], ['4.999', '7']],
             ['[1.6e-5, 1.9e24)', ['0.000016', '1.6*10^-5', '1.59e24'], ['1.59e-5', '1.9e24', '1.9*10^24']],
             ['[0, 1.6e-5]', ['1.6*10^-5'], ["2"]],
@@ -1132,6 +1316,89 @@ class NumericalResponseTest(ResponseTest):
         for given_answer, correct_responses, incorrect_responses in problem_setup:
             problem = self.build_problem(answer=given_answer)
             self.assert_multiple_grade(problem, correct_responses, incorrect_responses)
+
+    def test_additional_answer_grading(self):
+        """
+        Test additional answers are graded correct with their associated correcthint.
+        """
+        primary_answer = '100'
+        primary_correcthint = 'primary feedback'
+        additional_answers = {
+            '1': '1. additional feedback',
+            '2': '2. additional feedback',
+            '4': '4. additional feedback',
+            '5': ''
+        }
+        problem = self.build_problem(
+            answer=primary_answer,
+            additional_answers=additional_answers,
+            correcthint=primary_correcthint
+        )
+
+        # Assert primary answer is graded correctly.
+        correct_map = problem.grade_answers({'1_2_1': primary_answer})
+        self.assertEqual(correct_map.get_correctness('1_2_1'), 'correct')
+        self.assertIn(primary_correcthint, correct_map.get_msg('1_2_1'))
+
+        # Assert additional answers are graded correct
+        for answer, correcthint in additional_answers.items():
+            correct_map = problem.grade_answers({'1_2_1': answer})
+            self.assertEqual(correct_map.get_correctness('1_2_1'), 'correct')
+            self.assertIn(correcthint, correct_map.get_msg('1_2_1'))
+
+    def test_additional_answer_get_score(self):
+        """
+        Test `get_score` is working for additional answers.
+        """
+        problem = self.build_problem(answer='100', additional_answers={'1': ''})
+        responder = list(problem.responders.values())[0]
+
+        # Check primary answer.
+        new_cmap = responder.get_score({'1_2_1': '100'})
+        self.assertEqual(new_cmap.get_correctness('1_2_1'), 'correct')
+
+        # Check additional answer.
+        new_cmap = responder.get_score({'1_2_1': '1'})
+        self.assertEqual(new_cmap.get_correctness('1_2_1'), 'correct')
+
+        # Check any wrong answer.
+        new_cmap = responder.get_score({'1_2_1': '2'})
+        self.assertEqual(new_cmap.get_correctness('1_2_1'), 'incorrect')
+
+    def test_grade_range_tolerance_partial_credit(self):
+        problem_setup = [
+            # [given_answer,
+            #   [list of correct responses],
+            #   [list of incorrect responses],
+            #   [list of partially correct responses]]
+            [
+                '[5, 7)',
+                ['5', '6', '6.999'],
+                ['0', '100'],
+                ['4', '8']
+            ],
+            [
+                '[1.6e-5, 1.9e24)',
+                ['0.000016', '1.6*10^-5', '1.59e24'],
+                ['-1e26', '1.9e26', '1.9*10^26'],
+                ['0', '2e24']
+            ],
+            [
+                '[0, 1.6e-5]',
+                ['1.6*10^-5'],
+                ['2'],
+                ['1.9e-5', '-1e-6']
+            ],
+            [
+                '(1.6e-5, 10]',
+                ['2'],
+                ['-20', '30'],
+                ['-1', '12']
+            ],
+        ]
+        for given_answer, correct_responses, incorrect_responses, partial_responses in problem_setup:
+            problem = self.build_problem(answer=given_answer, credit_type='close')
+            self.assert_multiple_partial(problem, correct_responses, incorrect_responses, partial_responses)
 
     def test_grade_range_tolerance_exceptions(self):
         # no complex number in range tolerance staff answer
@@ -1170,6 +1437,61 @@ class NumericalResponseTest(ResponseTest):
         incorrect_responses = ["", "3.9", "4.1", "0"]
         self.assert_multiple_grade(problem, correct_responses, incorrect_responses)
 
+    def test_grade_partial(self):
+        # First: "list"-style grading scheme.
+        problem = self.build_problem(
+            answer=4,
+            credit_type='list',
+            partial_answers='2,8,-4'
+        )
+        correct_responses = ["4", "4.0"]
+        incorrect_responses = ["1", "3", "4.1", "0", "-2"]
+        partial_responses = ["2", "2.0", "-4", "-4.0", "8", "8.0"]
+        self.assert_multiple_partial(problem, correct_responses, incorrect_responses, partial_responses)
+
+        # Second: "close"-style grading scheme. Default range is twice tolerance.
+        problem = self.build_problem(
+            answer=4,
+            tolerance=0.2,
+            credit_type='close'
+        )
+        correct_responses = ["4", "4.1", "3.9"]
+        incorrect_responses = ["1", "3", "4.5", "0", "-2"]
+        partial_responses = ["4.3", "3.7"]
+        self.assert_multiple_partial(problem, correct_responses, incorrect_responses, partial_responses)
+
+        # Third: "close"-style grading scheme with partial_range set.
+        problem = self.build_problem(
+            answer=4,
+            tolerance=0.2,
+            partial_range=3,
+            credit_type='close'
+        )
+        correct_responses = ["4", "4.1"]
+        incorrect_responses = ["1", "3", "0", "-2"]
+        partial_responses = ["4.5", "3.5"]
+        self.assert_multiple_partial(problem, correct_responses, incorrect_responses, partial_responses)
+
+        # Fourth: both "list"- and "close"-style grading schemes at once.
+        problem = self.build_problem(
+            answer=4,
+            tolerance=0.2,
+            partial_range=3,
+            credit_type='close,list',
+            partial_answers='2,8,-4'
+        )
+        correct_responses = ["4", "4.0"]
+        incorrect_responses = ["1", "3", "0", "-2"]
+        partial_responses = ["2", "2.1", "1.5", "8", "7.5", "8.1", "-4", "-4.15", "-3.5", "4.5", "3.5"]
+        self.assert_multiple_partial(problem, correct_responses, incorrect_responses, partial_responses)
+
+    def test_numerical_valid_grading_schemes(self):
+        # 'bongo' is not a valid grading scheme.
+        problem = self.build_problem(answer=4, tolerance=0.1, credit_type='bongo')
+        input_dict = {'1_2_1': '4'}
+        with self.assertRaises(LoncapaProblemError):
+            problem.grade_answers(input_dict)
+
     def test_grade_decimal_tolerance(self):
         problem = self.build_problem(answer=4, tolerance=0.1)
         correct_responses = ["4.0", "4.00", "4.09", "3.91"]
@@ -1191,6 +1513,15 @@ class NumericalResponseTest(ResponseTest):
         problem = self.build_problem(answer=1, tolerance="200%")
         correct_responses = ["1", "1.00", "2.99", "0.99"]
         incorrect_responses = ["", "3.01", "-1.01"]
+        self.assert_multiple_grade(problem, correct_responses, incorrect_responses)
+
+    def test_grade_percent_tolerance_with_spaces(self):
+        """
+        Tests that system does not throw an error when tolerance data contains spaces before or after.
+        """
+        problem = self.build_problem(answer=4, tolerance="10% ")
+        correct_responses = ["4.0", "4.00", "4.39", "3.61"]
+        incorrect_responses = ["", "4.41", "3.59", "0"]
         self.assert_multiple_grade(problem, correct_responses, incorrect_responses)
 
     def test_floats(self):
@@ -1247,7 +1578,7 @@ class NumericalResponseTest(ResponseTest):
         problem = self.build_problem(answer=staff_ans, tolerance=1e-3)
 
         msg = "There was a problem with the staff answer to this problem"
-        with self.assertRaisesRegexp(StudentInputError, msg):
+        with self.assertRaisesRegex(StudentInputError, msg):
             self.assert_grade(problem, '1+j', 'correct')
 
         mock_log.debug.assert_called_once_with(
@@ -1267,9 +1598,11 @@ class NumericalResponseTest(ResponseTest):
                 if text == "There was a problem with the staff answer to this problem.":
                     text = "TRANSLATED!"
                 return text
+            gettext = ugettext
+
         problem.capa_system.i18n = FakeTranslations()
 
-        with self.assertRaisesRegexp(StudentInputError, "TRANSLATED!"):
+        with self.assertRaisesRegex(StudentInputError, "TRANSLATED!"):
             self.assert_grade(problem, '1+j', 'correct')
 
     def test_grade_infinity(self):
@@ -1305,8 +1638,9 @@ class NumericalResponseTest(ResponseTest):
         problem = self.build_problem(answer=4)
 
         errors = [  # (exception raised, message to student)
-            (calc.UndefinedVariable("x"), r"You may not use variables \(x\) in numerical problems"),
-            (ValueError("factorial() mess-up"), "factorial function evaluated outside its domain"),
+            (calc.UndefinedVariable("Invalid Input: x not permitted in answer as a variable"),
+             r"Invalid Input: x not permitted in answer as a variable"),
+            (ValueError("factorial() mess-up"), "Factorial function evaluated outside its domain"),
             (ValueError(), "Could not interpret '.*' as a number"),
             (pyparsing.ParseException("oopsie"), "Invalid math syntax"),
             (ZeroDivisionError(), "Could not interpret '.*' as a number")
@@ -1321,26 +1655,25 @@ class NumericalResponseTest(ResponseTest):
                         raise err
                 mock_eval.side_effect = evaluator_side_effect
 
-                with self.assertRaisesRegexp(StudentInputError, msg_regex):
+                with self.assertRaisesRegex(StudentInputError, msg_regex):
                     problem.grade_answers({'1_2_1': 'foobar'})
 
     def test_compare_answer(self):
         """Tests the answer compare function."""
         problem = self.build_problem(answer="42")
-        responder = problem.responders.values()[0]
+        responder = list(problem.responders.values())[0]
         self.assertTrue(responder.compare_answer('48', '8*6'))
         self.assertFalse(responder.compare_answer('48', '9*5'))
 
     def test_validate_answer(self):
         """Tests the answer validation function."""
         problem = self.build_problem(answer="42")
-        responder = problem.responders.values()[0]
+        responder = list(problem.responders.values())[0]
         self.assertTrue(responder.validate_answer('23.5'))
         self.assertFalse(responder.validate_answer('fish'))
 
 
-class CustomResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import CustomResponseXMLFactory
+class CustomResponseTest(ResponseTest):  # pylint: disable=missing-class-docstring
     xml_factory_class = CustomResponseXMLFactory
 
     def test_inline_code(self):
@@ -1397,11 +1730,18 @@ class CustomResponseTest(ResponseTest):
         #       or an ordered list of answers (if there are multiple inputs)
         #
         # The function should return a dict of the form
-        # { 'ok': BOOL, 'msg': STRING }
+        # { 'ok': BOOL or STRING, 'msg': STRING } (no 'grade_decimal' key to test that it's optional)
         #
         script = textwrap.dedent("""
             def check_func(expect, answer_given):
-                return {'ok': answer_given == expect, 'msg': 'Message text'}
+                partial_credit = '21'
+                if answer_given == expect:
+                    retval = True
+                elif answer_given == partial_credit:
+                    retval = 'partial'
+                else:
+                    retval = False
+                return {'ok': retval, 'msg': 'Message text'}
         """)
 
         problem = self.build_problem(script=script, cfn="check_func", expect="42")
@@ -1412,9 +1752,23 @@ class CustomResponseTest(ResponseTest):
 
         correctness = correct_map.get_correctness('1_2_1')
         msg = correct_map.get_msg('1_2_1')
+        npoints = correct_map.get_npoints('1_2_1')
 
         self.assertEqual(correctness, 'correct')
         self.assertEqual(msg, "Message text")
+        self.assertEqual(npoints, 1)
+
+        # Partially Credit answer
+        input_dict = {'1_2_1': '21'}
+        correct_map = problem.grade_answers(input_dict)
+
+        correctness = correct_map.get_correctness('1_2_1')
+        msg = correct_map.get_msg('1_2_1')
+        npoints = correct_map.get_npoints('1_2_1')
+
+        self.assertEqual(correctness, 'partially-correct')
+        self.assertEqual(msg, "Message text")
+        self.assertTrue(0 <= npoints <= 1)
 
         # Incorrect answer
         input_dict = {'1_2_1': '0'}
@@ -1422,20 +1776,105 @@ class CustomResponseTest(ResponseTest):
 
         correctness = correct_map.get_correctness('1_2_1')
         msg = correct_map.get_msg('1_2_1')
+        npoints = correct_map.get_npoints('1_2_1')
 
         self.assertEqual(correctness, 'incorrect')
         self.assertEqual(msg, "Message text")
+        self.assertEqual(npoints, 0)
+
+    def test_function_code_single_input_decimal_score(self):
+        # For function code, we pass in these arguments:
+        #
+        #   'expect' is the expect attribute of the <customresponse>
+        #
+        #   'answer_given' is the answer the student gave (if there is just one input)
+        #       or an ordered list of answers (if there are multiple inputs)
+        #
+        # The function should return a dict of the form
+        # { 'ok': BOOL or STRING, 'msg': STRING, 'grade_decimal': FLOAT }
+        #
+        script = textwrap.dedent("""
+            def check_func(expect, answer_given):
+                partial_credit = '21'
+                if answer_given == expect:
+                    retval = True
+                    score = 0.9
+                elif answer_given == partial_credit:
+                    retval = 'partial'
+                    score = 0.5
+                else:
+                    retval = False
+                    score = 0.1
+                return {
+                    'ok': retval,
+                    'msg': 'Message text',
+                    'grade_decimal': score,
+                }
+        """)
+
+        problem = self.build_problem(script=script, cfn="check_func", expect="42")
+
+        # Correct answer
+        input_dict = {'1_2_1': '42'}
+        correct_map = problem.grade_answers(input_dict)
+        self.assertEqual(correct_map.get_npoints('1_2_1'), 0.9)
+        self.assertEqual(correct_map.get_correctness('1_2_1'), 'correct')
+
+        # Incorrect answer
+        input_dict = {'1_2_1': '43'}
+        correct_map = problem.grade_answers(input_dict)
+        self.assertEqual(correct_map.get_npoints('1_2_1'), 0.1)
+        self.assertEqual(correct_map.get_correctness('1_2_1'), 'incorrect')
+
+        # Partially Correct answer
+        input_dict = {'1_2_1': '21'}
+        correct_map = problem.grade_answers(input_dict)
+        self.assertEqual(correct_map.get_npoints('1_2_1'), 0.5)
+        self.assertEqual(correct_map.get_correctness('1_2_1'), 'partially-correct')
+
+    def test_script_context(self):
+        # Ensure that python script variables can be used in the "expect" and "answer" fields,
+
+        script = script = textwrap.dedent("""
+            expected_ans = 42
+
+            def check_func(expect, answer_given):
+                return answer_given == expect
+        """)
+
+        problems = (
+            self.build_problem(script=script, cfn="check_func", expect="$expected_ans"),
+            self.build_problem(script=script, cfn="check_func", answer_attr="$expected_ans")
+        )
+
+        input_dict = {'1_2_1': '42'}
+
+        for problem in problems:
+            correctmap = problem.grade_answers(input_dict)
+
+            # CustomResponse also adds 'expect' to the problem context; check that directly first:
+            self.assertEqual(problem.context['expect'], '42')
+
+            # Also make sure the problem was graded correctly:
+            correctness = correctmap.get_correctness('1_2_1')
+            self.assertEqual(correctness, 'correct')
 
     def test_function_code_multiple_input_no_msg(self):
 
         # Check functions also have the option of returning
-        # a single boolean value
+        # a single boolean or string value
         # If true, mark all the inputs correct
+        # If one is true but not the other, mark all partially correct
         # If false, mark all the inputs incorrect
         script = textwrap.dedent("""
             def check_func(expect, answer_given):
-                return (answer_given[0] == expect and
-                        answer_given[1] == expect)
+                if answer_given[0] == expect and answer_given[1] == expect:
+                    retval = True
+                elif answer_given[0] == expect or answer_given[1] == expect:
+                    retval = 'partial'
+                else:
+                    retval = False
+                return retval
         """)
 
         problem = self.build_problem(script=script, cfn="check_func",
@@ -1451,8 +1890,20 @@ class CustomResponseTest(ResponseTest):
         correctness = correct_map.get_correctness('1_2_2')
         self.assertEqual(correctness, 'correct')
 
-        # One answer incorrect -- expect both inputs marked incorrect
+        # One answer incorrect -- expect both inputs marked partially correct
         input_dict = {'1_2_1': '0', '1_2_2': '42'}
+        correct_map = problem.grade_answers(input_dict)
+
+        correctness = correct_map.get_correctness('1_2_1')
+        self.assertEqual(correctness, 'partially-correct')
+        self.assertTrue(0 <= correct_map.get_npoints('1_2_1') <= 1)
+
+        correctness = correct_map.get_correctness('1_2_2')
+        self.assertEqual(correctness, 'partially-correct')
+        self.assertTrue(0 <= correct_map.get_npoints('1_2_2') <= 1)
+
+        # Both answers incorrect -- expect both inputs marked incorrect
+        input_dict = {'1_2_1': '0', '1_2_2': '0'}
         correct_map = problem.grade_answers(input_dict)
 
         correctness = correct_map.get_correctness('1_2_1')
@@ -1467,7 +1918,8 @@ class CustomResponseTest(ResponseTest):
         # the check function can return a dict of the form:
         #
         # {'overall_message': STRING,
-        #  'input_list': [{'ok': BOOL, 'msg': STRING}, ...] }
+        #  'input_list': [{'ok': BOOL or STRING, 'msg': STRING}, ...] }
+        # (no grade_decimal to test it's optional)
         #
         # 'overall_message' is displayed at the end of the response
         #
@@ -1478,18 +1930,23 @@ class CustomResponseTest(ResponseTest):
                 check1 = (int(answer_given[0]) == 1)
                 check2 = (int(answer_given[1]) == 2)
                 check3 = (int(answer_given[2]) == 3)
+                check4 = 'partial' if answer_given[3] == 'four' else False
                 return {'overall_message': 'Overall message',
                         'input_list': [
                             {'ok': check1,  'msg': 'Feedback 1'},
                             {'ok': check2,  'msg': 'Feedback 2'},
-                            {'ok': check3,  'msg': 'Feedback 3'} ] }
+                            {'ok': check3,  'msg': 'Feedback 3'},
+                            {'ok': check4,  'msg': 'Feedback 4'} ] }
             """)
 
-        problem = self.build_problem(script=script,
-                                     cfn="check_func", num_inputs=3)
+        problem = self.build_problem(
+            script=script,
+            cfn="check_func",
+            num_inputs=4
+        )
 
         # Grade the inputs (one input incorrect)
-        input_dict = {'1_2_1': '-999', '1_2_2': '2', '1_2_3': '3'}
+        input_dict = {'1_2_1': '-999', '1_2_2': '2', '1_2_3': '3', '1_2_4': 'four'}
         correct_map = problem.grade_answers(input_dict)
 
         # Expect that we receive the overall message (for the whole response)
@@ -1499,20 +1956,90 @@ class CustomResponseTest(ResponseTest):
         self.assertEqual(correct_map.get_correctness('1_2_1'), 'incorrect')
         self.assertEqual(correct_map.get_correctness('1_2_2'), 'correct')
         self.assertEqual(correct_map.get_correctness('1_2_3'), 'correct')
+        self.assertEqual(correct_map.get_correctness('1_2_4'), 'partially-correct')
+
+        # Expect that the inputs were given correct npoints
+        self.assertEqual(correct_map.get_npoints('1_2_1'), 0)
+        self.assertEqual(correct_map.get_npoints('1_2_2'), 1)
+        self.assertEqual(correct_map.get_npoints('1_2_3'), 1)
+        self.assertTrue(0 <= correct_map.get_npoints('1_2_4') <= 1)
 
         # Expect that we received messages for each individual input
         self.assertEqual(correct_map.get_msg('1_2_1'), 'Feedback 1')
         self.assertEqual(correct_map.get_msg('1_2_2'), 'Feedback 2')
         self.assertEqual(correct_map.get_msg('1_2_3'), 'Feedback 3')
+        self.assertEqual(correct_map.get_msg('1_2_4'), 'Feedback 4')
+
+    def test_function_code_multiple_inputs_decimal_score(self):
+
+        # If the <customresponse> has multiple inputs associated with it,
+        # the check function can return a dict of the form:
+        #
+        # {'overall_message': STRING,
+        #  'input_list': [{'ok': BOOL or STRING,
+        #                  'msg': STRING, 'grade_decimal': FLOAT}, ...] }
+        #        #
+        # 'input_list' contains dictionaries representing the correctness
+        #           and message for each input.
+        script = textwrap.dedent("""
+            def check_func(expect, answer_given):
+                check1 = (int(answer_given[0]) == 1)
+                check2 = (int(answer_given[1]) == 2)
+                check3 = (int(answer_given[2]) == 3)
+                check4 = 'partial' if answer_given[3] == 'four' else False
+                score1 = 0.9 if check1 else 0.1
+                score2 = 0.9 if check2 else 0.1
+                score3 = 0.9 if check3 else 0.1
+                score4 = 0.7 if check4 == 'partial' else 0.1
+                return {
+                    'input_list': [
+                        {'ok': check1, 'grade_decimal': score1, 'msg': 'Feedback 1'},
+                        {'ok': check2, 'grade_decimal': score2, 'msg': 'Feedback 2'},
+                        {'ok': check3, 'grade_decimal': score3, 'msg': 'Feedback 3'},
+                        {'ok': check4, 'grade_decimal': score4, 'msg': 'Feedback 4'},
+                    ]
+                }
+            """)
+
+        problem = self.build_problem(script=script, cfn="check_func", num_inputs=4)
+
+        # Grade the inputs (one input incorrect)
+        input_dict = {'1_2_1': '-999', '1_2_2': '2', '1_2_3': '3', '1_2_4': 'four'}
+        correct_map = problem.grade_answers(input_dict)
+
+        # Expect that the inputs were graded individually
+        self.assertEqual(correct_map.get_correctness('1_2_1'), 'incorrect')
+        self.assertEqual(correct_map.get_correctness('1_2_2'), 'correct')
+        self.assertEqual(correct_map.get_correctness('1_2_3'), 'correct')
+        self.assertEqual(correct_map.get_correctness('1_2_4'), 'partially-correct')
+
+        # Expect that the inputs were given correct npoints
+        self.assertEqual(correct_map.get_npoints('1_2_1'), 0.1)
+        self.assertEqual(correct_map.get_npoints('1_2_2'), 0.9)
+        self.assertEqual(correct_map.get_npoints('1_2_3'), 0.9)
+        self.assertEqual(correct_map.get_npoints('1_2_4'), 0.7)
 
     def test_function_code_with_extra_args(self):
         script = textwrap.dedent("""\
                     def check_func(expect, answer_given, options, dynamath):
                         assert options == "xyzzy", "Options was %r" % options
-                        return {'ok': answer_given == expect, 'msg': 'Message text'}
+                        partial_credit = '21'
+                        if answer_given == expect:
+                            retval = True
+                        elif answer_given == partial_credit:
+                            retval = 'partial'
+                        else:
+                            retval = False
+                        return {'ok': retval, 'msg': 'Message text'}
                     """)
 
-        problem = self.build_problem(script=script, cfn="check_func", expect="42", options="xyzzy", cfn_extra_args="options dynamath")
+        problem = self.build_problem(
+            script=script,
+            cfn="check_func",
+            expect="42",
+            options="xyzzy",
+            cfn_extra_args="options dynamath"
+        )
 
         # Correct answer
         input_dict = {'1_2_1': '42'}
@@ -1524,6 +2051,16 @@ class CustomResponseTest(ResponseTest):
         self.assertEqual(correctness, 'correct')
         self.assertEqual(msg, "Message text")
 
+        # Partially Correct answer
+        input_dict = {'1_2_1': '21'}
+        correct_map = problem.grade_answers(input_dict)
+
+        correctness = correct_map.get_correctness('1_2_1')
+        msg = correct_map.get_msg('1_2_1')
+
+        self.assertEqual(correctness, 'partially-correct')
+        self.assertEqual(msg, "Message text")
+
         # Incorrect answer
         input_dict = {'1_2_1': '0'}
         correct_map = problem.grade_answers(input_dict)
@@ -1533,6 +2070,46 @@ class CustomResponseTest(ResponseTest):
 
         self.assertEqual(correctness, 'incorrect')
         self.assertEqual(msg, "Message text")
+
+    def test_function_code_with_attempt_number(self):
+        script = textwrap.dedent("""\
+                    def gradeit(expect, ans, **kwargs):
+                        attempt = kwargs["attempt"]
+                        message = "This is attempt number {}".format(str(attempt))
+                        return {
+                            'input_list': [
+                                { 'ok': True, 'msg': message},
+                            ]
+                        }
+                    """)
+
+        problem = self.build_problem(
+            script=script,
+            cfn="gradeit",
+            expect="42",
+            cfn_extra_args="attempt"
+        )
+
+        # first attempt
+        input_dict = {'1_2_1': '42'}
+        problem.context['attempt'] = 1
+        correct_map = problem.grade_answers(input_dict)
+
+        correctness = correct_map.get_correctness('1_2_1')
+        msg = correct_map.get_msg('1_2_1')
+
+        self.assertEqual(correctness, 'correct')
+        self.assertEqual(msg, "This is attempt number 1")
+
+        # second attempt
+        problem.context['attempt'] = 2
+        correct_map = problem.grade_answers(input_dict)
+
+        correctness = correct_map.get_correctness('1_2_1')
+        msg = correct_map.get_msg('1_2_1')
+
+        self.assertEqual(correctness, 'correct')
+        self.assertEqual(msg, "This is attempt number 2")
 
     def test_multiple_inputs_return_one_status(self):
         # When given multiple inputs, the 'answer_given' argument
@@ -1550,8 +2127,12 @@ class CustomResponseTest(ResponseTest):
                 check1 = (int(answer_given[0]) == 1)
                 check2 = (int(answer_given[1]) == 2)
                 check3 = (int(answer_given[2]) == 3)
-                return {'ok': (check1 and check2 and check3),
-                        'msg': 'Message text'}
+                if (int(answer_given[0]) == -1) and check2 and check3:
+                    return {'ok': 'partial',
+                            'msg': 'Message text'}
+                else:
+                    return {'ok': (check1 and check2 and check3),
+                            'msg': 'Message text'}
             """)
 
         problem = self.build_problem(script=script,
@@ -1565,6 +2146,15 @@ class CustomResponseTest(ResponseTest):
         self.assertEqual(correct_map.get_correctness('1_2_1'), 'incorrect')
         self.assertEqual(correct_map.get_correctness('1_2_2'), 'incorrect')
         self.assertEqual(correct_map.get_correctness('1_2_3'), 'incorrect')
+
+        # Grade the inputs (one input partially correct)
+        input_dict = {'1_2_1': '-1', '1_2_2': '2', '1_2_3': '3'}
+        correct_map = problem.grade_answers(input_dict)
+
+        # Everything marked partially correct
+        self.assertEqual(correct_map.get_correctness('1_2_1'), 'partially-correct')
+        self.assertEqual(correct_map.get_correctness('1_2_2'), 'partially-correct')
+        self.assertEqual(correct_map.get_correctness('1_2_3'), 'partially-correct')
 
         # Grade the inputs (everything correct)
         input_dict = {'1_2_1': '1', '1_2_2': '2', '1_2_3': '3'}
@@ -1712,9 +2302,100 @@ class CustomResponseTest(ResponseTest):
             except ResponseError:
                 self.fail("Could not use name '{0}s' in custom response".format(module_name))
 
+    def test_python_lib_zip_is_available(self):
+        # Prove that we can import code from a zipfile passed down to us.
+
+        # Make a zipfile with one module in it with one function.
+        zipstring = io.BytesIO()
+        zipf = zipfile.ZipFile(zipstring, "w")
+        zipf.writestr("my_helper.py", textwrap.dedent("""\
+            def seventeen():
+                return 17
+            """))
+        zipf.close()
+
+        # Use that module in our Python script.
+        script = textwrap.dedent("""
+            import my_helper
+            num = my_helper.seventeen()
+            """)
+        capa_system = test_capa_system()
+        capa_system.get_python_lib_zip = lambda: zipstring.getvalue()
+        problem = self.build_problem(script=script, capa_system=capa_system)
+        self.assertEqual(problem.context['num'], 17)
+
+    def test_function_code_multiple_inputs_order(self):
+        # Ensure that order must be correct according to sub-problem position
+        script = textwrap.dedent("""
+            def check_func(expect, answer_given):
+                check1 = (int(answer_given[0]) == 1)
+                check2 = (int(answer_given[1]) == 2)
+                check3 = (int(answer_given[2]) == 3)
+                check4 = (int(answer_given[3]) == 4)
+                check5 = (int(answer_given[4]) == 5)
+                check6 = (int(answer_given[5]) == 6)
+                check7 = (int(answer_given[6]) == 7)
+                check8 = (int(answer_given[7]) == 8)
+                check9 = (int(answer_given[8]) == 9)
+                check10 = (int(answer_given[9]) == 10)
+                check11 = (int(answer_given[10]) == 11)
+                return {'overall_message': 'Overall message',
+                            'input_list': [
+                                { 'ok': check1, 'msg': '1'},
+                                { 'ok': check2, 'msg': '2'},
+                                { 'ok': check3, 'msg': '3'},
+                                { 'ok': check4, 'msg': '4'},
+                                { 'ok': check5, 'msg': '5'},
+                                { 'ok': check6, 'msg': '6'},
+                                { 'ok': check7, 'msg': '7'},
+                                { 'ok': check8, 'msg': '8'},
+                                { 'ok': check9, 'msg': '9'},
+                                { 'ok': check10, 'msg': '10'},
+                                { 'ok': check11, 'msg': '11'},
+                ]}
+            """)
+
+        problem = self.build_problem(script=script, cfn="check_func", num_inputs=11)
+
+        # Grade the inputs showing out of order
+        input_dict = {
+            '1_2_1': '1',
+            '1_2_2': '2',
+            '1_2_3': '3',
+            '1_2_4': '4',
+            '1_2_5': '5',
+            '1_2_6': '6',
+            '1_2_10': '10',
+            '1_2_11': '16',
+            '1_2_7': '7',
+            '1_2_8': '8',
+            '1_2_9': '9'
+        }
+
+        correct_order = [
+            '1_2_1', '1_2_2', '1_2_3', '1_2_4', '1_2_5', '1_2_6', '1_2_7', '1_2_8', '1_2_9', '1_2_10', '1_2_11'
+        ]
+
+        correct_map = problem.grade_answers(input_dict)
+
+        self.assertNotEqual(list(problem.student_answers.keys()), correct_order)
+
+        # euqal to correct order after sorting at get_score
+        self.assertListEqual(list(problem.responders.values())[0].context['idset'], correct_order)
+
+        self.assertEqual(correct_map.get_correctness('1_2_1'), 'correct')
+        self.assertEqual(correct_map.get_correctness('1_2_9'), 'correct')
+        self.assertEqual(correct_map.get_correctness('1_2_11'), 'incorrect')
+
+        self.assertEqual(correct_map.get_msg('1_2_1'), '1')
+        self.assertEqual(correct_map.get_msg('1_2_9'), '9')
+        self.assertEqual(correct_map.get_msg('1_2_11'), '11')
+
 
 class SchematicResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import SchematicResponseXMLFactory
+    """
+    Class containing setup and tests for Schematic responsetype.
+    """
     xml_factory_class = SchematicResponseXMLFactory
 
     def test_grade(self):
@@ -1765,7 +2446,6 @@ class SchematicResponseTest(ResponseTest):
 
 
 class AnnotationResponseTest(ResponseTest):
-    from capa.tests.response_xml_factory import AnnotationResponseXMLFactory
     xml_factory_class = AnnotationResponseXMLFactory
 
     def test_grade(self):
@@ -1807,7 +2487,6 @@ class ChoiceTextResponseTest(ResponseTest):
     Class containing setup and tests for ChoiceText responsetype.
     """
 
-    from response_xml_factory import ChoiceTextResponseXMLFactory
     xml_factory_class = ChoiceTextResponseXMLFactory
 
     # `TEST_INPUTS` is a dictionary mapping from
@@ -1978,13 +2657,6 @@ class ChoiceTextResponseTest(ResponseTest):
         with self.assertRaises(Exception):
             self.build_problem(type="invalidtextgroup")
 
-    def test_valid_xml(self):
-        """
-        Test that `build_problem` builds valid xml
-        """
-        self.build_problem()
-        self.assertTrue(True)
-
     def test_unchecked_input_not_validated(self):
         """
         Test that a student can have a non numeric answer in an unselected
@@ -2019,7 +2691,7 @@ class ChoiceTextResponseTest(ResponseTest):
             "checkboxtextgroup"
         )
 
-        with self.assertRaisesRegexp(StudentInputError, "Could not interpret"):
+        with self.assertRaisesRegex(StudentInputError, "Could not interpret"):
             # Test that error is raised for input in selected correct choice.
             self.assert_grade(
                 two_choice_two_input,
@@ -2027,7 +2699,7 @@ class ChoiceTextResponseTest(ResponseTest):
                 "correct"
             )
 
-        with self.assertRaisesRegexp(StudentInputError, "Could not interpret"):
+        with self.assertRaisesRegex(StudentInputError, "Could not interpret"):
             # Test that error is raised for input in selected incorrect choice.
             self.assert_grade(
                 two_choice_two_input,
@@ -2042,7 +2714,7 @@ class ChoiceTextResponseTest(ResponseTest):
              ],
             "checkboxtextgroup"
         )
-        with self.assertRaisesRegexp(
+        with self.assertRaisesRegex(
             StudentInputError,
             "The Staff answer could not be interpreted as a number."
         ):
@@ -2060,7 +2732,7 @@ class ChoiceTextResponseTest(ResponseTest):
         radiotextgroup.
         """
 
-        for name, inputs in self.TEST_INPUTS.iteritems():
+        for name, inputs in six.iteritems(self.TEST_INPUTS):
             # Turn submission into the form expected when grading this problem.
             submission = self._make_answer_dict(inputs)
             # Lookup the problem_name, and the whether this test problem
@@ -2140,7 +2812,7 @@ class ChoiceTextResponseTest(ResponseTest):
             "checkbox_2_choices_2_inputs": checkbox_two_choices_two_inputs
         }
 
-        for name, inputs in inputs.iteritems():
+        for name, inputs in six.iteritems(inputs):
             submission = self._make_answer_dict(inputs)
             # Load the test problem's name and desired correctness
             problem_name, correctness = scenarios[name]

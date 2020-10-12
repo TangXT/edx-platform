@@ -2,15 +2,23 @@
 Tests for split_migrator
 
 """
-import uuid
+
+
 import random
+import uuid
+
 import mock
-from xblock.fields import Reference, ReferenceList, ReferenceValueDict
+import six
+from six.moves import range, zip
+from xblock.fields import UNIQUE_ID, Reference, ReferenceList, ReferenceValueDict
+
+from openedx.core.lib.tests import attr
 from xmodule.modulestore.split_migrator import SplitMigrator
-from xmodule.modulestore.tests.test_split_w_old_mongo import SplitWMongoCourseBoostrapper
+from xmodule.modulestore.tests.test_split_w_old_mongo import SplitWMongoCourseBootstrapper
 
 
-class TestMigration(SplitWMongoCourseBoostrapper):
+@attr('mongo')
+class TestMigration(SplitWMongoCourseBootstrapper):
     """
     Test the split migrator
     """
@@ -34,7 +42,7 @@ class TestMigration(SplitWMongoCourseBoostrapper):
         self._create_item('chapter', chapter1_name, {}, {'display_name': 'Chapter 1'}, 'course', 'runid', split=False)
         chap2_loc = self.old_course_key.make_usage_key('chapter', uuid.uuid4().hex)
         self._create_item(
-            chap2_loc.category, chap2_loc.name, {}, {'display_name': 'Chapter 2'}, 'course', 'runid', split=False
+            chap2_loc.block_type, chap2_loc.block_id, {}, {'display_name': 'Chapter 2'}, 'course', 'runid', split=False
         )
         # vertical in live only
         live_vert_name = uuid.uuid4().hex
@@ -46,7 +54,7 @@ class TestMigration(SplitWMongoCourseBoostrapper):
         # vertical in both live and draft
         both_vert_loc = self.old_course_key.make_usage_key('vertical', uuid.uuid4().hex)
         self._create_item(
-            both_vert_loc.category, both_vert_loc.name, {}, {'display_name': 'Both vertical'}, 'chapter', chapter1_name,
+            both_vert_loc.block_type, both_vert_loc.block_id, {}, {'display_name': 'Both vertical'}, 'chapter', chapter1_name,
             draft=False, split=False
         )
         self.create_random_units(False, both_vert_loc)
@@ -57,13 +65,13 @@ class TestMigration(SplitWMongoCourseBoostrapper):
         # vertical in draft only (x2)
         draft_vert_loc = self.old_course_key.make_usage_key('vertical', uuid.uuid4().hex)
         self._create_item(
-            draft_vert_loc.category, draft_vert_loc.name, {}, {'display_name': 'Draft vertical'}, 'chapter', chapter1_name,
+            draft_vert_loc.block_type, draft_vert_loc.block_id, {}, {'display_name': 'Draft vertical'}, 'chapter', chapter1_name,
             draft=True, split=False
         )
         self.create_random_units(True, draft_vert_loc)
         draft_vert_loc = self.old_course_key.make_usage_key('vertical', uuid.uuid4().hex)
         self._create_item(
-            draft_vert_loc.category, draft_vert_loc.name, {}, {'display_name': 'Draft vertical2'}, 'chapter', chapter1_name,
+            draft_vert_loc.block_type, draft_vert_loc.block_id, {}, {'display_name': 'Draft vertical2'}, 'chapter', chapter1_name,
             draft=True, split=False
         )
         self.create_random_units(True, draft_vert_loc)
@@ -71,7 +79,7 @@ class TestMigration(SplitWMongoCourseBoostrapper):
         # and finally one in live only (so published has to skip 2 preceding sibs)
         live_vert_loc = self.old_course_key.make_usage_key('vertical', uuid.uuid4().hex)
         self._create_item(
-            live_vert_loc.category, live_vert_loc.name, {}, {'display_name': 'Live vertical end'}, 'chapter', chapter1_name,
+            live_vert_loc.block_type, live_vert_loc.block_id, {}, {'display_name': 'Live vertical end'}, 'chapter', chapter1_name,
             draft=False, split=False
         )
         self.create_random_units(False, live_vert_loc)
@@ -82,7 +90,7 @@ class TestMigration(SplitWMongoCourseBoostrapper):
         indirect2_loc = self.old_course_key.make_usage_key('html', uuid.uuid4().hex)
         conditional_loc = self.old_course_key.make_usage_key('conditional', uuid.uuid4().hex)
         self._create_item(
-            conditional_loc.category, conditional_loc.name,
+            conditional_loc.block_type, conditional_loc.block_id,
             {
                 'show_tag_list': [indirect1_loc, indirect2_loc],
                 'sources_list': [live_vert_loc, ],
@@ -92,18 +100,18 @@ class TestMigration(SplitWMongoCourseBoostrapper):
                     'completed': True,
                 },
             },
-            chap2_loc.category, chap2_loc.name,
+            chap2_loc.block_type, chap2_loc.block_id,
             draft=False, split=False
         )
         # create the children
         self._create_item(
-            indirect1_loc.category, indirect1_loc.name, {'data': ""}, {'display_name': 'conditional show 1'},
-            conditional_loc.category, conditional_loc.name,
+            indirect1_loc.block_type, indirect1_loc.block_id, {'data': ""}, {'display_name': 'conditional show 1'},
+            conditional_loc.block_type, conditional_loc.block_id,
             draft=False, split=False
         )
         self._create_item(
-            indirect2_loc.category, indirect2_loc.name, {'data': ""}, {'display_name': 'conditional show 2'},
-            conditional_loc.category, conditional_loc.name,
+            indirect2_loc.block_type, indirect2_loc.block_id, {'data': ""}, {'display_name': 'conditional show 2'},
+            conditional_loc.block_type, conditional_loc.block_id,
             draft=False, split=False
         )
 
@@ -139,7 +147,7 @@ class TestMigration(SplitWMongoCourseBoostrapper):
             metadata = {'display_name': str(uuid.uuid4()), 'graded': True}
             data = {}
             self._create_item(
-                location.category, location.name, data, metadata, parent_loc.category, parent_loc.name,
+                location.block_type, location.block_id, data, metadata, parent_loc.block_type, parent_loc.block_id,
                 draft=draft, split=False
             )
 
@@ -151,7 +159,7 @@ class TestMigration(SplitWMongoCourseBoostrapper):
 
         # grab the detached items to compare they should be in both published and draft
         for category in ['conditional', 'about', 'course_info', 'static_tab']:
-            for conditional in presplit.get_items(self.old_course_key, category=category):
+            for conditional in presplit.get_items(self.old_course_key, qualifiers={'category': category}):
                 locator = new_course_key.make_usage_key(category, conditional.location.block_id)
                 self.compare_dags(presplit, conditional, self.split_mongo.get_item(locator), published)
 
@@ -159,8 +167,15 @@ class TestMigration(SplitWMongoCourseBoostrapper):
         if split_dag_root.category != 'course':
             self.assertEqual(presplit_dag_root.location.block_id, split_dag_root.location.block_id)
         # compare all fields but references
-        for name, field in presplit_dag_root.fields.iteritems():
-            if not isinstance(field, (Reference, ReferenceList, ReferenceValueDict)):
+        for name, field in six.iteritems(presplit_dag_root.fields):
+            # fields generated from UNIQUE_IDs are unique to an XBlock's scope,
+            # so if such a field is unset on an XBlock, we don't expect it
+            # to persist across courses
+            field_generated_from_unique_id = not field.is_set_on(presplit_dag_root) and field.default == UNIQUE_ID
+            should_check_field = not (
+                field_generated_from_unique_id or isinstance(field, (Reference, ReferenceList, ReferenceValueDict))
+            )
+            if should_check_field:
                 self.assertEqual(
                     getattr(presplit_dag_root, name),
                     getattr(split_dag_root, name),

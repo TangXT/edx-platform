@@ -1,25 +1,22 @@
 """
 Test for LMS courseware app.
 """
-import mock
-from mock import Mock
-from unittest import TestCase
-from django.core.urlresolvers import reverse
-from django.test.utils import override_settings
+
 
 from textwrap import dedent
+from unittest import TestCase
 
+import mock
+from django.urls import reverse
+from opaque_keys.edx.keys import CourseKey
+from six import text_type
+
+from lms.djangoapps.courseware.tests.helpers import LoginEnrollmentTestCase
+from lms.djangoapps.lms_xblock.field_data import LmsFieldData
 from xmodule.error_module import ErrorDescriptor
 from xmodule.modulestore.django import modulestore
-from opaque_keys.edx.locations import SlashSeparatedCourseKey
-from xmodule.modulestore.xml_importer import import_from_xml
-from xmodule.modulestore.tests.django_utils import ModuleStoreTestCase
-
-from courseware.tests.helpers import LoginEnrollmentTestCase
-from courseware.tests.modulestore_config import TEST_DATA_DIR, \
-    TEST_DATA_MONGO_MODULESTORE, \
-    TEST_DATA_MIXED_MODULESTORE
-from lms.lib.xblock.field_data import LmsFieldData
+from xmodule.modulestore.tests.django_utils import TEST_DATA_MIXED_MODULESTORE, ModuleStoreTestCase
+from xmodule.modulestore.tests.factories import ToyCourseFactory
 
 
 class ActivateLoginTest(LoginEnrollmentTestCase):
@@ -27,6 +24,7 @@ class ActivateLoginTest(LoginEnrollmentTestCase):
     Test logging in and logging out.
     """
     def setUp(self):
+        super(ActivateLoginTest, self).setUp()
         self.setup_user()
 
     def test_activate_login(self):
@@ -40,6 +38,14 @@ class ActivateLoginTest(LoginEnrollmentTestCase):
         Test logout -- setup function does login.
         """
         self.logout()
+
+    def test_request_attr_on_logout(self):
+        """
+        Test request object after logging out to see whether it
+        has 'is_from_log_out' attribute set to true.
+        """
+        response = self.client.get(reverse('logout'))
+        self.assertTrue(getattr(response.wsgi_request, 'is_from_logout', False))
 
 
 class PageLoaderTestCase(LoginEnrollmentTestCase):
@@ -70,22 +76,22 @@ class PageLoaderTestCase(LoginEnrollmentTestCase):
 
             if descriptor.location.category == 'about':
                 self._assert_loads('about_course',
-                                   {'course_id': course_key.to_deprecated_string()},
+                                   {'course_id': text_type(course_key)},
                                    descriptor)
 
             elif descriptor.location.category == 'static_tab':
-                kwargs = {'course_id': course_key.to_deprecated_string(),
+                kwargs = {'course_id': text_type(course_key),
                           'tab_slug': descriptor.location.name}
                 self._assert_loads('static_tab', kwargs, descriptor)
 
             elif descriptor.location.category == 'course_info':
-                self._assert_loads('info', {'course_id': course_key.to_deprecated_string()},
+                self._assert_loads('info', {'course_id': text_type(course_key)},
                                    descriptor)
 
             else:
 
-                kwargs = {'course_id': course_key.to_deprecated_string(),
-                          'location': descriptor.location.to_deprecated_string()}
+                kwargs = {'course_id': text_type(course_key),
+                          'location': text_type(descriptor.location)}
 
                 self._assert_loads('jump_to', kwargs, descriptor,
                                    expect_redirect=True,
@@ -105,7 +111,7 @@ class PageLoaderTestCase(LoginEnrollmentTestCase):
         response = self.client.get(url, follow=True)
 
         if response.status_code != 200:
-            self.fail('Status %d for page %s' %
+            self.fail(u'Status %d for page %s' %
                       (response.status_code, descriptor.location))
 
         if expect_redirect:
@@ -116,34 +122,16 @@ class PageLoaderTestCase(LoginEnrollmentTestCase):
             self.assertNotIsInstance(descriptor, ErrorDescriptor)
 
 
-@override_settings(MODULESTORE=TEST_DATA_MIXED_MODULESTORE)
-class TestXmlCoursesLoad(ModuleStoreTestCase, PageLoaderTestCase):
-    """
-    Check that all pages in test courses load properly from XML.
-    """
-
-    def setUp(self):
-        super(TestXmlCoursesLoad, self).setUp()
-        self.setup_user()
-
-    def test_toy_course_loads(self):
-        # Load one of the XML based courses
-        # Our test mapping rules allow the MixedModuleStore
-        # to load this course from XML, not Mongo.
-        self.check_all_pages_load(SlashSeparatedCourseKey('edX', 'toy', '2012_Fall'))
-
-
 class TestMongoCoursesLoad(ModuleStoreTestCase, PageLoaderTestCase):
     """
     Check that all pages in test courses load properly from Mongo.
     """
+    MODULESTORE = TEST_DATA_MIXED_MODULESTORE
 
     def setUp(self):
         super(TestMongoCoursesLoad, self).setUp()
         self.setup_user()
-
-        # Import the toy course
-        import_from_xml(self.store, self.user.id, TEST_DATA_DIR, ['toy'])
+        self.toy_course_key = ToyCourseFactory.create().id
 
     @mock.patch('xmodule.course_module.requests.get')
     def test_toy_textbooks_loads(self, mock_get):
@@ -152,8 +140,7 @@ class TestMongoCoursesLoad(ModuleStoreTestCase, PageLoaderTestCase):
             <entry page="5" page_label="ii" name="Table of Contents"/>
             </table_of_contents>
         """).strip()
-
-        location = SlashSeparatedCourseKey('edX', 'toy', '2012_Fall').make_usage_key('course', '2012_Fall')
+        location = self.toy_course_key.make_usage_key('course', '2012_Fall')
         course = self.store.get_item(location)
         self.assertGreater(len(course.textbooks), 0)
 
@@ -163,7 +150,7 @@ class TestDraftModuleStore(ModuleStoreTestCase):
         store = modulestore()
 
         # fix was to allow get_items() to take the course_id parameter
-        store.get_items(SlashSeparatedCourseKey('abc', 'def', 'ghi'), category='vertical')
+        store.get_items(CourseKey.from_string('abc/def/ghi'), qualifiers={'category': 'vertical'})
 
         # test success is just getting through the above statement.
         # The bug was that 'course_id' argument was
@@ -183,9 +170,9 @@ class TestLmsFieldData(TestCase):
         # reached on any attribute access
 
         # pylint: disable=protected-access
-        base_authored = Mock()
-        base_student = Mock()
+        base_authored = mock.Mock()
+        base_student = mock.Mock()
         first_level = LmsFieldData(base_authored, base_student)
         second_level = LmsFieldData(first_level, base_student)
-        self.assertEquals(second_level._authored_data, first_level._authored_data)
+        self.assertEqual(second_level._authored_data, first_level._authored_data)
         self.assertNotIsInstance(second_level._authored_data, LmsFieldData)

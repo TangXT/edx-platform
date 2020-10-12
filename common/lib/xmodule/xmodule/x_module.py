@@ -1,36 +1,58 @@
+
+
 import logging
 import os
 import sys
-import yaml
-
-from functools import partial
-from lxml import etree
+import time
 from collections import namedtuple
-from pkg_resources import (
-    resource_exists,
-    resource_listdir,
-    resource_string,
-    resource_isdir,
-)
+from functools import partial
+
+import six
+import yaml
+from contracts import contract, new_contract
+from django.utils.encoding import python_2_unicode_compatible
+from lazy import lazy
+from lxml import etree
+from opaque_keys.edx.asides import AsideDefinitionKeyV2, AsideUsageKeyV2
+from opaque_keys.edx.keys import UsageKey
+from pkg_resources import resource_exists, resource_isdir, resource_listdir, resource_string
+from six import text_type
+from six.moves import map
+from web_fragments.fragment import Fragment
 from webob import Response
 from webob.multidict import MultiDict
+from xblock.core import XBlock, XBlockAside
+from xblock.fields import (
+    Dict,
+    Float,
+    Integer,
+    List,
+    Reference,
+    ReferenceList,
+    ReferenceValueDict,
+    Scope,
+    ScopeIds,
+    String,
+    UserScope
+)
+from xblock.runtime import IdGenerator, IdReader, Runtime
 
-from xblock.core import XBlock
-from xblock.fields import Scope, Integer, Float, List, XBlockMixin, String, Dict
-from xblock.fragment import Fragment
-from xblock.runtime import Runtime, IdReader
-from xmodule.fields import RelativeTime
-
+from openedx.core.djangolib.markup import HTML
+from xmodule import block_metadata_utils
 from xmodule.errortracker import exc_info_to_str
-from xmodule.modulestore.exceptions import ItemNotFoundError
-from opaque_keys.edx.keys import UsageKey
 from xmodule.exceptions import UndefinedContext
-from dogapi import dog_stats_api
-
+from xmodule.fields import RelativeTime
+from xmodule.modulestore.exceptions import ItemNotFoundError
+from xmodule.util.xmodule_django import add_webpack_to_fragment
 
 log = logging.getLogger(__name__)
 
 XMODULE_METRIC_NAME = 'edxapp.xmodule'
+XMODULE_DURATION_METRIC_NAME = XMODULE_METRIC_NAME + '.duration'
+XMODULE_METRIC_SAMPLE_RATE = 0.1
+
+# Stats event sent to DataDog in order to determine if old XML parsing can be deprecated.
+DEPRECATION_VSCOMPAT_EVENT = 'deprecation.vscompat'
 
 # xblock view names
 
@@ -38,6 +60,10 @@ XMODULE_METRIC_NAME = 'edxapp.xmodule'
 # It will also be used to render the block in "preview" mode in Studio, unless
 # the XBlock also implements author_view.
 STUDENT_VIEW = 'student_view'
+
+# This is the view that will be rendered to display the XBlock in the LMS for unenrolled learners.
+# Implementations of this view should assume that a user and user data are not available.
+PUBLIC_VIEW = 'public_view'
 
 # An optional view of the XBlock similar to student_view, but with possible inline
 # editing capabilities. This view differs from studio_view in that it should be as similar to student_view
@@ -49,7 +75,16 @@ AUTHOR_VIEW = 'author_view'
 STUDIO_VIEW = 'studio_view'
 
 # Views that present a "preview" view of an xblock (as opposed to an editing view).
-PREVIEW_VIEWS = [STUDENT_VIEW, AUTHOR_VIEW]
+PREVIEW_VIEWS = [STUDENT_VIEW, PUBLIC_VIEW, AUTHOR_VIEW]
+
+DEFAULT_PUBLIC_VIEW_MESSAGE = (
+    u'This content is only accessible to enrolled learners. '
+    u'Sign in or register, and enroll in this course to view it.'
+)
+
+# Make '_' a no-op so we can scrape strings. Using lambda instead of
+#  `django.utils.translation.ugettext_noop` because Django cannot be imported in this file
+_ = lambda text: text
 
 
 class OpaqueKeyReader(IdReader):
@@ -65,7 +100,7 @@ class OpaqueKeyReader(IdReader):
         Returns:
             The `definition_id` the usage is derived from
         """
-        return usage_id.definition_key
+        raise NotImplementedError("Specific Modulestores must implement get_definition_id")
 
     def get_block_type(self, def_id):
         """Retrieve the block_type of a particular definition
@@ -77,6 +112,91 @@ class OpaqueKeyReader(IdReader):
             The `block_type` of the definition
         """
         return def_id.block_type
+
+    def get_usage_id_from_aside(self, aside_id):
+        """
+        Retrieve the XBlock `usage_id` associated with this aside usage id.
+
+        Args:
+            aside_id: The usage id of the XBlockAside.
+
+        Returns:
+            The `usage_id` of the usage the aside is commenting on.
+        """
+        return aside_id.usage_key
+
+    def get_definition_id_from_aside(self, aside_id):
+        """
+        Retrieve the XBlock `definition_id` associated with this aside definition id.
+
+        Args:
+            aside_id: The usage id of the XBlockAside.
+
+        Returns:
+            The `definition_id` of the usage the aside is commenting on.
+        """
+        return aside_id.definition_key
+
+    def get_aside_type_from_usage(self, aside_id):
+        """
+        Retrieve the XBlockAside `aside_type` associated with this aside
+        usage id.
+
+        Args:
+            aside_id: The usage id of the XBlockAside.
+
+        Returns:
+            The `aside_type` of the aside.
+        """
+        return aside_id.aside_type
+
+    def get_aside_type_from_definition(self, aside_id):
+        """
+        Retrieve the XBlockAside `aside_type` associated with this aside
+        definition id.
+
+        Args:
+            aside_id: The definition id of the XBlockAside.
+
+        Returns:
+            The `aside_type` of the aside.
+        """
+        return aside_id.aside_type
+
+
+class AsideKeyGenerator(IdGenerator):
+    """
+    An :class:`.IdGenerator` that only provides facilities for constructing new XBlockAsides.
+    """
+    def create_aside(self, definition_id, usage_id, aside_type):
+        """
+        Make a new aside definition and usage ids, indicating an :class:`.XBlockAside` of type `aside_type`
+        commenting on an :class:`.XBlock` usage `usage_id`
+
+        Returns:
+            (aside_definition_id, aside_usage_id)
+        """
+        def_key = AsideDefinitionKeyV2(definition_id, aside_type)
+        usage_key = AsideUsageKeyV2(usage_id, aside_type)
+        return (def_key, usage_key)
+
+    def create_usage(self, def_id):
+        """Make a usage, storing its definition id.
+
+        Returns the newly-created usage id.
+        """
+        raise NotImplementedError("Specific Modulestores must provide implementations of create_usage")
+
+    def create_definition(self, block_type, slug=None):
+        """Make a definition, storing its block type.
+
+        If `slug` is provided, it is a suggestion that the definition id
+        incorporate the slug somehow.
+
+        Returns the newly-created definition id.
+
+        """
+        raise NotImplementedError("Specific Modulestores must provide implementations of create_definition")
 
 
 def dummy_track(_event_type, _event):
@@ -92,7 +212,12 @@ class HTMLSnippet(object):
     js = {}
     js_module_name = None
 
+    preview_view_js = {}
+    studio_view_js = {}
+
     css = {}
+    preview_view_css = {}
+    studio_view_css = {}
 
     @classmethod
     def get_javascript(cls):
@@ -113,12 +238,34 @@ class HTMLSnippet(object):
         coffee = cls.js.setdefault('coffee', [])
         js = cls.js.setdefault('js', [])
 
-        fragment = resource_string(__name__, 'js/src/xmodule.js')
-
-        if fragment not in js:
-            js.insert(0, fragment)
+        # Added xmodule.js separately to enforce 000 prefix for this only.
+        cls.js.setdefault('xmodule_js', resource_string(__name__, 'js/src/xmodule.js'))
 
         return cls.js
+
+    @classmethod
+    def get_preview_view_js(cls):
+        if issubclass(cls, XModule):
+            return cls.get_javascript()
+        return cls.preview_view_js
+
+    @classmethod
+    def get_preview_view_js_bundle_name(cls):
+        if issubclass(cls, XModule):
+            return cls.__name__
+        return cls.__name__ + 'Preview'
+
+    @classmethod
+    def get_studio_view_js(cls):
+        if issubclass(cls, XModuleDescriptor):
+            return cls.get_javascript()
+        return cls.studio_view_js
+
+    @classmethod
+    def get_studio_view_js_bundle_name(cls):
+        if issubclass(cls, XModuleDescriptor):
+            return cls.__name__
+        return cls.__name__ + 'Studio'
 
     @classmethod
     def get_css(cls):
@@ -136,6 +283,18 @@ class HTMLSnippet(object):
         """
         return cls.css
 
+    @classmethod
+    def get_preview_view_css(cls):
+        if issubclass(cls, XModule):
+            return cls.get_css()
+        return cls.preview_view_css
+
+    @classmethod
+    def get_studio_view_css(cls):
+        if issubclass(cls, XModuleDescriptor):
+            return cls.get_css()
+        return cls.studio_view_css
+
     def get_html(self):
         """
         Return the html used to display this snippet
@@ -145,27 +304,51 @@ class HTMLSnippet(object):
             .format(self.__class__))
 
 
-def shim_xmodule_js(fragment):
+def shim_xmodule_js(fragment, js_module_name):
     """
-    Set up the XBlock -> XModule shim on the supplied :class:`xblock.fragment.Fragment`
+    Set up the XBlock -> XModule shim on the supplied :class:`web_fragments.fragment.Fragment`
     """
+    # Delay this import so that it is only used (and django settings are parsed) when
+    # they are required (rather than at startup)
+    import webpack_loader.utils
+
     if not fragment.js_init_fn:
         fragment.initialize_js('XBlockToXModuleShim')
+        fragment.json_init_args = {'xmodule-type': js_module_name}
+
+        add_webpack_to_fragment(fragment, 'XModuleShim')
 
 
-class XModuleMixin(XBlockMixin):
+class XModuleFields(object):
+    """
+    Common fields for XModules.
+    """
+    display_name = String(
+        display_name=_("Display Name"),
+        help=_("The display name for this component."),
+        scope=Scope.settings,
+        # it'd be nice to have a useful default but it screws up other things; so,
+        # use display_name_with_default for those
+        default=None
+    )
+
+
+class XModuleMixin(XModuleFields, XBlock):
     """
     Fields and methods used by XModules internally.
 
     Adding this Mixin to an :class:`XBlock` allows it to cooperate with old-style :class:`XModules`
     """
-
     # Attributes for inspection of the descriptor
 
     # This indicates whether the xmodule is a problem-type.
     # It should respond to max_score() and grade(). It can be graded or ungraded
     # (like a practice problem).
     has_score = False
+
+    # Whether this module can be displayed in read-only mode.  It is safe to set this to True if
+    # all user state is handled through the FieldData API.
+    show_in_read_only_mode = False
 
     # Class level variable
 
@@ -182,14 +365,19 @@ class XModuleMixin(XBlockMixin):
     # in the module
     icon_class = 'other'
 
-    display_name = String(
-        display_name="Display Name",
-        help="This name appears in the horizontal navigation at the top of the page.",
-        scope=Scope.settings,
-        # it'd be nice to have a useful default but it screws up other things; so,
-        # use display_name_with_default for those
-        default=None
-    )
+    def __init__(self, *args, **kwargs):
+        self.xmodule_runtime = None
+        self._asides = []
+
+        super(XModuleMixin, self).__init__(*args, **kwargs)
+
+    @property
+    def runtime(self):
+        return CombinedSystem(self.xmodule_runtime, self._runtime)
+
+    @runtime.setter
+    def runtime(self, value):
+        self._runtime = value
 
     @property
     def system(self):
@@ -220,7 +408,7 @@ class XModuleMixin(XBlockMixin):
 
     @property
     def url_name(self):
-        return self.location.name
+        return block_metadata_utils.url_name_for_block(self)
 
     @property
     def display_name_with_default(self):
@@ -228,10 +416,30 @@ class XModuleMixin(XBlockMixin):
         Return a display name for the module: use display_name if defined in
         metadata, otherwise convert the url name.
         """
-        name = self.display_name
-        if name is None:
-            name = self.url_name.replace('_', ' ')
-        return name
+        return block_metadata_utils.display_name_with_default(self)
+
+    @property
+    def display_name_with_default_escaped(self):
+        """
+        DEPRECATED: use display_name_with_default
+
+        Return an html escaped display name for the module: use display_name if
+        defined in metadata, otherwise convert the url name.
+
+        Note: This newly introduced method should not be used.  It was only
+        introduced to enable a quick search/replace and the ability to slowly
+        migrate and test switching to display_name_with_default, which is no
+        longer escaped.
+        """
+        # xss-lint: disable=python-deprecated-display-name
+        return block_metadata_utils.display_name_with_default_escaped(self)
+
+    @property
+    def tooltip_title(self):
+        """
+        Return the title for the sequence item containing this xmodule as its top level item.
+        """
+        return self.display_name_with_default
 
     @property
     def xblock_kvs(self):
@@ -244,6 +452,26 @@ class XModuleMixin(XBlockMixin):
         self.save()
         return self._field_data._kvs  # pylint: disable=protected-access
 
+    @lazy
+    def _unwrapped_field_data(self):
+        """
+        This property hold the value _field_data here before we wrap it in
+        the LmsFieldData or OverrideFieldData classes.
+        """
+        return self._field_data
+
+    def add_aside(self, aside):
+        """
+        save connected asides
+        """
+        self._asides.append(aside)
+
+    def get_asides(self):
+        """
+        get the list of connected asides
+        """
+        return self._asides
+
     def get_explicitly_set_fields_by_scope(self, scope=Scope.content):
         """
         Get a dictionary of the fields for the given scope which are set explicitly on this xblock. (Including
@@ -251,12 +479,20 @@ class XModuleMixin(XBlockMixin):
         """
         result = {}
         for field in self.fields.values():
-            if (field.scope == scope and field.is_set_on(self)):
-                result[field.name] = field.read_json(self)
+            if field.scope == scope and field.is_set_on(self):
+                try:
+                    result[field.name] = field.read_json(self)
+                except TypeError as exception:
+                    exception_message = "{message}, Block-location:{location}, Field-name:{field_name}".format(
+                        message=text_type(exception),
+                        location=text_type(self.location),
+                        field_name=field.name
+                    )
+                    raise TypeError(exception_message)
         return result
 
     def has_children_at_depth(self, depth):
-        """
+        r"""
         Returns true if self has children at the given depth. depth==0 returns
         false if self is a leaf, true otherwise.
 
@@ -279,7 +515,7 @@ class XModuleMixin(XBlockMixin):
             return any(child.has_children_at_depth(depth - 1) for child in self.get_children())
 
     def get_content_titles(self):
-        """
+        r"""
         Returns list of content titles for all of self's children.
 
                          SEQUENCE
@@ -301,27 +537,40 @@ class XModuleMixin(XBlockMixin):
         if self.has_children:
             return sum((child.get_content_titles() for child in self.get_children()), [])
         else:
-            return [self.display_name_with_default]
+            # xss-lint: disable=python-deprecated-display-name
+            return [self.display_name_with_default_escaped]
 
-    def get_children(self):
+    def get_children(self, usage_id_filter=None, usage_key_filter=None):  # pylint: disable=arguments-differ
         """Returns a list of XBlock instances for the children of
         this module"""
 
-        if not self.has_children:
-            return []
+        # Be backwards compatible with callers using usage_key_filter
+        if usage_id_filter is None and usage_key_filter is not None:
+            usage_id_filter = usage_key_filter
 
-        if getattr(self, '_child_instances', None) is None:
-            self._child_instances = []  # pylint: disable=attribute-defined-outside-init
-            for child_loc in self.children:
-                try:
-                    child = self.runtime.get_block(child_loc)
-                    child.runtime.export_fs = self.runtime.export_fs
-                except ItemNotFoundError:
-                    log.exception(u'Unable to load item {loc}, skipping'.format(loc=child_loc))
-                    continue
-                self._child_instances.append(child)
+        return [
+            child
+            for child
+            in super(XModuleMixin, self).get_children(usage_id_filter)
+            if child is not None
+        ]
 
-        return self._child_instances
+    def get_child(self, usage_id):
+        """
+        Return the child XBlock identified by ``usage_id``, or ``None`` if there
+        is an error while retrieving the block.
+        """
+        try:
+            child = super(XModuleMixin, self).get_child(usage_id)
+        except ItemNotFoundError:
+            log.warning(u'Unable to load item %s, skipping', usage_id)
+            return None
+
+        if child is None:
+            return None
+
+        child.runtime.export_fs = self.runtime.export_fs
+        return child
 
     def get_required_module_descriptors(self):
         """Returns a list of XModuleDescriptor instances upon which this module depends, but are
@@ -411,18 +660,172 @@ class XModuleMixin(XBlockMixin):
         """
         return None
 
-    def bind_for_student(self, xmodule_runtime, field_data):
+    def bind_for_student(self, xmodule_runtime, user_id, wrappers=None):
         """
         Set up this XBlock to act as an XModule instead of an XModuleDescriptor.
 
-        :param xmodule_runtime: the runtime to use when accessing student facing methods
-        :type xmodule_runtime: :class:`ModuleSystem`
-        :param field_data: The :class:`FieldData` to use for all subsequent data access
-        :type field_data: :class:`FieldData`
+        Arguments:
+            xmodule_runtime (:class:`ModuleSystem'): the runtime to use when accessing student facing methods
+            user_id: The user_id to set in scope_ids
+            wrappers: These are a list functions that put a wrapper, such as
+                      LmsFieldData or OverrideFieldData, around the field_data.
+                      Note that the functions will be applied in the order in
+                      which they're listed. So [f1, f2] -> f2(f1(field_data))
         """
-        # pylint: disable=attribute-defined-outside-init
+
+        # Skip rebinding if we're already bound a user, and it's this user.
+        if self.scope_ids.user_id is not None and user_id == self.scope_ids.user_id:
+            if getattr(xmodule_runtime, 'position', None):
+                self.position = xmodule_runtime.position   # update the position of the tab
+            return
+
+        # If we are switching users mid-request, save the data from the old user.
+        self.save()
+
+        # Update scope_ids to point to the new user.
+        self.scope_ids = self.scope_ids._replace(user_id=user_id)
+
+        # Clear out any cached instantiated children.
+        self.clear_child_cache()
+
+        # Clear out any cached field data scoped to the old user.
+        for field in self.fields.values():
+            if field.scope in (Scope.parent, Scope.children):
+                continue
+
+            if field.scope.user == UserScope.ONE:
+                field._del_cached_value(self)  # pylint: disable=protected-access
+                # not the most elegant way of doing this, but if we're removing
+                # a field from the module's field_data_cache, we should also
+                # remove it from its _dirty_fields
+                if field in self._dirty_fields:
+                    del self._dirty_fields[field]
+
+        # Set the new xmodule_runtime and field_data (which are user-specific)
         self.xmodule_runtime = xmodule_runtime
-        self._field_data = field_data
+
+        if wrappers is None:
+            wrappers = []
+
+        wrapped_field_data = self._unwrapped_field_data
+        for wrapper in wrappers:
+            wrapped_field_data = wrapper(wrapped_field_data)
+
+        self._field_data = wrapped_field_data
+
+    @property
+    def non_editable_metadata_fields(self):
+        """
+        Return the list of fields that should not be editable in Studio.
+
+        When overriding, be sure to append to the superclasses' list.
+        """
+        # We are not allowing editing of xblock tag and name fields at this time (for any component).
+        return [XBlock.tags, XBlock.name]
+
+    @property
+    def editable_metadata_fields(self):
+        """
+        Returns the metadata fields to be edited in Studio. These are fields with scope `Scope.settings`.
+
+        Can be limited by extending `non_editable_metadata_fields`.
+        """
+        metadata_fields = {}
+
+        # Only use the fields from this class, not mixins
+        fields = getattr(self, 'unmixed_class', self.__class__).fields
+
+        for field in fields.values():
+            if field in self.non_editable_metadata_fields:
+                continue
+            if field.scope not in (Scope.settings, Scope.content):
+                continue
+
+            metadata_fields[field.name] = self._create_metadata_editor_info(field)
+
+        return metadata_fields
+
+    def _create_metadata_editor_info(self, field):
+        """
+        Creates the information needed by the metadata editor for a specific field.
+        """
+        def jsonify_value(field, json_choice):
+            """
+            Convert field value to JSON, if needed.
+            """
+            if isinstance(json_choice, dict):
+                new_json_choice = dict(json_choice)  # make a copy so below doesn't change the original
+                if 'display_name' in json_choice:
+                    new_json_choice['display_name'] = get_text(json_choice['display_name'])
+                if 'value' in json_choice:
+                    new_json_choice['value'] = field.to_json(json_choice['value'])
+            else:
+                new_json_choice = field.to_json(json_choice)
+            return new_json_choice
+
+        def get_text(value):
+            """Localize a text value that might be None."""
+            if value is None:
+                return None
+            else:
+                return self.runtime.service(self, "i18n").ugettext(value)
+
+        # gets the 'default_value' and 'explicitly_set' attrs
+        metadata_field_editor_info = self.runtime.get_field_provenance(self, field)
+        metadata_field_editor_info['field_name'] = field.name
+        metadata_field_editor_info['display_name'] = get_text(field.display_name)
+        metadata_field_editor_info['help'] = get_text(field.help)
+        metadata_field_editor_info['value'] = field.read_json(self)
+
+        # We support the following editors:
+        # 1. A select editor for fields with a list of possible values (includes Booleans).
+        # 2. Number editors for integers and floats.
+        # 3. A generic string editor for anything else (editing JSON representation of the value).
+        editor_type = "Generic"
+        values = field.values
+        if "values_provider" in field.runtime_options:
+            values = field.runtime_options['values_provider'](self)
+        if isinstance(values, (tuple, list)) and len(values) > 0:
+            editor_type = "Select"
+            values = [jsonify_value(field, json_choice) for json_choice in values]
+        elif isinstance(field, Integer):
+            editor_type = "Integer"
+        elif isinstance(field, Float):
+            editor_type = "Float"
+        elif isinstance(field, List):
+            editor_type = "List"
+        elif isinstance(field, Dict):
+            editor_type = "Dict"
+        elif isinstance(field, RelativeTime):
+            editor_type = "RelativeTime"
+        elif isinstance(field, String) and field.name == "license":
+            editor_type = "License"
+        metadata_field_editor_info['type'] = editor_type
+        metadata_field_editor_info['options'] = [] if values is None else values
+
+        return metadata_field_editor_info
+
+    def public_view(self, _context):
+        """
+        Default message for blocks that don't implement public_view
+        """
+        alert_html = HTML(
+            u'<div class="page-banner"><div class="alert alert-warning">'
+            u'<span class="icon icon-alert fa fa fa-warning" aria-hidden="true"></span>'
+            u'<div class="message-content">{}</div></div></div>'
+        )
+
+        if self.display_name:
+            display_text = _(
+                u'{display_name} is only accessible to enrolled learners. '
+                'Sign in or register, and enroll in this course to view it.'
+            ).format(
+                display_name=self.display_name
+            )
+        else:
+            display_text = _(DEFAULT_PUBLIC_VIEW_MESSAGE)
+
+        return Fragment(alert_html.format(display_text))
 
 
 class ProxyAttribute(object):
@@ -473,45 +876,16 @@ descriptor_attr = partial(ProxyAttribute, 'descriptor')  # pylint: disable=inval
 module_runtime_attr = partial(ProxyAttribute, 'xmodule_runtime')  # pylint: disable=invalid-name
 
 
-@XBlock.needs("i18n")
-class XModule(XModuleMixin, HTMLSnippet, XBlock):  # pylint: disable=abstract-method
-    """ Implements a generic learning module.
-
-        Subclasses must at a minimum provide a definition for get_html in order
-        to be displayed to users.
-
-        See the HTML module for a simple example.
+class XModuleToXBlockMixin(object):
     """
-
-    has_score = descriptor_attr('has_score')
-    _field_data_cache = descriptor_attr('_field_data_cache')
-    _field_data = descriptor_attr('_field_data')
-    _dirty_fields = descriptor_attr('_dirty_fields')
-
-    def __init__(self, descriptor, *args, **kwargs):
+    Common code needed by XModule and XBlocks converted from XModules.
+    """
+    @property
+    def ajax_url(self):
         """
-        Construct a new xmodule
-
-        runtime: An XBlock runtime allowing access to external resources
-
-        descriptor: the XModuleDescriptor that this module is an instance of.
-
-        field_data: A dictionary-like object that maps field names to values
-            for those fields.
+        Returns the URL for the ajax handler.
         """
-        # Set the descriptor first so that we can proxy to it
-        self.descriptor = descriptor
-        super(XModule, self).__init__(*args, **kwargs)
-        self._loaded_children = None
-        self.runtime.xmodule_instance = self
-
-    def __unicode__(self):
-        return u'<x_module(id={0})>'.format(self.id)
-
-    def handle_ajax(self, _dispatch, _data):
-        """ dispatch is last part of the URL.
-            data is a dictionary-like object with the content of the request"""
-        return u""
+        return self.runtime.handler_url(self, 'xmodule_handler', '', '').rstrip('/?')
 
     @XBlock.handler
     def xmodule_handler(self, request, suffix=None):
@@ -538,32 +912,81 @@ class XModule(XModuleMixin, HTMLSnippet, XBlock):  # pylint: disable=abstract-me
         # WebOb requests have multiple entries for uploaded files.  handle_ajax
         # expects a single entry as a list.
         request_post = MultiDict(request.POST)
-        for key in set(request.POST.iterkeys()):
+        for key in set(six.iterkeys(request.POST)):
             if hasattr(request.POST[key], "file"):
-                request_post[key] = map(FileObjForWebobFiles, request.POST.getall(key))
+                request_post[key] = list(map(FileObjForWebobFiles, request.POST.getall(key)))
 
         response_data = self.handle_ajax(suffix, request_post)
-        return Response(response_data, content_type='application/json')
+        return Response(response_data, content_type='application/json', charset='UTF-8')
 
-    def get_children(self):
+
+@XBlock.needs("i18n")
+@python_2_unicode_compatible
+class XModule(XModuleToXBlockMixin, HTMLSnippet, XModuleMixin):
+    """ Implements a generic learning module.
+
+        Subclasses must at a minimum provide a definition for get_html in order
+        to be displayed to users.
+
+        See the HTML module for a simple example.
+    """
+
+    entry_point = "xmodule.v1"
+
+    has_score = descriptor_attr('has_score')
+    max_score = descriptor_attr('max_score')
+    show_in_read_only_mode = descriptor_attr('show_in_read_only_mode')
+    _field_data_cache = descriptor_attr('_field_data_cache')
+    _field_data = descriptor_attr('_field_data')
+    _dirty_fields = descriptor_attr('_dirty_fields')
+
+    def __init__(self, descriptor, *args, **kwargs):
         """
-        Return module instances for all the children of this module.
+        Construct a new xmodule
+
+        runtime: An XBlock runtime allowing access to external resources
+
+        descriptor: the XModuleDescriptor that this module is an instance of.
+
+        field_data: A dictionary-like object that maps field names to values
+            for those fields.
         """
-        if self._loaded_children is None:
-            child_descriptors = self.get_child_descriptors()
 
-            # This deliberately uses system.get_module, rather than runtime.get_block,
-            # because we're looking at XModule children, rather than XModuleDescriptor children.
-            # That means it can use the deprecated XModule apis, rather than future XBlock apis
+        # Set the descriptor first so that we can proxy to it
+        self.descriptor = descriptor
+        self._runtime = None
+        super(XModule, self).__init__(*args, **kwargs)
+        self.runtime.xmodule_instance = self
 
-            # TODO: Once we're in a system where this returns a mix of XModuleDescriptors
-            # and XBlocks, we're likely to have to change this more
-            children = [self.system.get_module(descriptor) for descriptor in child_descriptors]
-            # get_module returns None if the current user doesn't have access
-            # to the location.
-            self._loaded_children = [c for c in children if c is not None]
+    @property
+    def runtime(self):
+        return CombinedSystem(self._runtime, self.descriptor._runtime)  # pylint: disable=protected-access
 
-        return self._loaded_children
+    @runtime.setter
+    def runtime(self, value):
+        self._runtime = value
+
+    def __str__(self):
+        # xss-lint: disable=python-wrap-html
+        return u'<x_module(id={0})>'.format(self.id)
+
+    def handle_ajax(self, _dispatch, _data):
+        """ dispatch is last part of the URL.
+            data is a dictionary-like object with the content of the request"""
+        return u""
+
+    def get_child(self, usage_id):
+        if usage_id in self._child_cache:
+            return self._child_cache[usage_id]
+
+        # Take advantage of the children cache that the descriptor might have
+        child_descriptor = self.descriptor.get_child(usage_id)
+        child_block = None
+        if child_descriptor is not None:
+            child_block = self.system.get_module(child_descriptor)
+
+        self._child_cache[usage_id] = child_block
+        return child_block
 
     def get_child_descriptors(self):
         """
@@ -605,7 +1028,7 @@ def policy_key(location):
     Get the key for a location in a policy file.  (Since the policy file is
     specific to a course, it doesn't need the full location url).
     """
-    return u'{cat}/{name}'.format(cat=location.category, name=location.name)
+    return u'{cat}/{name}'.format(cat=location.block_type, name=location.block_id)
 
 
 Template = namedtuple("Template", "metadata data children")
@@ -676,22 +1099,10 @@ class ResourceTemplates(object):
                     return template
 
 
-@XBlock.needs("i18n")
-class XModuleDescriptor(XModuleMixin, HTMLSnippet, ResourceTemplates, XBlock):
+class XModuleDescriptorToXBlockMixin(object):
     """
-    An XModuleDescriptor is a specification for an element of a course. This
-    could be a problem, an organizational element (a group of content), or a
-    segment of video, for example.
-
-    XModuleDescriptors are independent and agnostic to the current student state
-    on a problem. They handle the editing interface used by instructors to
-    create a problem, and can generate XModules (which do know about student
-    state).
+    Common code needed by XModuleDescriptor and XBlocks converted from XModules.
     """
-    entry_point = "xmodule.v1"
-    module_class = XModule
-
-
     # VS[compat].  Backwards compatibility code that can go away after
     # importing 2012 courses.
     # A set of metadata key conversions that we want to make
@@ -700,36 +1111,8 @@ class XModuleDescriptor(XModuleMixin, HTMLSnippet, ResourceTemplates, XBlock):
         'name': 'display_name',
     }
 
-    # ============================= STRUCTURAL MANIPULATION ===================
-    def __init__(self, *args, **kwargs):
-        """
-        Construct a new XModuleDescriptor. The only required arguments are the
-        system, used for interaction with external resources, and the
-        definition, which specifies all the data needed to edit and display the
-        problem (but none of the associated metadata that handles recordkeeping
-        around the problem).
-
-        This allows for maximal flexibility to add to the interface while
-        preserving backwards compatibility.
-
-        runtime: A DescriptorSystem for interacting with external resources
-
-        field_data: A dictionary-like object that maps field names to values
-            for those fields.
-
-        XModuleDescriptor.__init__ takes the same arguments as xblock.core:XBlock.__init__
-        """
-        super(XModuleDescriptor, self).__init__(*args, **kwargs)
-        # update_version is the version which last updated this xblock v prev being the penultimate updater
-        # leaving off original_version since it complicates creation w/o any obv value yet and is computable
-        # by following previous until None
-        # definition_locator is only used by mongostores which separate definitions from blocks
-        self.edited_by = self.edited_on = self.previous_version = self.update_version = self.definition_locator = None
-        self.xmodule_runtime = None
-
     @classmethod
     def _translate(cls, key):
-        'VS[compat]'
         return cls.metadata_translations.get(key, key)
 
     # ================================= XML PARSING ============================
@@ -738,9 +1121,21 @@ class XModuleDescriptor(XModuleMixin, HTMLSnippet, ResourceTemplates, XBlock):
         """
         Interpret the parsed XML in `node`, creating an XModuleDescriptor.
         """
-        xml = etree.tostring(node)
+        # It'd be great to not reserialize and deserialize the xml
+        xml = etree.tostring(node).decode('utf-8')
         block = cls.from_xml(xml, runtime, id_generator)
         return block
+
+    @classmethod
+    def parse_xml_new_runtime(cls, node, runtime, keys):
+        """
+        This XML lives within Blockstore and the new runtime doesn't need this
+        legacy XModule code. Use the "normal" XBlock parsing code.
+        """
+        try:
+            return super(XModuleDescriptorToXBlockMixin, cls).parse_xml_new_runtime(node, runtime, keys)
+        except AttributeError:
+            return super(XModuleDescriptorToXBlockMixin, cls).parse_xml(node, runtime, keys, id_generator=None)
 
     @classmethod
     def from_xml(cls, xml_data, system, id_generator):
@@ -770,7 +1165,11 @@ class XModuleDescriptor(XModuleMixin, HTMLSnippet, ResourceTemplates, XBlock):
         node.tag = exported_node.tag
         node.text = exported_node.text
         node.tail = exported_node.tail
+
         for key, value in exported_node.items():
+            if key == 'url_name' and value == 'course' and key in node.attrib:
+                # if url_name is set in ExportManager then do not override it here.
+                continue
             node.set(key, value)
 
         node.extend(list(exported_node))
@@ -790,6 +1189,51 @@ class XModuleDescriptor(XModuleMixin, HTMLSnippet, ResourceTemplates, XBlock):
         """
         raise NotImplementedError('Modules must implement export_to_xml to enable xml export')
 
+
+@XBlock.needs("i18n")
+class XModuleDescriptor(XModuleDescriptorToXBlockMixin, HTMLSnippet, ResourceTemplates, XModuleMixin):
+    """
+    An XModuleDescriptor is a specification for an element of a course. This
+    could be a problem, an organizational element (a group of content), or a
+    segment of video, for example.
+
+    XModuleDescriptors are independent and agnostic to the current student state
+    on a problem. They handle the editing interface used by instructors to
+    create a problem, and can generate XModules (which do know about student
+    state).
+    """
+
+    entry_point = "xmodule.v1"
+
+    module_class = XModule
+
+    # ============================= STRUCTURAL MANIPULATION ===================
+    def __init__(self, *args, **kwargs):
+        """
+        Construct a new XModuleDescriptor. The only required arguments are the
+        system, used for interaction with external resources, and the
+        definition, which specifies all the data needed to edit and display the
+        problem (but none of the associated metadata that handles recordkeeping
+        around the problem).
+
+        This allows for maximal flexibility to add to the interface while
+        preserving backwards compatibility.
+
+        runtime: A DescriptorSystem for interacting with external resources
+
+        field_data: A dictionary-like object that maps field names to values
+            for those fields.
+
+        XModuleDescriptor.__init__ takes the same arguments as xblock.core:XBlock.__init__
+        """
+        super(XModuleDescriptor, self).__init__(*args, **kwargs)
+        # update_version is the version which last updated this xblock v prev being the penultimate updater
+        # leaving off original_version since it complicates creation w/o any obv value yet and is computable
+        # by following previous until None
+        # definition_locator is only used by mongostores which separate definitions from blocks
+        self.previous_version = self.update_version = self.definition_locator = None
+        self.xmodule_runtime = None
+
     def editor_saved(self, user, old_metadata, old_content):
         """
         This method is called when "Save" is pressed on the Studio editor.
@@ -807,13 +1251,27 @@ class XModuleDescriptor(XModuleMixin, HTMLSnippet, ResourceTemplates, XBlock):
         """
         pass
 
-
     # =============================== BUILTIN METHODS ==========================
     def __eq__(self, other):
-        return (self.scope_ids == other.scope_ids and
-                self.fields.keys() == other.fields.keys() and
+        """
+        Is this XModule effectively equal to the other instance?
+        """
+        return (hasattr(other, 'scope_ids') and
+                self.scope_ids == other.scope_ids and
+                set(self.fields.keys()) == set(other.fields.keys()) and
                 all(getattr(self, field.name) == getattr(other, field.name)
                     for field in self.fields.values()))
+
+    def __hash__(self):  # pylint: disable=useless-super-delegation
+        """
+        This isn't technically appropriate since descriptors are actually mutable,
+        but in practice we rarely modify them after creation or instantiate two
+        equivalent descriptors in the same process.  And we perform graph
+        operations on large collections of XBlocks that have simply unacceptable
+        performance if we have to rely on lists and equality rather than sets,
+        dictionaries, and identity-based hash functions.
+        """
+        return super(XModuleDescriptor, self).__hash__()
 
     def __repr__(self):
         return (
@@ -823,90 +1281,6 @@ class XModuleDescriptor(XModuleMixin, HTMLSnippet, ResourceTemplates, XBlock):
             "{0.scope_ids!r}"
             ")".format(self)
         )
-
-    @property
-    def non_editable_metadata_fields(self):
-        """
-        Return the list of fields that should not be editable in Studio.
-
-        When overriding, be sure to append to the superclasses' list.
-        """
-        # We are not allowing editing of xblock tag and name fields at this time (for any component).
-        return [XBlock.tags, XBlock.name]
-
-    @property
-    def editable_metadata_fields(self):
-        """
-        Returns the metadata fields to be edited in Studio. These are fields with scope `Scope.settings`.
-
-        Can be limited by extending `non_editable_metadata_fields`.
-        """
-        metadata_fields = {}
-
-        # Only use the fields from this class, not mixins
-        fields = getattr(self, 'unmixed_class', self.__class__).fields
-
-        for field in fields.values():
-
-            if field.scope != Scope.settings or field in self.non_editable_metadata_fields:
-                continue
-
-            metadata_fields[field.name] = self._create_metadata_editor_info(field)
-
-        return metadata_fields
-
-    def _create_metadata_editor_info(self, field):
-        """
-        Creates the information needed by the metadata editor for a specific field.
-        """
-        def jsonify_value(field, json_choice):
-            if isinstance(json_choice, dict):
-                json_choice = dict(json_choice)  # make a copy so below doesn't change the original
-                if 'display_name' in json_choice:
-                    json_choice['display_name'] = get_text(json_choice['display_name'])
-                if 'value' in json_choice:
-                    json_choice['value'] = field.to_json(json_choice['value'])
-            else:
-                json_choice = field.to_json(json_choice)
-            return json_choice
-
-        def get_text(value):
-            """Localize a text value that might be None."""
-            if value is None:
-                return None
-            else:
-                return self.runtime.service(self, "i18n").ugettext(value)
-
-        # gets the 'default_value' and 'explicitly_set' attrs
-        metadata_field_editor_info = self.runtime.get_field_provenance(self, field)
-        metadata_field_editor_info['field_name'] = field.name
-        metadata_field_editor_info['display_name'] = get_text(field.display_name)
-        metadata_field_editor_info['help'] = get_text(field.help)
-        metadata_field_editor_info['value'] = field.read_json(self)
-
-        # We support the following editors:
-        # 1. A select editor for fields with a list of possible values (includes Booleans).
-        # 2. Number editors for integers and floats.
-        # 3. A generic string editor for anything else (editing JSON representation of the value).
-        editor_type = "Generic"
-        values = field.values
-        if isinstance(values, (tuple, list)) and len(values) > 0:
-            editor_type = "Select"
-            values = [jsonify_value(field, json_choice) for json_choice in values]
-        elif isinstance(field, Integer):
-            editor_type = "Integer"
-        elif isinstance(field, Float):
-            editor_type = "Float"
-        elif isinstance(field, List):
-            editor_type = "List"
-        elif isinstance(field, Dict):
-            editor_type = "Dict"
-        elif isinstance(field, RelativeTime):
-            editor_type = "RelativeTime"
-        metadata_field_editor_info['type'] = editor_type
-        metadata_field_editor_info['options'] = [] if values is None else values
-
-        return metadata_field_editor_info
 
     # ~~~~~~~~~~~~~~~ XModule Indirection ~~~~~~~~~~~~~~~~
     @property
@@ -925,6 +1299,7 @@ class XModuleDescriptor(XModuleMixin, HTMLSnippet, ResourceTemplates, XBlock):
                     descriptor=self,
                     scope_ids=self.scope_ids,
                     field_data=self._field_data,
+                    for_parent=self.get_parent() if self.has_cached_parent else None
                 )
                 self.xmodule_runtime.xmodule_instance.save()
             except Exception:  # pylint: disable=broad-except
@@ -952,8 +1327,8 @@ class XModuleDescriptor(XModuleMixin, HTMLSnippet, ResourceTemplates, XBlock):
     get_progress = module_attr('get_progress')
     get_score = module_attr('get_score')
     handle_ajax = module_attr('handle_ajax')
-    max_score = module_attr('max_score')
     student_view = module_attr(STUDENT_VIEW)
+    public_view = module_attr(PUBLIC_VIEW)
     get_child_descriptors = module_attr('get_child_descriptors')
     xmodule_handler = module_attr('xmodule_handler')
 
@@ -970,11 +1345,11 @@ class XModuleDescriptor(XModuleMixin, HTMLSnippet, ResourceTemplates, XBlock):
         return Fragment(self.get_html())
 
 
-class ConfigurableFragmentWrapper(object):  # pylint: disable=abstract-method
+class ConfigurableFragmentWrapper(object):
     """
-    Runtime mixin that allows for composition of many `wrap_child` wrappers
+    Runtime mixin that allows for composition of many `wrap_xblock` wrappers
     """
-    def __init__(self, wrappers=None, **kwargs):
+    def __init__(self, wrappers=None, wrappers_asides=None, **kwargs):
         """
         :param wrappers: A list of wrappers, where each wrapper is:
 
@@ -987,8 +1362,12 @@ class ConfigurableFragmentWrapper(object):  # pylint: disable=abstract-method
             self.wrappers = wrappers
         else:
             self.wrappers = []
+        if wrappers_asides is not None:
+            self.wrappers_asides = wrappers_asides
+        else:
+            self.wrappers_asides = []
 
-    def wrap_child(self, block, view, frag, context):
+    def wrap_xblock(self, block, view, frag, context):
         """
         See :func:`Runtime.wrap_child`
         """
@@ -997,11 +1376,23 @@ class ConfigurableFragmentWrapper(object):  # pylint: disable=abstract-method
 
         return frag
 
+    def wrap_aside(self, block, aside, view, frag, context):    # pylint: disable=unused-argument
+        """
+        See :func:`Runtime.wrap_child`
+        """
+        for wrapper in self.wrappers_asides:
+            frag = wrapper(aside, view, frag, context)
+
+        return frag
+
 
 # This function exists to give applications (LMS/CMS) a place to monkey-patch until
 # we can refactor modulestore to split out the FieldData half of its interface from
-# the Runtime part of its interface. This function matches the Runtime.handler_url interface
-def descriptor_global_handler_url(block, handler_name, suffix='', query='', thirdparty=False):  # pylint: disable=invalid-name, unused-argument
+# the Runtime part of its interface. This function mostly matches the
+# Runtime.handler_url interface.
+#
+# The monkey-patching happens in cms/djangoapps/xblock_config/apps.py and lms/djangoapps/lms_xblock/apps.py
+def descriptor_global_handler_url(block, handler_name, suffix='', query='', thirdparty=False):
     """
     See :meth:`xblock.runtime.Runtime.handler_url`.
     """
@@ -1011,7 +1402,9 @@ def descriptor_global_handler_url(block, handler_name, suffix='', query='', thir
 # This function exists to give applications (LMS/CMS) a place to monkey-patch until
 # we can refactor modulestore to split out the FieldData half of its interface from
 # the Runtime part of its interface. This function matches the Runtime.local_resource_url interface
-def descriptor_global_local_resource_url(block, uri):  # pylint: disable=invalid-name, unused-argument
+#
+# The monkey-patching happens in cms/djangoapps/xblock_config/apps.py and lms/djangoapps/lms_xblock/apps.py
+def descriptor_global_local_resource_url(block, uri):
     """
     See :meth:`xblock.runtime.Runtime.local_resource_url`.
     """
@@ -1024,6 +1417,7 @@ class MetricsMixin(object):
     """
 
     def render(self, block, view_name, context=None):
+        start_time = time.time()
         try:
             status = "success"
             return super(MetricsMixin, self).render(block, view_name, context=context)
@@ -1033,17 +1427,27 @@ class MetricsMixin(object):
             raise
 
         finally:
+            end_time = time.time()
+            duration = end_time - start_time
             course_id = getattr(self, 'course_id', '')
-            dog_stats_api.increment(XMODULE_METRIC_NAME, tags=[
+            tags = [
                 u'view_name:{}'.format(view_name),
                 u'action:render',
                 u'action_status:{}'.format(status),
                 u'course_id:{}'.format(course_id),
-                u'block_type:{}'.format(block.scope_ids.block_type)
-            ])
+                u'block_type:{}'.format(block.scope_ids.block_type),
+                u'block_family:{}'.format(block.entry_point),
+            ]
+            log.debug(
+                "%.3fs - render %s.%s (%s)",
+                duration,
+                block.__class__.__name__,
+                view_name,
+                getattr(block, 'location', ''),
+            )
 
     def handle(self, block, handler_name, request, suffix=''):
-        handle = None
+        start_time = time.time()
         try:
             status = "success"
             return super(MetricsMixin, self).handle(block, handler_name, request, suffix=suffix)
@@ -1053,23 +1457,33 @@ class MetricsMixin(object):
             raise
 
         finally:
+            end_time = time.time()
+            duration = end_time - start_time
             course_id = getattr(self, 'course_id', '')
-            dog_stats_api.increment(XMODULE_METRIC_NAME, tags=[
+            tags = [
                 u'handler_name:{}'.format(handler_name),
                 u'action:handle',
                 u'action_status:{}'.format(status),
                 u'course_id:{}'.format(course_id),
-                u'block_type:{}'.format(block.scope_ids.block_type)
-            ])
+                u'block_type:{}'.format(block.scope_ids.block_type),
+                u'block_family:{}'.format(block.entry_point),
+            ]
+            log.debug(
+                "%.3fs - handle %s.%s (%s)",
+                duration,
+                block.__class__.__name__,
+                handler_name,
+                getattr(block, 'location', ''),
+            )
 
 
-class DescriptorSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # pylint: disable=abstract-method
+class DescriptorSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):
     """
     Base class for :class:`Runtime`s to be used with :class:`XModuleDescriptor`s
     """
-
+    # pylint: disable=bad-continuation
     def __init__(
-        self, load_item, resources_fs, error_tracker, get_policy=None, **kwargs
+        self, load_item, resources_fs, error_tracker, get_policy=None, disabled_xblock_types=lambda: [], **kwargs
     ):
         """
         load_item: Takes a Location and returns an XModuleDescriptor
@@ -1081,30 +1495,7 @@ class DescriptorSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # p
             Used for example to get a list of all non-fatal problems on course
             load, and display them to the user.
 
-            A function of (error_msg). errortracker.py provides a
-            handy make_error_tracker() function.
-
-            Patterns for using the error handler:
-               try:
-                  x = access_some_resource()
-                  check_some_format(x)
-               except SomeProblem as err:
-                  msg = 'Grommet {0} is broken: {1}'.format(x, str(err))
-                  log.warning(msg)  # don't rely on tracker to log
-                        # NOTE: we generally don't want content errors logged as errors
-                  self.system.error_tracker(msg)
-                  # work around
-                  return 'Oops, couldn't load grommet'
-
-               OR, if not in an exception context:
-
-               if not check_something(thingy):
-                  msg = "thingy {0} is broken".format(thingy)
-                  log.critical(msg)
-                  self.system.error_tracker(msg)
-
-               NOTE: To avoid duplication, do not call the tracker on errors
-               that you're about to re-raise---let the caller track them.
+            See errortracker.py for more documentation
 
         get_policy: a function that takes a usage id and returns a dict of
             policy to apply.
@@ -1112,7 +1503,9 @@ class DescriptorSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # p
         local_resource_url: an implementation of :meth:`xblock.runtime.Runtime.local_resource_url`
 
         """
-        super(DescriptorSystem, self).__init__(id_reader=OpaqueKeyReader(), **kwargs)
+        kwargs.setdefault('id_reader', OpaqueKeyReader())
+        kwargs.setdefault('id_generator', AsideKeyGenerator())
+        super(DescriptorSystem, self).__init__(**kwargs)
 
         # This is used by XModules to write out separate files during xml export
         self.export_fs = None
@@ -1125,9 +1518,19 @@ class DescriptorSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # p
         else:
             self.get_policy = lambda u: {}
 
-    def get_block(self, usage_id):
+        self.disabled_xblock_types = disabled_xblock_types
+
+    def get_block(self, usage_id, for_parent=None):
         """See documentation for `xblock.runtime:Runtime.get_block`"""
-        return self.load_item(usage_id)
+        return self.load_item(usage_id, for_parent=for_parent)
+
+    def load_block_type(self, block_type):
+        """
+        Returns a subclass of :class:`.XBlock` that corresponds to the specified `block_type`.
+        """
+        if block_type in self.disabled_xblock_types():
+            return self.default_class
+        return super(DescriptorSystem, self).load_block_type(block_type)
 
     def get_field_provenance(self, xblock, field):
         """
@@ -1140,6 +1543,7 @@ class DescriptorSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # p
         :param xblock:
         :param field:
         """
+        # pylint: disable=protected-access
         # in runtime b/c runtime contains app-specific xblock behavior. Studio's the only app
         # which needs this level of introspection right now. runtime also is 'allowed' to know
         # about the kvs, dbmodel, etc.
@@ -1147,50 +1551,38 @@ class DescriptorSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # p
         result = {}
         result['explicitly_set'] = xblock._field_data.has(xblock, field.name)
         try:
-            block_inherited = xblock.xblock_kvs.inherited_settings
-        except AttributeError:  # if inherited_settings doesn't exist on kvs
-            block_inherited = {}
-        if field.name in block_inherited:
-            result['default_value'] = block_inherited[field.name]
-        else:
+            result['default_value'] = xblock._field_data.default(xblock, field.name)
+        except KeyError:
             result['default_value'] = field.to_json(field.default)
         return result
 
-    def render(self, block, view_name, context=None):
-        if view_name in PREVIEW_VIEWS:
-            assert block.xmodule_runtime is not None
-            if isinstance(block, (XModule, XModuleDescriptor)):
-                to_render = block._xmodule
-            else:
-                to_render = block
-            return block.xmodule_runtime.render(to_render, view_name, context)
-        else:
-            return super(DescriptorSystem, self).render(block, view_name, context)
-
     def handler_url(self, block, handler_name, suffix='', query='', thirdparty=False):
-        xmodule_runtime = getattr(block, 'xmodule_runtime', None)
-        if xmodule_runtime is not None:
-            return xmodule_runtime.handler_url(block, handler_name, suffix, query, thirdparty)
-        else:
-            # Currently, Modulestore is responsible for instantiating DescriptorSystems
-            # This means that LMS/CMS don't have a way to define a subclass of DescriptorSystem
-            # that implements the correct handler url. So, for now, instead, we will reference a
-            # global function that the application can override.
-            return descriptor_global_handler_url(block, handler_name, suffix, query, thirdparty)
+        # Currently, Modulestore is responsible for instantiating DescriptorSystems
+        # This means that LMS/CMS don't have a way to define a subclass of DescriptorSystem
+        # that implements the correct handler url. So, for now, instead, we will reference a
+        # global function that the application can override.
+        return descriptor_global_handler_url(block, handler_name, suffix, query, thirdparty)
 
     def local_resource_url(self, block, uri):
         """
         See :meth:`xblock.runtime.Runtime:local_resource_url` for documentation.
         """
-        xmodule_runtime = getattr(block, 'xmodule_runtime', None)
-        if xmodule_runtime is not None:
-            return xmodule_runtime.local_resource_url(block, uri)
-        else:
-            # Currently, Modulestore is responsible for instantiating DescriptorSystems
-            # This means that LMS/CMS don't have a way to define a subclass of DescriptorSystem
-            # that implements the correct local_resource_url. So, for now, instead, we will reference a
-            # global function that the application can override.
-            return descriptor_global_local_resource_url(block, uri)
+        # Currently, Modulestore is responsible for instantiating DescriptorSystems
+        # This means that LMS/CMS don't have a way to define a subclass of DescriptorSystem
+        # that implements the correct local_resource_url. So, for now, instead, we will reference a
+        # global function that the application can override.
+        return descriptor_global_local_resource_url(block, uri)
+
+    def applicable_aside_types(self, block):
+        """
+        See :meth:`xblock.runtime.Runtime:applicable_aside_types` for documentation.
+        """
+        potential_set = set(super(DescriptorSystem, self).applicable_aside_types(block))
+        if getattr(block, 'xmodule_runtime', None) is not None:
+            if hasattr(block.xmodule_runtime, 'applicable_aside_types'):
+                application_set = set(block.xmodule_runtime.applicable_aside_types(block))
+                return list(potential_set.intersection(application_set))
+        return list(potential_set)
 
     def resource_url(self, resource):
         """
@@ -1198,18 +1590,39 @@ class DescriptorSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # p
         """
         raise NotImplementedError("edX Platform doesn't currently implement XBlock resource urls")
 
-    def publish(self, block, event_type, event):
-        """
-        See :meth:`xblock.runtime.Runtime:publish` for documentation.
-        """
-        xmodule_runtime = getattr(block, 'xmodule_runtime', None)
-        if xmodule_runtime is not None:
-            return xmodule_runtime.publish(block, event_type, event)
-
     def add_block_as_child_node(self, block, node):
         child = etree.SubElement(node, "unknown")
         child.set('url_name', block.url_name)
         block.add_xml_to_node(child)
+
+    def publish(self, block, event_type, event):
+        # A stub publish method that doesn't emit any events from XModuleDescriptors.
+        pass
+
+    def service(self, block, service_name):
+        """
+        Runtime-specific override for the XBlock service manager.  If a service is not currently
+        instantiated and is declared as a critical requirement, an attempt is made to load the
+        module.
+
+        Arguments:
+            block (an XBlock): this block's class will be examined for service
+                decorators.
+            service_name (string): the name of the service requested.
+
+        Returns:
+            An object implementing the requested service, or None.
+        """
+        # getting the service from parent module. making sure of block service declarations.
+        service = super(DescriptorSystem, self).service(block=block, service_name=service_name)
+        # Passing the block to service if it is callable e.g. ModuleI18nService. It is the responsibility of calling
+        # service to handle the passing argument.
+        if callable(service):
+            return service(block)
+        return service
+
+
+new_contract('DescriptorSystem', DescriptorSystem)
 
 
 class XMLParsingSystem(DescriptorSystem):
@@ -1222,8 +1635,113 @@ class XMLParsingSystem(DescriptorSystem):
         super(XMLParsingSystem, self).__init__(**kwargs)
         self.process_xml = process_xml
 
+    def _usage_id_from_node(self, node, parent_id, id_generator=None):
+        """Create a new usage id from an XML dom node.
 
-class ModuleSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # pylint: disable=abstract-method
+        Args:
+            node (lxml.etree.Element): The DOM node to interpret.
+            parent_id: The usage ID of the parent block
+            id_generator (IdGenerator): The :class:`.IdGenerator` to use
+                for creating ids
+        Returns:
+            UsageKey: the usage key for the new xblock
+        """
+        return self.xblock_from_node(node, parent_id, id_generator).scope_ids.usage_id
+
+    def xblock_from_node(self, node, parent_id, id_generator=None):
+        """
+        Create an XBlock instance from XML data.
+
+        Args:
+            xml_data (string): A string containing valid xml.
+            system (XMLParsingSystem): The :class:`.XMLParsingSystem` used to connect the block
+                to the outside world.
+            id_generator (IdGenerator): An :class:`~xblock.runtime.IdGenerator` that
+                will be used to construct the usage_id and definition_id for the block.
+
+        Returns:
+            XBlock: The fully instantiated :class:`~xblock.core.XBlock`.
+
+        """
+        id_generator = id_generator or self.id_generator
+        # leave next line commented out - useful for low-level debugging
+        # log.debug('[_usage_id_from_node] tag=%s, class=%s' % (node.tag, xblock_class))
+
+        block_type = node.tag
+        # remove xblock-family from elements
+        node.attrib.pop('xblock-family', None)
+
+        url_name = node.get('url_name')  # difference from XBlock.runtime
+        def_id = id_generator.create_definition(block_type, url_name)
+        usage_id = id_generator.create_usage(def_id)
+
+        keys = ScopeIds(None, block_type, def_id, usage_id)
+        block_class = self.mixologist.mix(self.load_block_type(block_type))
+
+        aside_children = self.parse_asides(node, def_id, usage_id, id_generator)
+        asides_tags = [x.tag for x in aside_children]
+
+        block = block_class.parse_xml(node, self, keys, id_generator)
+        self._convert_reference_fields_to_keys(block)  # difference from XBlock.runtime
+        block.parent = parent_id
+        block.save()
+
+        asides = self.get_asides(block)
+        for asd in asides:
+            if asd.scope_ids.block_type in asides_tags:
+                block.add_aside(asd)
+
+        return block
+
+    def parse_asides(self, node, def_id, usage_id, id_generator):
+        """pull the asides out of the xml payload and instantiate them"""
+        aside_children = []
+        for child in node.iterchildren():
+            # get xblock-family from node
+            xblock_family = child.attrib.pop('xblock-family', None)
+            if xblock_family:
+                xblock_family = self._family_id_to_superclass(xblock_family)
+                if issubclass(xblock_family, XBlockAside):
+                    aside_children.append(child)
+        # now process them & remove them from the xml payload
+        for child in aside_children:
+            self._aside_from_xml(child, def_id, usage_id, id_generator)
+            node.remove(child)
+        return aside_children
+
+    def _make_usage_key(self, course_key, value):
+        """
+        Makes value into a UsageKey inside the specified course.
+        If value is already a UsageKey, returns that.
+        """
+        if isinstance(value, UsageKey):
+            return value
+        usage_key = UsageKey.from_string(value)
+        return usage_key.map_into_course(course_key)
+
+    def _convert_reference_fields_to_keys(self, xblock):
+        """
+        Find all fields of type reference and convert the payload into UsageKeys
+        """
+        course_key = xblock.scope_ids.usage_id.course_key
+
+        for field in six.itervalues(xblock.fields):
+            if field.is_set_on(xblock):
+                field_value = getattr(xblock, field.name)
+                if field_value is None:
+                    continue
+                elif isinstance(field, Reference):
+                    setattr(xblock, field.name, self._make_usage_key(course_key, field_value))
+                elif isinstance(field, ReferenceList):
+                    setattr(xblock, field.name, [self._make_usage_key(course_key, ele) for ele in field_value])
+                elif isinstance(field, ReferenceValueDict):
+                    for key, subvalue in six.iteritems(field_value):
+                        assert isinstance(subvalue, six.string_types)
+                        field_value[key] = self._make_usage_key(course_key, subvalue)
+                    setattr(xblock, field.name, field_value)
+
+
+class ModuleSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):
     """
     This is an abstraction such that x_modules can function independent
     of the courseware (e.g. import into other types of courseware, LMS,
@@ -1235,16 +1753,17 @@ class ModuleSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # pylin
     Note that these functions can be closures over e.g. a django request
     and user, or other environment-specific info.
     """
+
+    @contract(descriptor_runtime='DescriptorSystem')
     def __init__(
             self, static_url, track_function, get_module, render_template,
             replace_urls, descriptor_runtime, user=None, filestore=None,
             debug=False, hostname="", xqueue=None, publish=None, node_path="",
             anonymous_student_id='', course_id=None,
-            open_ended_grading_interface=None, s3_interface=None,
             cache=None, can_execute_unsafe_code=None, replace_course_urls=None,
             replace_jump_to_id_urls=None, error_descriptor_class=None, get_real_user=None,
             field_data=None, get_user_role=None, rebind_noauth_module_to_user=None,
-            user_location=None, **kwargs):
+            user_location=None, get_python_lib_zip=None, **kwargs):
         """
         Create a closure around the system environment.
 
@@ -1293,6 +1812,10 @@ class ModuleSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # pylin
         can_execute_unsafe_code - A function returning a boolean, whether or
             not to allow the execution of unsafe, unsandboxed code.
 
+        get_python_lib_zip - A function returning a bytestring or None.  The
+            bytestring is the contents of a zip file that should be importable
+            by other Python code running in the module.
+
         error_descriptor_class - The class to use to render XModules with errors
 
         get_real_user - function that takes `anonymous_student_id` and returns real user_id,
@@ -1309,7 +1832,9 @@ class ModuleSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # pylin
 
         # Usage_store is unused, and field_data is often supplanted with an
         # explicit field_data during construct_xblock.
-        super(ModuleSystem, self).__init__(id_reader=OpaqueKeyReader(), field_data=field_data, **kwargs)
+        kwargs.setdefault('id_reader', getattr(descriptor_runtime, 'id_reader', OpaqueKeyReader()))
+        kwargs.setdefault('id_generator', getattr(descriptor_runtime, 'id_generator', AsideKeyGenerator()))
+        super(ModuleSystem, self).__init__(field_data=field_data, **kwargs)
 
         self.STATIC_URL = static_url
         self.xqueue = xqueue
@@ -1329,11 +1854,9 @@ class ModuleSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # pylin
         if publish:
             self.publish = publish
 
-        self.open_ended_grading_interface = open_ended_grading_interface
-        self.s3_interface = s3_interface
-
         self.cache = cache or DoNothingCache()
         self.can_execute_unsafe_code = can_execute_unsafe_code or (lambda: False)
+        self.get_python_lib_zip = get_python_lib_zip or (lambda: None)
         self.replace_course_urls = replace_course_urls
         self.replace_jump_to_id_urls = replace_jump_to_id_urls
         self.error_descriptor_class = error_descriptor_class
@@ -1346,6 +1869,9 @@ class ModuleSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # pylin
         self.descriptor_runtime = descriptor_runtime
         self.rebind_noauth_module_to_user = rebind_noauth_module_to_user
 
+        if user:
+            self.user_id = user.id
+
     def get(self, attr):
         """	provide uniform access to attributes (like etree)."""
         return self.__dict__.get(attr)
@@ -1355,10 +1881,12 @@ class ModuleSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # pylin
         self.__dict__[attr] = val
 
     def __repr__(self):
-        return repr(self.__dict__)
+        kwargs = self.__dict__.copy()
 
-    def __str__(self):
-        return str(self.__dict__)
+        # Remove value set transiently by XBlock
+        kwargs.pop('_view_name')
+
+        return "{}{}".format(self.__class__.__name__, kwargs)
 
     @property
     def ajax_url(self):
@@ -1368,14 +1896,157 @@ class ModuleSystem(MetricsMixin, ConfigurableFragmentWrapper, Runtime):  # pylin
         assert self.xmodule_instance is not None
         return self.handler_url(self.xmodule_instance, 'xmodule_handler', '', '').rstrip('/?')
 
-    def get_block(self, block_id):
-        return self.get_module(self.descriptor_runtime.get_block(block_id))
+    def get_block(self, block_id, for_parent=None):
+        return self.get_module(self.descriptor_runtime.get_block(block_id, for_parent=for_parent))
 
     def resource_url(self, resource):
         raise NotImplementedError("edX Platform doesn't currently implement XBlock resource urls")
 
     def publish(self, block, event_type, event):
         pass
+
+    def service(self, block, service_name):
+        """
+        Runtime-specific override for the XBlock service manager.  If a service is not currently
+        instantiated and is declared as a critical requirement, an attempt is made to load the
+        module.
+
+        Arguments:
+            block (an XBlock): this block's class will be examined for service
+                decorators.
+            service_name (string): the name of the service requested.
+
+        Returns:
+            An object implementing the requested service, or None.
+        """
+        # getting the service from parent module. making sure of block service declarations.
+        service = super(ModuleSystem, self).service(block=block, service_name=service_name)
+        # Passing the block to service if it is callable e.g. ModuleI18nService. It is the responsibility of calling
+        # service to handle the passing argument.
+        if callable(service):
+            return service(block)
+        return service
+
+
+class CombinedSystem(object):
+    """
+    This class is a shim to allow both pure XBlocks and XModuleDescriptors
+    that have been bound as XModules to access both the attributes of ModuleSystem
+    and of DescriptorSystem as a single runtime.
+    """
+
+    __slots__ = ('_module_system', '_descriptor_system')
+
+    # This system doesn't override a number of methods that are provided by ModuleSystem and DescriptorSystem,
+    # namely handler_url, local_resource_url, query, and resource_url.
+    #
+    # At runtime, the ModuleSystem and/or DescriptorSystem will define those methods
+    #
+    def __init__(self, module_system, descriptor_system):
+        # These attributes are set directly to __dict__ below to avoid a recursion in getattr/setattr.
+        self._module_system = module_system
+        self._descriptor_system = descriptor_system
+
+    def _get_student_block(self, block):
+        """
+        If block is an XModuleDescriptor that has been bound to a student, return
+        the corresponding XModule, instead of the XModuleDescriptor.
+
+        Otherwise, return block.
+        """
+        if isinstance(block, XModuleDescriptor) and block.xmodule_runtime:
+            return block._xmodule  # pylint: disable=protected-access
+        else:
+            return block
+
+    def render(self, block, view_name, context=None):
+        """
+        Render a block by invoking its view.
+
+        Finds the view named `view_name` on `block`.  The default view will be
+        used if a specific view hasn't be registered.  If there is no default
+        view, an exception will be raised.
+
+        The view is invoked, passing it `context`.  The value returned by the
+        view is returned, with possible modifications by the runtime to
+        integrate it into a larger whole.
+
+        """
+        context = context or {}
+        if view_name in PREVIEW_VIEWS:
+            block = self._get_student_block(block)
+
+        return self.__getattr__('render')(block, view_name, context)
+
+    def service(self, block, service_name):
+        """Return a service, or None.
+
+        Services are objects implementing arbitrary other interfaces.  They are
+        requested by agreed-upon names, see [XXX TODO] for a list of possible
+        services.  The object returned depends on the service requested.
+
+        XBlocks must announce their intention to request services with the
+        `XBlock.needs` or `XBlock.wants` decorators.  Use `needs` if you assume
+        that the service is available, or `wants` if your code is flexible and
+        can accept a None from this method.
+
+        Runtimes can override this method if they have different techniques for
+        finding and delivering services.
+
+        Arguments:
+            block (an XBlock): this block's class will be examined for service
+                decorators.
+            service_name (string): the name of the service requested.
+
+        Returns:
+            An object implementing the requested service, or None.
+
+        """
+        service = None
+
+        if self._module_system:
+            service = self._module_system.service(block, service_name)
+
+        if service is None:
+            service = self._descriptor_system.service(block, service_name)
+
+        return service
+
+    def __getattr__(self, name):
+        """
+        If the ModuleSystem doesn't have an attribute, try returning the same attribute from the
+        DescriptorSystem, instead. This allows XModuleDescriptors that are bound as XModules
+        to still function as XModuleDescriptors.
+        """
+        # First we try a lookup in the module system...
+        try:
+            return getattr(self._module_system, name)
+        except AttributeError:
+            return getattr(self._descriptor_system, name)
+
+    def __setattr__(self, name, value):
+        """
+        If the ModuleSystem is set, set the attr on it.
+        Always set the attr on the DescriptorSystem.
+        """
+        if name in self.__slots__:
+            return super(CombinedSystem, self).__setattr__(name, value)
+
+        if self._module_system:
+            setattr(self._module_system, name, value)
+        setattr(self._descriptor_system, name, value)
+
+    def __delattr__(self, name):
+        """
+        If the ModuleSystem is set, delete the attribute from it.
+        Always delete the attribute from the DescriptorSystem.
+        """
+        if self._module_system:
+            delattr(self._module_system, name)
+        delattr(self._descriptor_system, name)
+
+    def __repr__(self):
+        return "CombinedSystem({!r}, {!r})".format(self._module_system, self._descriptor_system)
 
 
 class DoNothingCache(object):

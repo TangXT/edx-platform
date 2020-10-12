@@ -1,27 +1,30 @@
 """
  Test contentstore.mongo functionality
 """
+
+
 import logging
-from uuid import uuid4
-import unittest
 import mimetypes
-from tempfile import mkdtemp
-import path
 import shutil
+import unittest
+from tempfile import mkdtemp
+from uuid import uuid4
 
-from opaque_keys.edx.locations import SlashSeparatedCourseKey, AssetLocation
-from xmodule.tests import DATA_DIR
-from xmodule.contentstore.mongo import MongoContentStore
-from xmodule.contentstore.content import StaticContent
-from xmodule.exceptions import NotFoundError
 import ddt
-from __builtin__ import delattr
+import path
+from opaque_keys.edx.keys import AssetKey
+from opaque_keys.edx.locator import AssetLocator, CourseLocator
 
+from xmodule.contentstore.content import StaticContent
+from xmodule.contentstore.mongo import MongoContentStore
+from xmodule.exceptions import NotFoundError
+from xmodule.modulestore.tests.mongo_connection import MONGO_HOST, MONGO_PORT_NUM
+from xmodule.tests import DATA_DIR
 
 log = logging.getLogger(__name__)
 
-HOST = 'localhost'
-PORT = 27017
+HOST = MONGO_HOST
+PORT = MONGO_PORT_NUM
 DB = 'test_mongo_%s' % uuid4().hex[:5]
 
 
@@ -41,13 +44,13 @@ class TestContentstore(unittest.TestCase):
         Restores deprecated values
         """
         if cls.asset_deprecated is not None:
-            setattr(AssetLocation, 'deprecated', cls.asset_deprecated)
+            AssetLocator.deprecated = cls.asset_deprecated
         else:
-            delattr(AssetLocation, 'deprecated')
+            del AssetLocator.deprecated
         if cls.ssck_deprecated is not None:
-            setattr(SlashSeparatedCourseKey, 'deprecated', cls.ssck_deprecated)
+            CourseLocator.deprecated = cls.ssck_deprecated
         else:
-            delattr(SlashSeparatedCourseKey, 'deprecated')
+            del CourseLocator.deprecated
         return super(TestContentstore, cls).tearDownClass()
 
     def set_up_assets(self, deprecated):
@@ -59,11 +62,11 @@ class TestContentstore(unittest.TestCase):
         self.contentstore = MongoContentStore(HOST, DB, port=PORT)
         self.addCleanup(self.contentstore._drop_database)  # pylint: disable=protected-access
 
-        setattr(AssetLocation, 'deprecated', deprecated)
-        setattr(SlashSeparatedCourseKey, 'deprecated', deprecated)
+        AssetLocator.deprecated = deprecated
+        CourseLocator.deprecated = deprecated
 
-        self.course1_key = SlashSeparatedCourseKey('test', 'asset_test', '2014_07')
-        self.course2_key = SlashSeparatedCourseKey('test', 'asset_test2', '2014_07')
+        self.course1_key = CourseLocator('test', 'asset_test', '2014_07')
+        self.course2_key = CourseLocator('test', 'asset_test2', '2014_07')
 
         self.course1_files = ['contains.sh', 'picture1.jpg', 'picture2.jpg']
         self.course2_files = ['picture1.jpg', 'picture3.jpg', 'door_2.ogg']
@@ -129,18 +132,18 @@ class TestContentstore(unittest.TestCase):
         Test export
         """
         self.set_up_assets(deprecated)
-        root_dir = path.path(mkdtemp())
+        root_dir = path.Path(mkdtemp())
         try:
             self.contentstore.export_all_for_course(
                 self.course1_key, root_dir,
-                path.path(root_dir / "policy.json"),
+                path.Path(root_dir / "policy.json"),
             )
             for filename in self.course1_files:
-                filepath = path.path(root_dir / filename)
+                filepath = path.Path(root_dir / filename)
                 self.assertTrue(filepath.isfile(), "{} is not a file".format(filepath))
             for filename in self.course2_files:
                 if filename not in self.course1_files:
-                    filepath = path.path(root_dir / filename)
+                    filepath = path.Path(root_dir / filename)
                     self.assertFalse(filepath.isfile(), "{} is unexpected exported a file".format(filepath))
         finally:
             shutil.rmtree(root_dir)
@@ -154,13 +157,13 @@ class TestContentstore(unittest.TestCase):
         course1_assets, count = self.contentstore.get_all_content_for_course(self.course1_key)
         self.assertEqual(count, len(self.course1_files), course1_assets)
         for asset in course1_assets:
-            parsed = AssetLocation.from_deprecated_string(asset['filename'])
-            self.assertIn(parsed.name, self.course1_files)
+            parsed = AssetKey.from_string(asset['filename'])
+            self.assertIn(parsed.block_id, self.course1_files)
 
         course1_assets, __ = self.contentstore.get_all_content_for_course(self.course1_key, 1, 1)
         self.assertEqual(len(course1_assets), 1, course1_assets)
 
-        fake_course = SlashSeparatedCourseKey('test', 'fake', 'non')
+        fake_course = CourseLocator('test', 'fake', 'non')
         course_assets, count = self.contentstore.get_all_content_for_course(fake_course)
         self.assertEqual(count, 0)
         self.assertEqual(course_assets, [])
@@ -183,7 +186,7 @@ class TestContentstore(unittest.TestCase):
         copy_all_course_assets
         """
         self.set_up_assets(deprecated)
-        dest_course = SlashSeparatedCourseKey('test', 'destination', 'copy')
+        dest_course = CourseLocator('test', 'destination', 'copy')
         self.contentstore.copy_all_course_assets(self.course1_key, dest_course)
         for filename in self.course1_files:
             asset_key = self.course1_key.make_asset_key('asset', filename)
@@ -195,6 +198,18 @@ class TestContentstore(unittest.TestCase):
 
         __, count = self.contentstore.get_all_content_for_course(dest_course)
         self.assertEqual(count, len(self.course1_files))
+
+    @ddt.data(True, False)
+    def test_copy_assets_with_duplicates(self, deprecated):
+        """
+        Copy all assets even if the destination has some duplicate assets
+        """
+        self.set_up_assets(deprecated)
+        dest_course = self.course2_key
+        self.contentstore.copy_all_course_assets(self.course1_key, dest_course)
+
+        __, count = self.contentstore.get_all_content_for_course(dest_course)
+        self.assertEqual(count, 5)
 
     @ddt.data(True, False)
     def test_delete_assets(self, deprecated):

@@ -2,10 +2,14 @@
 Annotations Tool Mixin
 This file contains global variables and functions used in the various Annotation Tools.
 """
+
+
+from os.path import basename, splitext
+
 from lxml import etree
-from urlparse import urlparse
-from os.path import splitext, basename
-from HTMLParser import HTMLParser
+from six.moves.html_parser import HTMLParser
+from six.moves.urllib.parse import urlparse
+
 
 def get_instructions(xmltree):
     """ Removes <instructions> from the xmltree and returns them as a string, otherwise None. """

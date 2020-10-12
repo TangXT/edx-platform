@@ -8,39 +8,50 @@ of a student over a period of time. Right now, the only models are the abstract
 `SoftwareSecurePhotoVerification`. The hope is to keep as much of the
 photo verification process as generic as possible.
 """
-from datetime import datetime, timedelta
-from email.utils import formatdate
+
+import base64
+import codecs
 import functools
 import json
 import logging
+import os.path
 import uuid
+from datetime import timedelta
+from email.utils import formatdate
 
-from boto.s3.connection import S3Connection
-from boto.s3.key import Key
-import pytz
 import requests
-
+import six
+from config_models.models import ConfigurationModel
 from django.conf import settings
-from django.core.urlresolvers import reverse
-from django.db import models
 from django.contrib.auth.models import User
-from django.utils.translation import ugettext as _
-from model_utils.models import StatusModel
+from django.core.files.base import ContentFile
+from django.db import models, transaction
+from django.urls import reverse
+from django.utils.encoding import python_2_unicode_compatible
+from django.utils.functional import cached_property
+from django.utils.timezone import now
+from django.utils.translation import ugettext_lazy
 from model_utils import Choices
+from model_utils.models import StatusModel, TimeStampedModel
+from opaque_keys.edx.django.models import CourseKeyField
 
-from verify_student.ssencrypt import (
-    random_aes_key, encrypt_and_encode,
-    generate_signed_message, rsa_encrypt
+from lms.djangoapps.verify_student.ssencrypt import (
+    encrypt_and_encode,
+    generate_signed_message,
+    random_aes_key,
+    rsa_encrypt
 )
+from openedx.core.djangoapps.signals.signals import LEARNER_NOW_VERIFIED
+from openedx.core.storage import get_storage
 
-from reverification.models import MidcourseReverificationWindow
+from .utils import auto_verify_for_testing_enabled, earliest_allowed_verification_date, submit_request_to_ss
 
 log = logging.getLogger(__name__)
 
 
-def generateUUID():  # pylint: disable=C0103
+def generateUUID():  # pylint: disable=invalid-name
     """ Utility function; generates UUIDs """
-    return str(uuid.uuid4())
+    return six.text_type(uuid.uuid4())
 
 
 class VerificationException(Exception):
@@ -80,7 +91,162 @@ def status_before_must_be(*valid_start_statuses):
     return decorator_func
 
 
-class PhotoVerification(StatusModel):
+class IDVerificationAttempt(StatusModel):
+    """
+    Each IDVerificationAttempt represents a Student's attempt to establish
+    their identity through one of several methods that inherit from this Model,
+    including PhotoVerification and SSOVerification.
+
+    .. pii: The User's name is stored in this and sub-models
+    .. pii_types: name
+    .. pii_retirement: retained
+    """
+    STATUS = Choices(u'created', u'ready', u'submitted', u'must_retry', u'approved', u'denied')
+    user = models.ForeignKey(User, db_index=True, on_delete=models.CASCADE)
+
+    # They can change their name later on, so we want to copy the value here so
+    # we always preserve what it was at the time they requested. We only copy
+    # this value during the mark_ready() step. Prior to that, you should be
+    # displaying the user's name from their user.profile.name.
+    name = models.CharField(blank=True, max_length=255)
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
+
+    class Meta(object):
+        app_label = "verify_student"
+        abstract = True
+        ordering = ['-created_at']
+
+    @property
+    def expiration_datetime(self):
+        """Datetime that the verification will expire. """
+        days_good_for = settings.VERIFY_STUDENT["DAYS_GOOD_FOR"]
+        return self.created_at + timedelta(days=days_good_for)
+
+    def should_display_status_to_user(self):
+        """Whether or not the status from this attempt should be displayed to the user."""
+        raise NotImplementedError
+
+    def active_at_datetime(self, deadline):
+        """Check whether the verification was active at a particular datetime.
+
+        Arguments:
+            deadline (datetime): The date at which the verification was active
+                (created before and expiration datetime is after today).
+
+        Returns:
+            bool
+
+        """
+        return (
+            self.created_at < deadline and
+            self.expiration_datetime > now()
+        )
+
+
+@python_2_unicode_compatible
+class ManualVerification(IDVerificationAttempt):
+    """
+    Each ManualVerification represents a user's verification that bypasses the need for
+    any other verification.
+
+    .. pii: The User's name is stored in the parent model
+    .. pii_types: name
+    .. pii_retirement: retained
+    """
+
+    reason = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text=(
+            u'Specifies the reason for manual verification of the user.'
+        )
+    )
+
+    class Meta(object):
+        app_label = 'verify_student'
+
+    def __str__(self):
+        return 'ManualIDVerification for {name}, status: {status}'.format(
+            name=self.name,
+            status=self.status,
+        )
+
+    def should_display_status_to_user(self):
+        """
+        Whether or not the status should be displayed to the user.
+        """
+        return False
+
+
+@python_2_unicode_compatible
+class SSOVerification(IDVerificationAttempt):
+    """
+    Each SSOVerification represents a Student's attempt to establish their identity
+    by signing in with SSO. ID verification through SSO bypasses the need for
+    photo verification.
+
+    .. no_pii:
+    """
+
+    OAUTH2 = u'third_party_auth.models.OAuth2ProviderConfig'
+    SAML = u'third_party_auth.models.SAMLProviderConfig'
+    LTI = u'third_party_auth.models.LTIProviderConfig'
+    IDENTITY_PROVIDER_TYPE_CHOICES = (
+        (OAUTH2, u'OAuth2 Provider'),
+        (SAML, u'SAML Provider'),
+        (LTI, u'LTI Provider'),
+    )
+
+    identity_provider_type = models.CharField(
+        max_length=100,
+        blank=False,
+        choices=IDENTITY_PROVIDER_TYPE_CHOICES,
+        default=SAML,
+        help_text=(
+            u'Specifies which type of Identity Provider this verification originated from.'
+        )
+    )
+
+    identity_provider_slug = models.SlugField(
+        max_length=30, db_index=True, default=u'default',
+        help_text=(
+            u'The slug uniquely identifying the Identity Provider this verification originated from.'
+        ))
+
+    class Meta(object):
+        app_label = "verify_student"
+
+    def __str__(self):
+        return 'SSOIDVerification for {name}, status: {status}'.format(
+            name=self.name,
+            status=self.status,
+        )
+
+    def should_display_status_to_user(self):
+        """Whether or not the status from this attempt should be displayed to the user."""
+        return False
+
+    def send_approval_signal(self, approved_by='None'):
+        """
+        Send a signal indicating that this verification was approved.
+        """
+        log.info(u"Verification for user '{user_id}' approved by '{reviewer}' SSO.".format(
+            user_id=self.user, reviewer=approved_by
+        ))
+
+        # Emit signal to find and generate eligible certificates
+        LEARNER_NOW_VERIFIED.send_robust(
+            sender=SSOVerification,
+            user=self.user
+        )
+
+        message = u'LEARNER_NOW_VERIFIED signal fired for {user} from SSOVerification'
+        log.info(message.format(user=self.user.username))
+
+
+class PhotoVerification(IDVerificationAttempt):
     """
     Each PhotoVerification represents a Student's attempt to establish
     their identity by uploading a photo of themselves and a picture ID. An
@@ -114,23 +280,19 @@ class PhotoVerification(StatusModel):
         student cannot re-open this attempt -- they have to create another
         attempt and submit it instead.
 
-    Because this Model inherits from StatusModel, we can also do things like::
+    Because this Model inherits from IDVerificationAttempt, which inherits
+    from StatusModel, we can also do things like:
 
         attempt.status == PhotoVerification.STATUS.created
         attempt.status == "created"
         pending_requests = PhotoVerification.submitted.all()
+
+    .. pii: The User's name is stored in the parent model, this one stores links to face and photo ID images
+    .. pii_types: name, image
+    .. pii_retirement: retained
     """
     ######################## Fields Set During Creation ########################
     # See class docstring for description of status states
-    STATUS = Choices('created', 'ready', 'submitted', 'must_retry', 'approved', 'denied')
-    user = models.ForeignKey(User, db_index=True)
-
-    # They can change their name later on, so we want to copy the value here so
-    # we always preserve what it was at the time they requested. We only copy
-    # this value during the mark_ready() step. Prior to that, you should be
-    # displaying the user's name from their user.profile.name.
-    name = models.CharField(blank=True, max_length=255)
-
     # Where we place the uploaded image files (e.g. S3 URLs)
     face_image_url = models.URLField(blank=True, max_length=255)
     photo_id_image_url = models.URLField(blank=True, max_length=255)
@@ -140,16 +302,14 @@ class PhotoVerification(StatusModel):
     # user IDs or something too easily guessable.
     receipt_id = models.CharField(
         db_index=True,
-        default=lambda: generateUUID(),
+        default=generateUUID,
         max_length=255,
     )
-
-    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
-    updated_at = models.DateTimeField(auto_now=True, db_index=True)
 
     # Indicates whether or not a user wants to see the verification status
     # displayed on their dash.  Right now, only relevant for allowing students
     # to "dismiss" a failed midcourse reverification message
+    # TODO: This field is deprecated.
     display = models.BooleanField(db_index=True, default=True)
 
     ######################## Fields Set When Submitting ########################
@@ -162,7 +322,8 @@ class PhotoVerification(StatusModel):
         db_index=True,
         default=None,
         null=True,
-        related_name="photo_verifications_reviewed"
+        related_name="photo_verifications_reviewed",
+        on_delete=models.CASCADE,
     )
 
     # Mark the name of the service used to evaluate this attempt (e.g
@@ -173,143 +334,14 @@ class PhotoVerification(StatusModel):
     error_msg = models.TextField(blank=True)
 
     # Non-required field. External services can add any arbitrary codes as time
-    # goes on. We don't try to define an exhuastive list -- this is just
+    # goes on. We don't try to define an exhaustive list -- this is just
     # capturing it so that we can later query for the common problems.
     error_code = models.CharField(blank=True, max_length=50)
 
-    class Meta:
+    class Meta(object):
+        app_label = "verify_student"
         abstract = True
         ordering = ['-created_at']
-
-    ##### Methods listed in the order you'd typically call them
-    @classmethod
-    def _earliest_allowed_date(cls):
-        """
-        Returns the earliest allowed date given the settings
-
-        """
-        DAYS_GOOD_FOR = settings.VERIFY_STUDENT["DAYS_GOOD_FOR"]
-        allowed_date = (
-            datetime.now(pytz.UTC) - timedelta(days=DAYS_GOOD_FOR)
-        )
-        return allowed_date
-
-    @classmethod
-    def user_is_verified(cls, user, earliest_allowed_date=None, window=None):
-        """
-        Return whether or not a user has satisfactorily proved their identity.
-        Depending on the policy, this can expire after some period of time, so
-        a user might have to renew periodically.
-
-        If window=None, then this will check for the user's *initial* verification.
-        If window is set to anything else, it will check for the reverification
-        associated with that window.
-        """
-        return cls.objects.filter(
-            user=user,
-            status="approved",
-            created_at__gte=(earliest_allowed_date
-                             or cls._earliest_allowed_date()),
-            window=window
-        ).exists()
-
-    @classmethod
-    def user_has_valid_or_pending(cls, user, earliest_allowed_date=None, window=None):
-        """
-        Return whether the user has a complete verification attempt that is or
-        *might* be good. This means that it's approved, been submitted, or would
-        have been submitted but had an non-user error when it was being
-        submitted. It's basically any situation in which the user has signed off
-        on the contents of the attempt, and we have not yet received a denial.
-
-        If window=None, this will check for the user's *initial* verification.  If
-        window is anything else, this will check for the reverification associated
-        with that window.
-        """
-        valid_statuses = ['submitted', 'approved']
-        if not window:
-            valid_statuses.append('must_retry')
-        return cls.objects.filter(
-            user=user,
-            status__in=valid_statuses,
-            created_at__gte=(earliest_allowed_date
-                             or cls._earliest_allowed_date()),
-            window=window,
-        ).exists()
-
-    @classmethod
-    def active_for_user(cls, user, window=None):
-        """
-        Return the most recent PhotoVerification that is marked ready (i.e. the
-        user has said they're set, but we haven't submitted anything yet).
-
-        If window=None, this checks for the original verification.  If window is set to
-        anything else, this will check for the reverification associated with that window.
-        """
-        # This should only be one at the most, but just in case we create more
-        # by mistake, we'll grab the most recently created one.
-        active_attempts = cls.objects.filter(user=user, status='ready', window=window).order_by('-created_at')
-        if active_attempts:
-            return active_attempts[0]
-        else:
-            return None
-
-    @classmethod
-    def user_status(cls, user, window=None):
-        """
-        Returns the status of the user based on their past verification attempts
-
-        If no such verification exists, returns 'none'
-        If verification has expired, returns 'expired'
-        If the verification has been approved, returns 'approved'
-        If the verification process is still ongoing, returns 'pending'
-        If the verification has been denied and the user must resubmit photos, returns 'must_reverify'
-
-        If window=None, this checks initial verifications
-        If window is set, this checks for the reverification associated with that window
-        """
-        status = 'none'
-        error_msg = ''
-
-        if cls.user_is_verified(user, window=window):
-            status = 'approved'
-
-        elif cls.user_has_valid_or_pending(user, window=window):
-            # user_has_valid_or_pending does include 'approved', but if we are
-            # here, we know that the attempt is still pending
-            status = 'pending'
-
-        else:
-            # we need to check the most recent attempt to see if we need to ask them to do
-            # a retry
-            try:
-                attempts = cls.objects.filter(user=user, window=window).order_by('-updated_at')
-                attempt = attempts[0]
-            except IndexError:
-
-                # If no verification exists for a *midcourse* reverification, then that just
-                # means the student still needs to reverify.  For *original* verifications,
-                # we return 'none'
-                if(window):
-                    return('must_reverify', error_msg)
-                else:
-                    return ('none', error_msg)
-
-            if attempt.created_at < cls._earliest_allowed_date():
-                return ('expired', error_msg)
-
-            # If someone is denied their original verification attempt, they can try to reverify.
-            # However, if a midcourse reverification is denied, that denial is permanent.
-            if attempt.status == 'denied':
-                if window is None:
-                    status = 'must_reverify'
-                else:
-                    status = 'denied'
-            if attempt.error_msg:
-                error_msg = attempt.parsed_error_msg()
-
-        return (status, error_msg)
-
 
     def parsed_error_msg(self):
         """
@@ -359,7 +391,7 @@ class PhotoVerification(StatusModel):
         # student dashboard. But at this point, we lock the value into the
         # attempt.
         self.name = self.user.profile.name
-        self.status = "ready"
+        self.status = self.STATUS.ready
         self.save()
 
     @status_before_must_be("must_retry", "submitted", "approved", "denied")
@@ -389,17 +421,73 @@ class PhotoVerification(StatusModel):
             of `reviewed_by_user_id` and `reviewed_by_service` will be changed
             to whoever is doing the approving, and `error_msg` will be reset.
             The only record that this record was ever denied would be in our
-            logs. This should be a relatively rare occurence.
+            logs. This should be a relatively rare occurrence.
         """
         # If someone approves an outdated version of this, the first one wins
-        if self.status == "approved":
+        if self.status == self.STATUS.approved:
             return
 
+        log.info(u"Verification for user '{user_id}' approved by '{reviewer}'.".format(
+            user_id=self.user, reviewer=user_id
+        ))
         self.error_msg = ""  # reset, in case this attempt was denied before
         self.error_code = ""  # reset, in case this attempt was denied before
         self.reviewing_user = user_id
         self.reviewing_service = service
-        self.status = "approved"
+        self.status = self.STATUS.approved
+        self.save()
+        # Emit signal to find and generate eligible certificates
+        LEARNER_NOW_VERIFIED.send_robust(
+            sender=PhotoVerification,
+            user=self.user
+        )
+
+        message = u'LEARNER_NOW_VERIFIED signal fired for {user} from PhotoVerification'
+        log.info(message.format(user=self.user.username))
+
+    @status_before_must_be("ready", "must_retry")
+    def mark_submit(self):
+        """
+        Submit this attempt.
+        Valid attempt statuses when calling this method:
+            `ready`, `must_retry`
+
+        Status after method completes: `submitted`
+
+        State Transitions:
+
+            → → → `must_retry`
+            ↑        ↑ ↓
+         `ready` → `submitted`
+        """
+        self.submitted_at = now()
+        self.status = self.STATUS.submitted
+        self.save()
+
+    @status_before_must_be("ready", "must_retry", "submitted")
+    def mark_must_retry(self, error=""):
+        """
+        Set the attempt status to `must_retry`.
+        Mark that this attempt could not be completed because of a system error.
+        Status should be moved to `must_retry`. For example, if Software Secure
+        service is down and we couldn't process the request even after retrying.
+
+        Valid attempt statuses when calling this method:
+            `ready`, `submitted`
+
+        Status after method completes: `must_retry`
+
+        State Transitions:
+
+            → → → `must_retry`
+            ↑        ↑ ↓
+          `ready` → `submitted`
+        """
+        if self.status == self.STATUS.must_retry:
+            return
+
+        self.status = self.STATUS.must_retry
+        self.error_msg = error
         self.save()
 
     @status_before_must_be("must_retry", "submitted", "approved", "denied")
@@ -432,17 +520,20 @@ class PhotoVerification(StatusModel):
             previous values of `reviewed_by_user_id` and `reviewed_by_service`
             will be changed to whoever is doing the denying. The only record
             that this record was ever approved would be in our logs. This should
-            be a relatively rare occurence.
+            be a relatively rare occurrence.
         `denied` → `denied`
             Update the error message and reviewing_user/reviewing_service. Just
             lets you amend the error message in case there were additional
             details to be made.
         """
+        log.info(u"Verification for user '{user_id}' denied by '{reviewer}'.".format(
+            user_id=self.user, reviewer=reviewing_user
+        ))
         self.error_msg = error_msg
         self.error_code = error_code
         self.reviewing_user = reviewing_user
         self.reviewing_service = reviewing_service
-        self.status = "denied"
+        self.status = self.STATUS.denied
         self.save()
 
     @status_before_must_be("must_retry", "submitted", "approved", "denied")
@@ -457,37 +548,39 @@ class PhotoVerification(StatusModel):
         reported to us that they couldn't process our submission because they
         couldn't decrypt the image we sent.
         """
-        if self.status in ["approved", "denied"]:
+        if self.status in [self.STATUS.approved, self.STATUS.denied]:
             return  # If we were already approved or denied, just leave it.
 
         self.error_msg = error_msg
         self.error_code = error_code
         self.reviewing_user = reviewing_user
         self.reviewing_service = reviewing_service
-        self.status = "must_retry"
+        self.status = self.STATUS.must_retry
         self.save()
 
     @classmethod
-    def display_off(cls, user_id):
+    def retire_user(cls, user_id):
         """
-        Find all failed PhotoVerifications for a user, and sets those verifications' `display`
-        property to false, so the notification banner can be switched off.
-        """
-        user = User.objects.get(id=user_id)
-        cls.objects.filter(user=user, status="denied").exclude(window=None).update(display=False)
+        Retire user as part of GDPR Phase I
+        Returns 'True' if records found
 
-    @classmethod
-    def display_status(cls, user, window):
+        :param user_id: int
+        :return: bool
         """
-        Finds the `display` property for the PhotoVerification associated with
-        (user, window). Default is True
-        """
-        attempts = cls.objects.filter(user=user, window=window).order_by('-updated_at')
         try:
-            attempt = attempts[0]
-            return attempt.display
-        except IndexError:
-            return True
+            user_obj = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return False
+
+        photo_objects = cls.objects.filter(
+            user=user_obj
+        ).update(
+            name='',
+            face_image_url='',
+            photo_id_image_url='',
+            photo_id_key=''
+        )
+        return photo_objects > 0
 
 
 class SoftwareSecurePhotoVerification(PhotoVerification):
@@ -502,24 +595,25 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
     sensitive nature of the data, the following security precautions are taken:
 
     1. The snapshot of their face is encrypted using AES-256 in CBC mode. All
-       face photos are encypted with the same key, and this key is known to
+       face photos are encrypted with the same key, and this key is known to
        both Software Secure and edx-platform.
 
     2. The snapshot of a user's photo ID is also encrypted using AES-256, but
-       the key is randomly generated using pycrypto's Random. Every verification
+       the key is randomly generated using os.urandom. Every verification
        attempt has a new key. The AES key is then encrypted using a public key
-       provided by Software Secure. We store only the RSA-encryped AES key.
+       provided by Software Secure. We store only the RSA-encrypted AES key.
        Since edx-platform does not have Software Secure's private RSA key, it
        means that we can no longer even read photo ID.
 
     3. The encrypted photos are base64 encoded and stored in an S3 bucket that
        edx-platform does not have read access to.
 
-    Note: this model handles both *inital* verifications (which you must perform
-    at the time you register for a verified cert), and *midcourse reverifications*.
-    To distinguish between the two, check the value of the property window:
-    intial verifications of a window of None, whereas midcourse reverifications
-    * must always be linked to a specific window*.
+    Note: this model handles *initial* verifications (which you must perform
+    at the time you register for a verified cert).
+
+    .. pii: The User's name is stored in the parent model, this one stores links to face and photo ID images
+    .. pii_types: name, image
+    .. pii_retirement: retained
     """
     # This is a base64.urlsafe_encode(rsa_encrypt(photo_id_aes_key), ss_pub_key)
     # So first we generate a random AES-256 key to encrypt our photo ID with.
@@ -528,50 +622,60 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
     photo_id_key = models.TextField(max_length=1024)
 
     IMAGE_LINK_DURATION = 5 * 60 * 60 * 24  # 5 days in seconds
+    copy_id_photo_from = models.ForeignKey("self", null=True, blank=True, on_delete=models.CASCADE)
 
-    window = models.ForeignKey(MidcourseReverificationWindow, db_index=True, null=True)
+    # Fields for functionality of sending email when verification expires
+    # expiry_date: The date when the SoftwareSecurePhotoVerification will expire
+    # expiry_email_date: This field is used to maintain a check for learners to which email
+    # to notify for expired verification is already sent.
+    expiry_date = models.DateTimeField(null=True, blank=True, db_index=True)
+    expiry_email_date = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    @status_before_must_be("must_retry", "submitted", "approved", "denied")
+    def approve(self, user_id=None, service=""):
+        """
+        Approve the verification attempt for user
+
+        Valid attempt statuses when calling this method:
+            `submitted`, `approved`, `denied`
+
+        After method completes:
+            status is set to `approved`
+            expiry_date is set to one year from now
+        """
+        self.expiry_date = now() + timedelta(
+            days=settings.VERIFY_STUDENT["DAYS_GOOD_FOR"]
+        )
+        super(SoftwareSecurePhotoVerification, self).approve(user_id, service)
 
     @classmethod
-    def user_is_reverified_for_all(cls, course_id, user):
-        """
-        Checks to see if the student has successfully reverified for all of the
-        mandatory re-verification windows associated with a course.
+    def get_initial_verification(cls, user, earliest_allowed_date=None):
+        """Get initial verification for a user with the 'photo_id_key'.
 
-        This is used primarily by the certificate generation code... if the user is
-        not re-verified for all windows, then they cannot receive a certificate.
-        """
-        all_windows = MidcourseReverificationWindow.objects.filter(course_id=course_id)
-        # if there are no windows for a course, then return True right off
-        if (not all_windows.exists()):
-            return True
+        Arguments:
+            user(User): user object
+            earliest_allowed_date(datetime): override expiration date for initial verification
 
-        for window in all_windows:
-            try:
-                # The status of the most recent reverification for each window must be "approved"
-                # for a student to count as completely reverified
-                attempts = cls.objects.filter(user=user, window=window).order_by('-updated_at')
-                attempt = attempts[0]
-                if attempt.status != "approved":
-                    return False
-            except Exception:  # pylint: disable=W0703
-                return False
-
-        return True
-
-    @classmethod
-    def original_verification(cls, user):
+        Return:
+            SoftwareSecurePhotoVerification (object) or None
         """
-        Returns the most current SoftwareSecurePhotoVerification object associated with the user.
-        """
-        query = cls.objects.filter(user=user, window=None).order_by('-updated_at')
-        return query[0]
+        init_verification = cls.objects.filter(
+            user=user,
+            status__in=["submitted", "approved"],
+            created_at__gte=(
+                earliest_allowed_date or earliest_allowed_verification_date()
+            )
+        ).exclude(photo_id_key='')
+
+        return init_verification.latest('created_at') if init_verification.exists() else None
 
     @status_before_must_be("created")
     def upload_face_image(self, img_data):
         """
-        Upload an image of the user's face to S3. `img_data` should be a raw
+        Upload an image of the user's face. `img_data` should be a raw
         bytestream of a PNG image. This method will take the data, encrypt it
-        using our FACE_IMAGE_AES_KEY, encode it with base64 and save it to S3.
+        using our FACE_IMAGE_AES_KEY, encode it with base64 and save it to the
+        storage backend.
 
         Yes, encoding it to base64 adds compute and disk usage without much real
         benefit, but that's what the other end of this API is expecting to get.
@@ -580,36 +684,28 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
         # developing and aren't interested in working on student identity
         # verification functionality. If you do want to work on it, you have to
         # explicitly enable these in your private settings.
-        if settings.FEATURES.get('AUTOMATIC_VERIFY_STUDENT_IDENTITY_FOR_TESTING'):
+        if auto_verify_for_testing_enabled():
             return
 
         aes_key_str = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["FACE_IMAGE_AES_KEY"]
-        aes_key = aes_key_str.decode("hex")
 
-        s3_key = self._generate_s3_key("face")
-        s3_key.set_contents_from_string(encrypt_and_encode(img_data, aes_key))
+        if six.PY3:
+            aes_key = codecs.decode(aes_key_str, "hex")
+        else:
+            aes_key = aes_key_str.decode("hex")
 
-    @status_before_must_be("created")
-    def fetch_photo_id_image(self):
-        """
-        Find the user's photo ID image, which was submitted with their original verification.
-        The image has already been encrypted and stored in s3, so we just need to find that
-        location
-        """
-        if settings.FEATURES.get('AUTOMATIC_VERIFY_STUDENT_IDENTITY_FOR_TESTING'):
-            return
-
-        self.photo_id_key = self.original_verification(self.user).photo_id_key
-        self.save()
+        path = self._get_path("face")
+        buff = ContentFile(encrypt_and_encode(img_data, aes_key))
+        self._storage.save(path, buff)
 
     @status_before_must_be("created")
     def upload_photo_id_image(self, img_data):
         """
-        Upload an the user's photo ID image to S3. `img_data` should be a raw
+        Upload an the user's photo ID image. `img_data` should be a raw
         bytestream of a PNG image. This method will take the data, encrypt it
-        using a randomly generated AES key, encode it with base64 and save it to
-        S3. The random key is also encrypted using Software Secure's public RSA
-        key and stored in our `photo_id_key` field.
+        using a randomly generated AES key, encode it with base64 and save it
+        to the storage backend. The random key is also encrypted using Software
+        Secure's public RSA key and stored in our `photo_id_key` field.
 
         Yes, encoding it to base64 adds compute and disk usage without much real
         benefit, but that's what the other end of this API is expecting to get.
@@ -618,42 +714,59 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
         # developing and aren't interested in working on student identity
         # verification functionality. If you do want to work on it, you have to
         # explicitly enable these in your private settings.
-        if settings.FEATURES.get('AUTOMATIC_VERIFY_STUDENT_IDENTITY_FOR_TESTING'):
+        if auto_verify_for_testing_enabled():
+            # fake photo id key is set only for initial verification
+            self.photo_id_key = 'fake-photo-id-key'
+            self.save()
             return
 
         aes_key = random_aes_key()
         rsa_key_str = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["RSA_PUBLIC_KEY"]
         rsa_encrypted_aes_key = rsa_encrypt(aes_key, rsa_key_str)
 
-        # Upload this to S3
-        s3_key = self._generate_s3_key("photo_id")
-        s3_key.set_contents_from_string(encrypt_and_encode(img_data, aes_key))
+        # Save this to the storage backend
+        path = self._get_path("photo_id")
+        buff = ContentFile(encrypt_and_encode(img_data, aes_key))
+        self._storage.save(path, buff)
 
         # Update our record fields
-        self.photo_id_key = rsa_encrypted_aes_key.encode('base64')
+        if six.PY3:
+            self.photo_id_key = codecs.encode(rsa_encrypted_aes_key, 'base64').decode('utf-8')
+        else:
+            self.photo_id_key = rsa_encrypted_aes_key.encode('base64')
+
         self.save()
 
     @status_before_must_be("must_retry", "ready", "submitted")
-    def submit(self):
+    def submit(self, copy_id_photo_from=None):
         """
         Submit our verification attempt to Software Secure for validation. This
-        will set our status to "submitted" if the post is successful, and
+        will set our status to "submitted", if the post is successful or will set to
         "must_retry" if the post fails.
+
+        Keyword Arguments:
+            copy_id_photo_from (SoftwareSecurePhotoVerification): If provided, re-send the ID photo
+                data from this attempt.  This is used for re-verification, in which new face photos
+                are sent with previously-submitted ID photos.
         """
-        try:
-            response = self.send_request()
-            if response.ok:
-                self.submitted_at = datetime.now(pytz.UTC)
-                self.status = "submitted"
-                self.save()
-            else:
-                self.status = "must_retry"
-                self.error_msg = response.text
-                self.save()
-        except Exception as error:
-            log.exception(error)
-            self.status = "must_retry"
-            self.save()
+        if auto_verify_for_testing_enabled():
+            self.mark_submit()
+            fake_response = requests.Response()
+            fake_response.status_code = 200
+            return fake_response
+
+        if copy_id_photo_from is not None:
+            log.info(
+                ('Software Secure attempt for user: %r and receipt ID: %r used the same photo ID data as the '
+                 'receipt with ID %r.'),
+                self.user.username,
+                self.receipt_id,
+                copy_id_photo_from.receipt_id,
+            )
+
+        transaction.on_commit(
+            lambda: submit_request_to_ss(user_verification=self, copy_id_photo_from=copy_id_photo_from)
+        )
 
     def parsed_error_msg(self):
         """
@@ -663,58 +776,98 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
 
             `[{"photoIdReasons": ["Not provided"]}]`
 
-        Returns a list of error messages
+        Returns:
+            str[]: List of error messages.
         """
-        # Translates the category names and messages into something more human readable
-        message_dict = {
-            ("photoIdReasons", "Not provided"): _("No photo ID was provided."),
-            ("photoIdReasons", "Text not clear"): _("We couldn't read your name from your photo ID image."),
-            ("generalReasons", "Name mismatch"): _("The name associated with your account and the name on your ID do not match."),
-            ("userPhotoReasons", "Image not clear"): _("The image of your face was not clear."),
-            ("userPhotoReasons", "Face out of view"): _("Your face was not visible in your self-photo"),
+        parsed_errors = []
+        error_map = {
+            'EdX name not provided': 'name_mismatch',
+            'Name mismatch': 'name_mismatch',
+            'Photo/ID Photo mismatch': 'photos_mismatched',
+            'ID name not provided': 'id_image_missing_name',
+            'Invalid Id': 'id_invalid',
+            'No text': 'id_invalid',
+            'Not provided': 'id_image_missing',
+            'Photo hidden/No photo': 'id_image_not_clear',
+            'Text not clear': 'id_image_not_clear',
+            'Face out of view': 'user_image_not_clear',
+            'Image not clear': 'user_image_not_clear',
+            'Photo not provided': 'user_image_missing',
         }
 
         try:
-            msg_json = json.loads(self.error_msg)
-            msg_dict = msg_json[0]
+            messages = set()
+            message_groups = json.loads(self.error_msg)
 
-            msg = []
-            for category in msg_dict:
-                # find the messages associated with this category
-                category_msgs = msg_dict[category]
-                for category_msg in category_msgs:
-                    msg.append(message_dict[(category, category_msg)])
-            return u", ".join(msg)
-        except (ValueError, KeyError):
-            # if we can't parse the message as JSON or the category doesn't
-            # match one of our known categories, show a generic error
-            log.error('PhotoVerification: Error parsing this error message: %s', self.error_msg)
-            return _("There was an error verifying your ID photos.")
+            for message_group in message_groups:
+                messages = messages.union(set(*six.itervalues(message_group)))
 
-    def image_url(self, name):
+            for message in messages:
+                parsed_error = error_map.get(message)
+
+                if parsed_error:
+                    parsed_errors.append(parsed_error)
+                else:
+                    log.debug(u'Ignoring photo verification error message: %s', message)
+        except Exception:  # pylint: disable=broad-except
+            log.exception(u'Failed to parse error message for SoftwareSecurePhotoVerification %d', self.pk)
+
+        return parsed_errors
+
+    def image_url(self, name, override_receipt_id=None):
         """
         We dynamically generate this, since we want it the expiration clock to
         start when the message is created, not when the record is created.
+
+        Arguments:
+            name (str): Name of the image (e.g. "photo_id" or "face")
+
+        Keyword Arguments:
+            override_receipt_id (str): If provided, use this receipt ID instead
+                of the ID for this attempt.  This is useful for reverification
+                where we need to construct a URL to a previously-submitted
+                photo ID image.
+
+        Returns:
+            string: The expiring URL for the image.
+
         """
-        s3_key = self._generate_s3_key(name)
-        return s3_key.generate_url(self.IMAGE_LINK_DURATION)
+        path = self._get_path(name, override_receipt_id=override_receipt_id)
+        return self._storage.url(path)
 
-    def _generate_s3_key(self, prefix):
+    @cached_property
+    def _storage(self):
         """
-        Generates a key for an s3 bucket location
-
-        Example: face/4dd1add9-6719-42f7-bea0-115c008c4fca
+        Return the configured django storage backend.
         """
-        conn = S3Connection(
-            settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["AWS_ACCESS_KEY"],
-            settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["AWS_SECRET_KEY"]
-        )
-        bucket = conn.get_bucket(settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["S3_BUCKET"])
+        config = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]
 
-        key = Key(bucket)
-        key.key = "{}/{}".format(prefix, self.receipt_id)
+        # Default to the S3 backend for backward compatibility
+        storage_class = config.get("STORAGE_CLASS", "storages.backends.s3boto.S3BotoStorage")
+        storage_kwargs = config.get("STORAGE_KWARGS", {})
 
-        return key
+        # Map old settings to the parameters expected by the storage backend
+        if "AWS_ACCESS_KEY" in config:
+            storage_kwargs["access_key"] = config["AWS_ACCESS_KEY"]
+        if "AWS_SECRET_KEY" in config:
+            storage_kwargs["secret_key"] = config["AWS_SECRET_KEY"]
+        if "S3_BUCKET" in config:
+            storage_kwargs["bucket"] = config["S3_BUCKET"]
+            storage_kwargs["querystring_expire"] = self.IMAGE_LINK_DURATION
+
+        return get_storage(storage_class, **storage_kwargs)
+
+    def _get_path(self, prefix, override_receipt_id=None):
+        """
+        Returns the path to a resource with this instance's `receipt_id`.
+
+        If `override_receipt_id` is given, the path to that resource will be
+        retrieved instead. This allows us to retrieve images submitted in
+        previous attempts (used for reverification, where we send a new face
+        photo with the same photo ID from a previous attempt).
+        """
+        receipt_id = self.receipt_id if override_receipt_id is None else override_receipt_id
+        return os.path.join(prefix, receipt_id)
 
     def _encrypted_user_photo_key_str(self):
         """
@@ -724,14 +877,24 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
         faces.
         """
         face_aes_key_str = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["FACE_IMAGE_AES_KEY"]
-        face_aes_key = face_aes_key_str.decode("hex")
+        face_aes_key = codecs.decode(face_aes_key_str, 'hex')
         rsa_key_str = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["RSA_PUBLIC_KEY"]
         rsa_encrypted_face_aes_key = rsa_encrypt(face_aes_key, rsa_key_str)
+        return base64.b64encode(rsa_encrypted_face_aes_key).decode('utf-8')
 
-        return rsa_encrypted_face_aes_key.encode("base64")
+    def create_request(self, copy_id_photo_from=None):
+        """
+        Construct the HTTP request to the photo verification service.
 
-    def create_request(self):
-        """return headers, body_dict"""
+        Keyword Arguments:
+            copy_id_photo_from (SoftwareSecurePhotoVerification): If provided, re-send the ID photo
+                data from this attempt.  This is used for re-verification, in which new face photos
+                are sent with previously-submitted ID photos.
+
+        Returns:
+            tuple of (header, body), where both `header` and `body` are dictionaries.
+
+        """
         access_key = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["API_ACCESS_KEY"]
         secret_key = settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["API_SECRET_KEY"]
 
@@ -740,11 +903,25 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
             scheme, settings.SITE_NAME, reverse('verify_student_results_callback')
         )
 
+        # If we're copying the photo ID image from a previous verification attempt,
+        # then we need to send the old image data with the correct image key.
+        photo_id_url = (
+            self.image_url("photo_id")
+            if copy_id_photo_from is None
+            else self.image_url("photo_id", override_receipt_id=copy_id_photo_from.receipt_id)
+        )
+
+        photo_id_key = (
+            self.photo_id_key
+            if copy_id_photo_from is None else
+            copy_id_photo_from.photo_id_key
+        )
+
         body = {
             "EdX-ID": str(self.receipt_id),
             "ExpectedName": self.name,
-            "PhotoID": self.image_url("photo_id"),
-            "PhotoIDKey": self.photo_id_key,
+            "PhotoID": photo_id_url,
+            "PhotoIDKey": photo_id_key,
             "SendResponseTo": callback_url,
             "UserPhoto": self.image_url("face"),
             "UserPhotoKey": self._encrypted_user_photo_key_str(),
@@ -771,40 +948,179 @@ class SoftwareSecurePhotoVerification(PhotoVerification):
         headers, body = self.create_request()
 
         header_txt = "\n".join(
-            "{}: {}".format(h, v) for h, v in sorted(headers.items())
+            u"{}: {}".format(h, v) for h, v in sorted(headers.items())
         )
-        body_txt = json.dumps(body, indent=2, sort_keys=True, ensure_ascii=False).encode('utf-8')
+        body_txt = json.dumps(body, indent=2, sort_keys=True, ensure_ascii=False)
 
         return header_txt + "\n\n" + body_txt
 
+    def should_display_status_to_user(self):
+        """Whether or not the status from this attempt should be displayed to the user."""
+        return True
 
-    def send_request(self):
+    @classmethod
+    def get_recent_verification(cls, user):
         """
-        Assembles a submission to Software Secure and sends it via HTTPS.
+        Return the most recent approved verification of user
 
-        Returns a request.Response() object with the reply we get from SS.
+        Keyword Arguments:
+            user (User): The user for which the most recent approved verification is fetched
+
+        Returns:
+            SoftwareSecurePhotoVerification (object) or None
         """
-        # If AUTOMATIC_VERIFY_STUDENT_IDENTITY_FOR_TESTING is True, we want to
-        # skip posting anything to Software Secure. We actually don't even
-        # create the message because that would require encryption and message
-        # signing that rely on settings.VERIFY_STUDENT values that aren't set
-        # in dev. So we just pretend like we successfully posted
-        if settings.FEATURES.get('AUTOMATIC_VERIFY_STUDENT_IDENTITY_FOR_TESTING'):
-            fake_response = requests.Response()
-            fake_response.status_code = 200
-            return fake_response
+        recent_verification = SoftwareSecurePhotoVerification.objects.filter(status='approved',
+                                                                             user_id=user.id,
+                                                                             expiry_date__isnull=False)
 
-        headers, body = self.create_request()
-        response = requests.post(
-            settings.VERIFY_STUDENT["SOFTWARE_SECURE"]["API_URL"],
-            headers=headers,
-            data=json.dumps(body, indent=2, sort_keys=True, ensure_ascii=False).encode('utf-8'),
-            verify=False
+        return recent_verification.latest('updated_at') if recent_verification.exists() else None
+
+    @classmethod
+    def update_expiry_email_date_for_user(cls, user, email_config):
+        """
+        Updates the expiry_email_date to send expiry email if the most recent approved
+        verification for the user is expired.
+
+        Keyword Arguments:
+            user (User): user object
+            email_config (dict): Contains configuration related to verification expiry email
+
+        """
+        today = now().replace(hour=0, minute=0, second=0, microsecond=0)
+        recently_expired_date = today - timedelta(days=email_config['DAYS_RANGE'])
+
+        verification = SoftwareSecurePhotoVerification.get_recent_verification(user)
+
+        if verification and verification.expiry_date < recently_expired_date and not verification.expiry_email_date:
+            expiry_email_date = today - timedelta(days=email_config['RESEND_DAYS'])
+            SoftwareSecurePhotoVerification.objects.filter(pk=verification.pk).update(
+                expiry_email_date=expiry_email_date)
+
+
+class VerificationDeadline(TimeStampedModel):
+    """
+    Represent a verification deadline for a particular course.
+
+    The verification deadline is the datetime after which
+    users are no longer allowed to submit photos for initial verification
+    in a course.
+
+    Note that this is NOT the same as the "upgrade" deadline, after
+    which a user is no longer allowed to upgrade to a verified enrollment.
+
+    If no verification deadline record exists for a course,
+    then that course does not have a deadline.  This means that users
+    can submit photos at any time.
+
+    .. no_pii:
+    """
+    class Meta(object):
+        app_label = "verify_student"
+
+    course_key = CourseKeyField(
+        max_length=255,
+        db_index=True,
+        unique=True,
+        help_text=ugettext_lazy(u"The course for which this deadline applies"),
+    )
+
+    deadline = models.DateTimeField(
+        help_text=ugettext_lazy(
+            u"The datetime after which users are no longer allowed "
+            "to submit photos for verification."
         )
-        log.debug("Sent request to Software Secure for {}".format(self.receipt_id))
-        log.debug("Headers:\n{}\n\n".format(headers))
-        log.debug("Body:\n{}\n\n".format(body))
-        log.debug("Return code: {}".format(response.status_code))
-        log.debug("Return message:\n\n{}\n\n".format(response.text))
+    )
 
-        return response
+    # The system prefers to set this automatically based on default settings. But
+    # if the field is set manually we want a way to indicate that so we don't
+    # overwrite the manual setting of the field.
+    deadline_is_explicit = models.BooleanField(default=False)
+
+    @classmethod
+    def set_deadline(cls, course_key, deadline, is_explicit=False):
+        """
+        Configure the verification deadline for a course.
+
+        If `deadline` is `None`, then the course will have no verification
+        deadline.  In this case, users will be able to verify for the course
+        at any time.
+
+        Arguments:
+            course_key (CourseKey): Identifier for the course.
+            deadline (datetime or None): The verification deadline.
+
+        """
+        if deadline is None:
+            VerificationDeadline.objects.filter(course_key=course_key).delete()
+        else:
+            record, created = VerificationDeadline.objects.get_or_create(
+                course_key=course_key,
+                defaults={"deadline": deadline, "deadline_is_explicit": is_explicit}
+            )
+
+            if not created:
+                record.deadline = deadline
+                record.deadline_is_explicit = is_explicit
+                record.save()
+
+    @classmethod
+    def deadlines_for_enrollments(cls, enrollments_qs):
+        """
+        Retrieve verification deadlines for a user's enrolled courses.
+
+        Arguments:
+            enrollments_qs: CourseEnrollment queryset. For performance reasons
+                            we want the queryset here instead of passing in a
+                            big list of course_keys in an "SELECT IN" query.
+                            If we have a queryset, Django is smart enough to do
+                            a performant subquery at the MySQL layer instead of
+                            passing down all the course_keys through Python.
+
+        Returns:
+            dict: Map of course keys to datetimes (verification deadlines)
+        """
+        verification_deadlines = VerificationDeadline.objects.filter(
+            course_key__in=enrollments_qs.values('course_id')
+        )
+        return {
+            deadline.course_key: deadline.deadline
+            for deadline in verification_deadlines
+        }
+
+    @classmethod
+    def deadline_for_course(cls, course_key):
+        """
+        Retrieve the verification deadline for a particular course.
+
+        Arguments:
+            course_key (CourseKey): The identifier for the course.
+
+        Returns:
+            datetime or None
+
+        """
+        try:
+            deadline = cls.objects.get(course_key=course_key)
+            return deadline.deadline
+        except cls.DoesNotExist:
+            return None
+
+
+class SSPVerificationRetryConfig(ConfigurationModel):  # pylint: disable=model-missing-unicode, useless-suppression
+    """
+        SSPVerificationRetryConfig used to inject arguments
+        to retry_failed_photo_verifications management command
+    """
+
+    class Meta(object):
+        app_label = 'verify_student'
+        verbose_name = 'sspv retry student argument'
+
+    arguments = models.TextField(
+        blank=True,
+        help_text='Useful for manually running a Jenkins job. Specify like --verification-ids 1 2 3',
+        default=''
+    )
+
+    def __str__(self):
+        return six.text_type(self.arguments)

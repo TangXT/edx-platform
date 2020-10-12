@@ -12,30 +12,38 @@ file and check it in at the same time as your model changes. To do that,
 ASSUMPTIONS: modules have unique IDs, even across different module_types
 
 """
-from cStringIO import StringIO
-from gzip import GzipFile
-from uuid import uuid4
+
+
+import codecs
 import csv
-import json
 import hashlib
+import json
+import logging
 import os.path
-import urllib
+from uuid import uuid4
 
-from boto.s3.connection import S3Connection
-from boto.s3.key import Key
-
+import six
+from boto.exception import BotoServerError
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.core.files.base import ContentFile
 from django.db import models, transaction
+from django.utils.encoding import python_2_unicode_compatible
+from django.utils.translation import ugettext as _
+from opaque_keys.edx.django.models import CourseKeyField
+from six import text_type
 
-from xmodule_django.models import CourseKeyField
+from openedx.core.storage import get_storage
 
+logger = logging.getLogger(__name__)
 
 # define custom states used by InstructorTask
 QUEUING = 'QUEUING'
 PROGRESS = 'PROGRESS'
+TASK_INPUT_LENGTH = 10000
 
 
+@python_2_unicode_compatible
 class InstructorTask(models.Model):
     """
     Stores information about background tasks that have been submitted to
@@ -57,15 +65,20 @@ class InstructorTask(models.Model):
     `requester` stores id of user who submitted the task
     `created` stores date that entry was first created
     `updated` stores date that entry was last modified
+
+    .. no_pii:
     """
+    class Meta(object):
+        app_label = "instructor_task"
+
     task_type = models.CharField(max_length=50, db_index=True)
     course_id = CourseKeyField(max_length=255, db_index=True)
     task_key = models.CharField(max_length=255, db_index=True)
-    task_input = models.CharField(max_length=255)
+    task_input = models.TextField()
     task_id = models.CharField(max_length=255, db_index=True)  # max_length from celery_taskmeta
     task_state = models.CharField(max_length=50, null=True, db_index=True)  # max_length from celery_taskmeta
     task_output = models.CharField(max_length=1024, null=True)
-    requester = models.ForeignKey(User, db_index=True)
+    requester = models.ForeignKey(User, db_index=True, on_delete=models.CASCADE)
     created = models.DateTimeField(auto_now_add=True, null=True)
     updated = models.DateTimeField(auto_now=True)
     subtasks = models.TextField(blank=True)  # JSON dictionary
@@ -80,31 +93,28 @@ class InstructorTask(models.Model):
             'task_output': self.task_output,
         },)
 
-    def __unicode__(self):
-        return unicode(repr(self))
+    def __str__(self):
+        return six.text_type(repr(self))
 
     @classmethod
     def create(cls, course_id, task_type, task_key, task_input, requester):
         """
         Create an instance of InstructorTask.
-
-        The InstructorTask.save_now method makes sure the InstructorTask entry is committed.
-        When called from any view that is wrapped by TransactionMiddleware,
-        and thus in a "commit-on-success" transaction, an autocommit buried within here
-        will cause any pending transaction to be committed by a successful
-        save here.  Any future database operations will take place in a
-        separate transaction.
         """
         # create the task_id here, and pass it into celery:
         task_id = str(uuid4())
-
         json_task_input = json.dumps(task_input)
 
-        # check length of task_input, and return an exception if it's too long:
-        if len(json_task_input) > 255:
-            fmt = 'Task input longer than 255: "{input}" for "{task}" of "{course}"'
-            msg = fmt.format(input=json_task_input, task=task_type, course=course_id)
-            raise ValueError(msg)
+        # check length of task_input, and return an exception if it's too long
+        if len(json_task_input) > TASK_INPUT_LENGTH:
+            logger.error(
+                u'Task input longer than: `%s` for `%s` of course: `%s`',
+                TASK_INPUT_LENGTH,
+                task_type,
+                course_id
+            )
+            error_msg = _('An error has occurred. Task was not created.')
+            raise AttributeError(error_msg)
 
         # create the task, then save it:
         instructor_task = cls(
@@ -120,17 +130,10 @@ class InstructorTask(models.Model):
 
         return instructor_task
 
-    @transaction.autocommit
+    @transaction.atomic
     def save_now(self):
         """
         Writes InstructorTask immediately, ensuring the transaction is committed.
-
-        Autocommit annotation makes sure the database entry is committed.
-        When called from any view that is wrapped by TransactionMiddleware,
-        and thus in a "commit-on-success" transaction, this autocommit here
-        will cause any pending transaction to be committed by a successful
-        save here.  Any future database operations will take place in a
-        separate transaction.
         """
         self.save()
 
@@ -145,7 +148,7 @@ class InstructorTask(models.Model):
         # will fit in the column.  In the meantime, just return an exception.
         json_output = json.dumps(returned_result)
         if len(json_output) > 1023:
-            raise ValueError("Length of task output is too long: {0}".format(json_output))
+            raise ValueError(u"Length of task output is too long: {0}".format(json_output))
         return json_output
 
     @staticmethod
@@ -160,7 +163,7 @@ class InstructorTask(models.Model):
         Truncation is indicated by adding "..." to the end of the value.
         """
         tag = '...'
-        task_progress = {'exception': type(exception).__name__, 'message': unicode(exception.message)}
+        task_progress = {'exception': type(exception).__name__, 'message': text_type(exception)}
         if traceback_string is not None:
             # truncate any traceback that goes into the InstructorTask model:
             task_progress['traceback'] = traceback_string
@@ -198,210 +201,141 @@ class ReportStore(object):
     passing in the whole dataset. Doing that for now just because it's simpler.
     """
     @classmethod
-    def from_config(cls):
+    def from_config(cls, config_name):
         """
         Return one of the ReportStore subclasses depending on django
         configuration. Look at subclasses for expected configuration.
         """
-        storage_type = settings.GRADES_DOWNLOAD.get("STORAGE_TYPE")
-        if storage_type.lower() == "s3":
-            return S3ReportStore.from_config()
-        elif storage_type.lower() == "localfs":
-            return LocalFSReportStore.from_config()
+        # Convert old configuration parameters to those expected by
+        # DjangoStorageReportStore for backward compatibility
+        config = getattr(settings, config_name, {})
+        storage_type = config.get('STORAGE_TYPE', '').lower()
+        if storage_type == 's3':
+            return DjangoStorageReportStore(
+                storage_class='storages.backends.s3boto.S3BotoStorage',
+                storage_kwargs={
+                    'bucket': config['BUCKET'],
+                    'location': config['ROOT_PATH'],
+                    'custom_domain': config.get("CUSTOM_DOMAIN", None),
+                    'querystring_expire': 300,
+                    'gzip': True,
+                },
+            )
+        elif storage_type == 'localfs':
+            return DjangoStorageReportStore(
+                storage_class='django.core.files.storage.FileSystemStorage',
+                storage_kwargs={
+                    'location': config['ROOT_PATH'],
+                },
+            )
+        return DjangoStorageReportStore.from_config(config_name)
+
+    def _get_utf8_encoded_rows(self, rows):
+        """
+        Given a list of `rows` containing unicode strings, return a
+        new list of rows with those strings encoded as utf-8 for CSV
+        compatibility.
+        """
+        for row in rows:
+            if six.PY2:
+                yield [six.text_type(item).encode('utf-8') for item in row]
+            else:
+                yield [six.text_type(item) for item in row]
 
 
-class S3ReportStore(ReportStore):
+class DjangoStorageReportStore(ReportStore):
     """
-    Reports store backed by S3. The directory structure we use to store things
-    is::
-
-        `{bucket}/{root_path}/{sha1 hash of course_id}/filename`
-
-    We might later use subdirectories or metadata to do more intelligent
-    grouping and querying, but right now it simply depends on its own
-    conventions on where files are stored to know what to display. Clients using
-    this class can name the final file whatever they want.
+    ReportStore implementation that delegates to django's storage api.
     """
-    def __init__(self, bucket_name, root_path):
-        self.root_path = root_path
-
-        conn = S3Connection(
-            settings.AWS_ACCESS_KEY_ID,
-            settings.AWS_SECRET_ACCESS_KEY
-        )
-        self.bucket = conn.get_bucket(bucket_name)
+    def __init__(self, storage_class=None, storage_kwargs=None):
+        if storage_kwargs is None:
+            storage_kwargs = {}
+        self.storage = get_storage(storage_class, **storage_kwargs)
 
     @classmethod
-    def from_config(cls):
+    def from_config(cls, config_name):
         """
-        The expected configuration for an `S3ReportStore` is to have a
-        `GRADES_DOWNLOAD` dict in settings with the following fields::
+        By default, the default file storage specified by the `DEFAULT_FILE_STORAGE`
+        setting will be used. To configure the storage used, add a dict in
+        settings with the following fields::
 
-            STORAGE_TYPE : "s3"
-            BUCKET : Your bucket name, e.g. "reports-bucket"
-            ROOT_PATH : The path you want to store all course files under. Do not
-                        use a leading or trailing slash. e.g. "staging" or
-                        "staging/2013", not "/staging", or "/staging/"
+            STORAGE_CLASS : The import path of the storage class to use. If
+                            not set, the DEFAULT_FILE_STORAGE setting will be used.
+            STORAGE_KWARGS : An optional dict of kwargs to pass to the storage
+                             constructor. This can be used to specify a
+                             different S3 bucket or root path, for example.
 
-        Since S3 access relies on boto, you must also define `AWS_ACCESS_KEY_ID`
-        and `AWS_SECRET_ACCESS_KEY` in settings.
+        Reference the setting name when calling `.from_config`.
         """
         return cls(
-            settings.GRADES_DOWNLOAD['BUCKET'],
-            settings.GRADES_DOWNLOAD['ROOT_PATH']
+            getattr(settings, config_name).get('STORAGE_CLASS'),
+            getattr(settings, config_name).get('STORAGE_KWARGS'),
         )
-
-    def key_for(self, course_id, filename):
-        """Return the S3 key we would use to store and retrieve the data for the
-        given filename."""
-        hashed_course_id = hashlib.sha1(course_id.to_deprecated_string())
-
-        key = Key(self.bucket)
-        key.key = "{}/{}/{}".format(
-            self.root_path,
-            hashed_course_id.hexdigest(),
-            filename
-        )
-
-        return key
 
     def store(self, course_id, filename, buff):
         """
         Store the contents of `buff` in a directory determined by hashing
-        `course_id`, and name the file `filename`. `buff` is typically a
-        `StringIO`, but can be anything that implements `.getvalue()`.
-
-        This method assumes that the contents of `buff` are gzip-encoded (it
-        will add the appropriate headers to S3 to make the decompression
-        transparent via the browser). Filenames should end in whatever
-        suffix makes sense for the original file, so `.txt` instead of `.gz`
+        `course_id`, and name the file `filename`. `buff` can be any file-like
+        object, ready to be read from the beginning.
         """
-        key = self.key_for(course_id, filename)
+        path = self.path_to(course_id, filename)
+        # See https://github.com/boto/boto/issues/2868
+        # Boto doesn't play nice with unicode in python3
+        if not six.PY2:
+            buff_contents = buff.read()
 
-        data = buff.getvalue()
-        key.size = len(data)
-        key.content_encoding = "gzip"
-        key.content_type = "text/csv"
+            if not isinstance(buff_contents, bytes):
+                buff_contents = buff_contents.encode('utf-8')
 
-        # Just setting the content encoding and type above should work
-        # according to the docs, but when experimenting, this was necessary for
-        # it to actually take.
-        key.set_contents_from_string(
-            data,
-            headers={
-                "Content-Encoding": "gzip",
-                "Content-Length": len(data),
-                "Content-Type": "text/csv",
-            }
-        )
+            buff = ContentFile(buff_contents)
+
+        self.storage.save(path, buff)
 
     def store_rows(self, course_id, filename, rows):
         """
-        Given a `course_id`, `filename`, and `rows` (each row is an iterable of
-        strings), create a buffer that is a gzip'd csv file, and then `store()`
-        that buffer.
-
-        Even though we store it in gzip format, browsers will transparently
-        download and decompress it. Filenames should end in `.csv`, not `.gz`.
+        Given a course_id, filename, and rows (each row is an iterable of
+        strings), write the rows to the storage backend in csv format.
         """
-        output_buffer = StringIO()
-        gzip_file = GzipFile(fileobj=output_buffer, mode="wb")
-        csv.writer(gzip_file).writerows(rows)
-        gzip_file.close()
-
+        output_buffer = ContentFile('')
+        # Adding unicode signature (BOM) for MS Excel 2013 compatibility
+        if six.PY2:
+            output_buffer.write(codecs.BOM_UTF8)
+        csvwriter = csv.writer(output_buffer)
+        csvwriter.writerows(self._get_utf8_encoded_rows(rows))
+        output_buffer.seek(0)
         self.store(course_id, filename, output_buffer)
 
     def links_for(self, course_id):
         """
-        For a given `course_id`, return a list of `(filename, url)` tuples. `url`
-        can be plugged straight into an href
+        For a given `course_id`, return a list of `(filename, url)` tuples.
+        Calls the `url` method of the underlying storage backend. Returned
+        urls can be plugged straight into an href
         """
-        course_dir = self.key_for(course_id, '')
-        return sorted(
-            [
-                (key.key.split("/")[-1], key.generate_url(expires_in=300))
-                for key in self.bucket.list(prefix=course_dir.key)
-            ],
-            reverse=True
-        )
-
-
-class LocalFSReportStore(ReportStore):
-    """
-    LocalFS implementation of a ReportStore. This is meant for debugging
-    purposes and is *absolutely not for production use*. Use S3ReportStore for
-    that. We use this in tests and for local development. When it generates
-    links, it will make file:/// style links. That means you actually have to
-    copy them and open them in a separate browser window, for security reasons.
-    This lets us do the cheap thing locally for debugging without having to open
-    up a separate URL that would only be used to send files in dev.
-    """
-    def __init__(self, root_path):
-        """
-        Initialize with root_path where we're going to store our files. We
-        will build a directory structure under this for each course.
-        """
-        self.root_path = root_path
-        if not os.path.exists(root_path):
-            os.makedirs(root_path)
-
-    @classmethod
-    def from_config(cls):
-        """
-        Generate an instance of this object from Django settings. It assumes
-        that there is a dict in settings named GRADES_DOWNLOAD and that it has
-        a ROOT_PATH that maps to an absolute file path that the web app has
-        write permissions to. `LocalFSReportStore` will create any intermediate
-        directories as needed. Example::
-
-            STORAGE_TYPE : "localfs"
-            ROOT_PATH : /tmp/edx/report-downloads/
-        """
-        return cls(settings.GRADES_DOWNLOAD['ROOT_PATH'])
-
-    def path_to(self, course_id, filename):
-        """Return the full path to a given file for a given course."""
-        return os.path.join(self.root_path, urllib.quote(course_id.to_deprecated_string(), safe=''), filename)
-
-    def store(self, course_id, filename, buff):
-        """
-        Given the `course_id` and `filename`, store the contents of `buff` in
-        that file. Overwrite anything that was there previously. `buff` is
-        assumed to be a StringIO objecd (or anything that can flush its contents
-        to string using `.getvalue()`).
-        """
-        full_path = self.path_to(course_id, filename)
-        directory = os.path.dirname(full_path)
-        if not os.path.exists(directory):
-            os.mkdir(directory)
-
-        with open(full_path, "wb") as f:
-            f.write(buff.getvalue())
-
-    def store_rows(self, course_id, filename, rows):
-        """
-        Given a course_id, filename, and rows (each row is an iterable of strings),
-        write this data out.
-        """
-        output_buffer = StringIO()
-        csv.writer(output_buffer).writerows(rows)
-        self.store(course_id, filename, output_buffer)
-
-    def links_for(self, course_id):
-        """
-        For a given `course_id`, return a list of `(filename, url)` tuples. `url`
-        can be plugged straight into an href. Note that `LocalFSReportStore`
-        will generate `file://` type URLs, so you'll need to copy the URL and
-        open it in a new browser window. Again, this class is only meant for
-        local development.
-        """
-        course_dir = self.path_to(course_id, '')
-        if not os.path.exists(course_dir):
+        course_dir = self.path_to(course_id)
+        try:
+            _, filenames = self.storage.listdir(course_dir)
+        except OSError:
+            # Django's FileSystemStorage fails with an OSError if the course
+            # dir does not exist; other storage types return an empty list.
             return []
-        return sorted(
-            [
-                (filename, ("file://" + urllib.quote(os.path.join(course_dir, filename))))
-                for filename in os.listdir(course_dir)
-            ],
-            reverse=True
-        )
+        except BotoServerError as ex:
+            logger.error(
+                u'Fetching files failed for course: %s, status: %s, reason: %s',
+                course_id,
+                ex.status,
+                ex.reason
+            )
+            return []
+        files = [(filename, os.path.join(course_dir, filename)) for filename in filenames]
+        files.sort(key=lambda f: self.storage.get_modified_time(f[1]), reverse=True)
+        return [
+            (filename, self.storage.url(full_path))
+            for filename, full_path in files
+        ]
+
+    def path_to(self, course_id, filename=''):
+        """
+        Return the full path to a given file for a given course.
+        """
+        hashed_course_id = hashlib.sha1(text_type(course_id).encode('utf-8')).hexdigest()
+        return os.path.join(hashed_course_id, filename)

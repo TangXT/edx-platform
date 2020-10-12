@@ -1,9 +1,12 @@
-from lxml import etree
+
+
 import unittest
 import xml.sax.saxutils as saxutils
 
-from . import test_capa_system
+from lxml import etree
+
 from capa import customrender
+from capa.tests.helpers import test_capa_system
 
 # just a handy shortcut
 lookup_tag = customrender.registry.get_class_for_tag
@@ -73,6 +76,5 @@ class MathRenderTest(unittest.TestCase):
         self.check_parse('$abc$', '[mathjaxinline]abc[/mathjaxinline]')
         self.check_parse('$abc', '$abc')
         self.check_parse(r'$\displaystyle 2+2$', '[mathjax] 2+2[/mathjax]')
-
 
     # NOTE: not testing get_html yet because I don't understand why it's doing what it's doing.

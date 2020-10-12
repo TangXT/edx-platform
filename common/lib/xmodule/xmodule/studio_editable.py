@@ -1,16 +1,19 @@
 """
 Mixin to support editing in Studio.
 """
-from xmodule.x_module import module_attr, STUDENT_VIEW, AUTHOR_VIEW
 
 
-class StudioEditableModule(object):
+import six
+from xmodule.x_module import AUTHOR_VIEW, STUDENT_VIEW, module_attr
+
+
+class StudioEditableBlock(object):
     """
-    Helper methods for supporting Studio editing of xmodules.
+    Helper methods for supporting Studio editing of XBlocks.
 
-    This class is only intended to be used with an XModule, as it assumes the existence of
-    self.descriptor and self.system.
+    This class is only intended to be used with an XBlock!
     """
+    has_author_view = True
 
     def render_children(self, context, fragment, can_reorder=False, can_add=False):
         """
@@ -19,19 +22,19 @@ class StudioEditableModule(object):
         """
         contents = []
 
-        for child in self.descriptor.get_children():  # pylint: disable=E1101
+        for child in self.get_children():  # pylint: disable=no-member
             if can_reorder:
                 context['reorderable_items'].add(child.location)
-            child_module = self.system.get_module(child)  # pylint: disable=E1101
-            rendered_child = child_module.render(StudioEditableModule.get_preview_view_name(child_module), context)
-            fragment.add_frag_resources(rendered_child)
+            context['can_add'] = can_add
+            rendered_child = child.render(StudioEditableModule.get_preview_view_name(child), context)
+            fragment.add_fragment_resources(rendered_child)
 
             contents.append({
-                'id': child.location.to_deprecated_string(),
+                'id': six.text_type(child.location),
                 'content': rendered_child.content
             })
 
-        fragment.add_content(self.system.render_template("studio_render_children_view.html", {  # pylint: disable=E1101
+        fragment.add_content(self.system.render_template("studio_render_children_view.html", {  # pylint: disable=no-member
             'items': contents,
             'xblock_context': context,
             'can_add': can_add,
@@ -43,7 +46,10 @@ class StudioEditableModule(object):
         """
         Helper method for getting preview view name (student_view or author_view) for a given module.
         """
-        return AUTHOR_VIEW if hasattr(block, AUTHOR_VIEW) else STUDENT_VIEW
+        return AUTHOR_VIEW if has_author_view(block) else STUDENT_VIEW
+
+
+StudioEditableModule = StudioEditableBlock
 
 
 class StudioEditableDescriptor(object):
@@ -55,3 +61,10 @@ class StudioEditableDescriptor(object):
     """
     author_view = module_attr(AUTHOR_VIEW)
     has_author_view = True
+
+
+def has_author_view(descriptor):
+    """
+    Returns True if the xmodule linked to the descriptor supports "author_view".
+    """
+    return getattr(descriptor, 'has_author_view', False)

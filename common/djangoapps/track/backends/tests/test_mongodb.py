@@ -1,19 +1,17 @@
-from __future__ import absolute_import
 
-from uuid import uuid4
-
-from mock import patch
 
 from django.test import TestCase
+from mock import patch
 
 from track.backends.mongodb import MongoBackend
 
 
 class TestMongoBackend(TestCase):
     def setUp(self):
+        super(TestMongoBackend, self).setUp()
         self.mongo_patcher = patch('track.backends.mongodb.MongoClient')
-        self.addCleanup(self.mongo_patcher.stop)
         self.mongo_patcher.start()
+        self.addCleanup(self.mongo_patcher.stop)
 
         self.backend = MongoBackend()
 

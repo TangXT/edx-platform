@@ -2,11 +2,19 @@
 Base class for pages specific to a course in Studio.
 """
 
+
+import os
+from abc import abstractmethod
+
+import six
 from bok_choy.page_object import PageObject
-from . import BASE_URL
+from opaque_keys.edx.locator import CourseLocator
+
+from common.test.acceptance.pages.studio import BASE_URL
+from common.test.acceptance.pages.studio.utils import HelpMixin
 
 
-class CoursePage(PageObject):
+class CoursePage(PageObject, HelpMixin):
     """
     Abstract base class for page objects specific to a course in Studio.
     """
@@ -14,6 +22,15 @@ class CoursePage(PageObject):
     # Overridden by subclasses to provide the relative path within the course
     # Does not need to include the leading forward or trailing slash
     url_path = ""
+
+    @abstractmethod
+    def is_browser_on_page(self):
+        """
+        Verifies browser is on the correct page.
+
+        Should be implemented in child classes.
+        """
+        pass
 
     def __init__(self, browser, course_org, course_num, course_run):
         """
@@ -34,5 +51,12 @@ class CoursePage(PageObject):
         """
         Construct a URL to the page within the course.
         """
-        course_key = "{course_org}/{course_num}/{course_run}".format(**self.course_info)
-        return "/".join([BASE_URL, self.url_path, course_key])
+        # TODO - is there a better way to make this agnostic to the underlying default module store?
+        default_store = os.environ.get('DEFAULT_STORE', 'draft')
+        course_key = CourseLocator(
+            self.course_info['course_org'],
+            self.course_info['course_num'],
+            self.course_info['course_run'],
+            deprecated=(default_store == 'draft')
+        )
+        return "/".join([BASE_URL, self.url_path, six.text_type(course_key)])

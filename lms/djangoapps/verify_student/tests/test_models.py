@@ -1,27 +1,33 @@
 # -*- coding: utf-8 -*-
-from datetime import timedelta, datetime
-import json
-from xmodule.modulestore.tests.factories import CourseFactory
-from opaque_keys.edx.locations import SlashSeparatedCourseKey
-from nose.tools import assert_is_none, assert_equals, assert_raises, assert_true, assert_false
-from mock import patch
-import pytz
-from django.test import TestCase
-from courseware.tests.tests import TEST_DATA_MONGO_MODULESTORE
-from django.test.utils import override_settings
-from django.conf import settings
-import requests
-import requests.exceptions
 
-from student.tests.factories import UserFactory
-from verify_student.models import (
-    SoftwareSecurePhotoVerification, VerificationException,
+import base64
+from datetime import datetime, timedelta
+
+import ddt
+import mock
+import requests.exceptions
+import simplejson as json
+from django.conf import settings
+from django.utils.timezone import now
+from freezegun import freeze_time
+from mock import patch
+from six.moves import range
+
+from common.test.utils import MockS3BotoMixin
+from lms.djangoapps.verify_student.models import (
+    ManualVerification,
+    PhotoVerification,
+    SoftwareSecurePhotoVerification,
+    SSOVerification,
+    VerificationException
 )
-from reverification.tests.factories import MidcourseReverificationWindowFactory
+from student.tests.factories import UserFactory
+from verify_student.tests import TestVerificationBase
+from xmodule.modulestore.tests.django_utils import ModuleStoreTestCase
 
 FAKE_SETTINGS = {
     "SOFTWARE_SECURE": {
-        "FACE_IMAGE_AES_KEY" : "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "FACE_IMAGE_AES_KEY": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "API_ACCESS_KEY": "BBBBBBBBBBBBBBBBBBBB",
         "API_SECRET_KEY": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
         "RSA_PUBLIC_KEY": """-----BEGIN PUBLIC KEY-----
@@ -36,44 +42,12 @@ iwIDAQAB
         "API_URL": "http://localhost/verify_student/fake_endpoint",
         "AWS_ACCESS_KEY": "FAKEACCESSKEY",
         "AWS_SECRET_KEY": "FAKESECRETKEY",
-        "S3_BUCKET": "fake-bucket"
-    }
+        "S3_BUCKET": "fake-bucket",
+        "CERT_VERIFICATION_PATH": False,
+    },
+    "DAYS_GOOD_FOR": 10,
 }
 
-
-class MockKey(object):
-    """
-    Mocking a boto S3 Key object. It's a really dumb mock because once we
-    write data to S3, we never read it again. We simply generate a link to it
-    and pass that to Software Secure. Because of that, we don't even implement
-    the ability to pull back previously written content in this mock.
-
-    Testing that the encryption/decryption roundtrip on the data works is in
-    test_ssencrypt.py
-    """
-    def __init__(self, bucket):
-        self.bucket = bucket
-
-    def set_contents_from_string(self, contents):
-        self.contents = contents
-
-    def generate_url(self, duration):
-        return "http://fake-edx-s3.edx.org/"
-
-
-class MockBucket(object):
-    """Mocking a boto S3 Bucket object."""
-    def __init__(self, name):
-        self.name = name
-
-
-class MockS3Connection(object):
-    """Mocking a boto S3 Connection"""
-    def __init__(self, access_key, secret_key):
-        pass
-
-    def get_bucket(self, bucket_name):
-        return MockBucket(bucket_name)
 
 def mock_software_secure_post(url, headers=None, data=None, **kwargs):
     """
@@ -89,19 +63,17 @@ def mock_software_secure_post(url, headers=None, data=None, **kwargs):
         "UserPhoto", "UserPhotoKey",
     ]
     for key in EXPECTED_KEYS:
-        assert_true(
-            data_dict.get(key),
-            "'{}' must be present and not blank in JSON submitted to Software Secure".format(key)
-        )
+        assert data_dict.get(key)
 
     # The keys should be stored as Base64 strings, i.e. this should not explode
-    photo_id_key = data_dict["PhotoIDKey"].decode("base64")
-    user_photo_key = data_dict["UserPhotoKey"].decode("base64")
+    data_dict["PhotoIDKey"] = base64.b64decode(data_dict["PhotoIDKey"])
+    data_dict["UserPhotoKey"] = base64.b64decode(data_dict["UserPhotoKey"])
 
     response = requests.Response()
     response.status_code = 200
 
     return response
+
 
 def mock_software_secure_post_error(url, headers=None, data=None, **kwargs):
     """
@@ -112,17 +84,17 @@ def mock_software_secure_post_error(url, headers=None, data=None, **kwargs):
     response.status_code = 400
     return response
 
+
 def mock_software_secure_post_unavailable(url, headers=None, data=None, **kwargs):
     """Simulates a connection failure when we try to submit to Software Secure."""
     raise requests.exceptions.ConnectionError
 
 
-# Lots of patching to stub in our own settings, S3 substitutes, and HTTP posting
+# Lots of patching to stub in our own settings, and HTTP posting
 @patch.dict(settings.VERIFY_STUDENT, FAKE_SETTINGS)
-@patch('verify_student.models.S3Connection', new=MockS3Connection)
-@patch('verify_student.models.Key', new=MockKey)
-@patch('verify_student.models.requests.post', new=mock_software_secure_post)
-class TestPhotoVerification(TestCase):
+@patch('lms.djangoapps.verify_student.models.requests.post', new=mock_software_secure_post)
+@ddt.ddt
+class TestPhotoVerification(TestVerificationBase, MockS3BotoMixin, ModuleStoreTestCase):
 
     def test_state_transitions(self):
         """
@@ -138,44 +110,59 @@ class TestPhotoVerification(TestCase):
         """
         user = UserFactory.create()
         attempt = SoftwareSecurePhotoVerification(user=user)
-        assert_equals(attempt.status, "created")
+        self.assertEqual(attempt.status, PhotoVerification.STATUS.created)
 
         # These should all fail because we're in the wrong starting state.
-        assert_raises(VerificationException, attempt.submit)
-        assert_raises(VerificationException, attempt.approve)
-        assert_raises(VerificationException, attempt.deny)
+        self.assertRaises(VerificationException, attempt.submit)
+        self.assertRaises(VerificationException, attempt.approve)
+        self.assertRaises(VerificationException, attempt.deny)
+        self.assertRaises(VerificationException, attempt.mark_must_retry)
+        self.assertRaises(VerificationException, attempt.mark_submit)
 
         # Now let's fill in some values so that we can pass the mark_ready() call
         attempt.mark_ready()
-        assert_equals(attempt.status, "ready")
+        self.assertEqual(attempt.status, PhotoVerification.STATUS.ready)
 
         # ready (can't approve or deny unless it's "submitted")
-        assert_raises(VerificationException, attempt.approve)
-        assert_raises(VerificationException, attempt.deny)
+        self.assertRaises(VerificationException, attempt.approve)
+        self.assertRaises(VerificationException, attempt.deny)
+        attempt.mark_must_retry()
+        attempt.mark_submit()
 
         DENY_ERROR_MSG = '[{"photoIdReasons": ["Not provided"]}]'
 
         # must_retry
-        attempt.status = "must_retry"
+        attempt.status = PhotoVerification.STATUS.must_retry
         attempt.system_error("System error")
+        attempt.mark_must_retry()  # no-op
+        attempt.mark_submit()
         attempt.approve()
-        attempt.status = "must_retry"
+
+        attempt.status = PhotoVerification.STATUS.must_retry
         attempt.deny(DENY_ERROR_MSG)
 
         # submitted
-        attempt.status = "submitted"
+        attempt.status = PhotoVerification.STATUS.submitted
         attempt.deny(DENY_ERROR_MSG)
-        attempt.status = "submitted"
+
+        attempt.status = PhotoVerification.STATUS.submitted
+        attempt.mark_must_retry()
+
+        attempt.status = PhotoVerification.STATUS.submitted
         attempt.approve()
 
         # approved
-        assert_raises(VerificationException, attempt.submit)
+        self.assertRaises(VerificationException, attempt.submit)
+        self.assertRaises(VerificationException, attempt.mark_must_retry)
+        self.assertRaises(VerificationException, attempt.mark_submit)
         attempt.approve()  # no-op
         attempt.system_error("System error")  # no-op, something processed it without error
         attempt.deny(DENY_ERROR_MSG)
 
         # denied
-        assert_raises(VerificationException, attempt.submit)
+        self.assertRaises(VerificationException, attempt.submit)
+        self.assertRaises(VerificationException, attempt.mark_must_retry)
+        self.assertRaises(VerificationException, attempt.mark_submit)
         attempt.deny(DENY_ERROR_MSG)  # no-op
         attempt.system_error("System error")  # no-op, something processed it without error
         attempt.approve()
@@ -188,7 +175,7 @@ class TestPhotoVerification(TestCase):
         was when you submitted it.
         """
         user = UserFactory.create()
-        user.profile.name = u"Jack \u01B4" # gratuious non-ASCII char to test encodings
+        user.profile.name = u"Jack \u01B4"  # gratuious non-ASCII char to test encodings
 
         attempt = SoftwareSecurePhotoVerification(user=user)
         user.profile.name = u"Clyde \u01B4"
@@ -196,317 +183,241 @@ class TestPhotoVerification(TestCase):
 
         user.profile.name = u"Rusty \u01B4"
 
-        assert_equals(u"Clyde \u01B4", attempt.name)
-
-    def create_and_submit(self):
-        """Helper method to create a generic submission and send it."""
-        user = UserFactory.create()
-        attempt = SoftwareSecurePhotoVerification(user=user)
-        user.profile.name = u"Rust\u01B4"
-
-        attempt.upload_face_image("Just pretend this is image data")
-        attempt.upload_photo_id_image("Hey, we're a photo ID")
-        attempt.mark_ready()
-        attempt.submit()
-
-        return attempt
-
-    def test_fetch_photo_id_image(self):
-        user = UserFactory.create()
-        orig_attempt = SoftwareSecurePhotoVerification(user=user, window=None)
-        orig_attempt.save()
-
-        old_key = orig_attempt.photo_id_key
-
-        window = MidcourseReverificationWindowFactory(
-            course_id=SlashSeparatedCourseKey("pony", "rainbow", "dash"),
-            start_date=datetime.now(pytz.utc) - timedelta(days=5),
-            end_date=datetime.now(pytz.utc) + timedelta(days=5)
-        )
-        new_attempt = SoftwareSecurePhotoVerification(user=user, window=window)
-        new_attempt.save()
-        new_attempt.fetch_photo_id_image()
-        assert_equals(new_attempt.photo_id_key, old_key)
+        self.assertEqual(u"Clyde \u01B4", attempt.name)
 
     def test_submissions(self):
         """Test that we set our status correctly after a submission."""
         # Basic case, things go well.
-        attempt = self.create_and_submit()
-        assert_equals(attempt.status, "submitted")
+        attempt = self.create_upload_and_submit_attempt_for_user()
+        self.assertEqual(attempt.status, PhotoVerification.STATUS.submitted)
 
         # We post, but Software Secure doesn't like what we send for some reason
-        with patch('verify_student.models.requests.post', new=mock_software_secure_post_error):
-            attempt = self.create_and_submit()
-            assert_equals(attempt.status, "must_retry")
+        with patch('lms.djangoapps.verify_student.tasks.requests.post', new=mock_software_secure_post_error):
+            attempt = self.create_upload_and_submit_attempt_for_user()
+            self.assertEqual(attempt.status, PhotoVerification.STATUS.must_retry)
 
-        # We try to post, but run into an error (in this case a newtork connection error)
-        with patch('verify_student.models.requests.post', new=mock_software_secure_post_unavailable):
-            attempt = self.create_and_submit()
-            assert_equals(attempt.status, "must_retry")
+        # We try to post, but run into an error (in this case a network connection error)
+        with patch('lms.djangoapps.verify_student.tasks.requests.post', new=mock_software_secure_post_unavailable):
+            attempt = self.create_upload_and_submit_attempt_for_user()
+            self.assertEqual(attempt.status, PhotoVerification.STATUS.must_retry)
 
-    def test_active_for_user(self):
+    @mock.patch.dict(settings.FEATURES, {'AUTOMATIC_VERIFY_STUDENT_IDENTITY_FOR_TESTING': True})
+    def test_submission_while_testing_flag_is_true(self):
+        """ Test that a fake value is set for field 'photo_id_key' of user's
+        initial verification when the feature flag 'AUTOMATIC_VERIFY_STUDENT_IDENTITY_FOR_TESTING'
+        is enabled.
         """
-        Make sure we can retrive a user's active (in progress) verification
-        attempt.
-        """
-        user = UserFactory.create()
+        attempt = self.create_upload_and_submit_attempt_for_user()
+        self.assertEqual(attempt.photo_id_key, "fake-photo-id-key")
 
-        # This user has no active at the moment...
-        assert_is_none(SoftwareSecurePhotoVerification.active_for_user(user))
-
-        # Create an attempt and mark it ready...
-        attempt = SoftwareSecurePhotoVerification(user=user)
-        attempt.mark_ready()
-        assert_equals(attempt, SoftwareSecurePhotoVerification.active_for_user(user))
-
-        # A new user won't see this...
-        user2 = UserFactory.create()
-        user2.save()
-        assert_is_none(SoftwareSecurePhotoVerification.active_for_user(user2))
-
-        # If it's got a different status, it doesn't count
-        for status in ["submitted", "must_retry", "approved", "denied"]:
-            attempt.status = status
-            attempt.save()
-            assert_is_none(SoftwareSecurePhotoVerification.active_for_user(user))
-
-        # But if we create yet another one and mark it ready, it passes again.
-        attempt_2 = SoftwareSecurePhotoVerification(user=user)
-        attempt_2.mark_ready()
-        assert_equals(attempt_2, SoftwareSecurePhotoVerification.active_for_user(user))
-
-        # And if we add yet another one with a later created time, we get that
-        # one instead. We always want the most recent attempt marked ready()
-        attempt_3 = SoftwareSecurePhotoVerification(
-            user=user,
-            created_at=attempt_2.created_at + timedelta(days=1)
-        )
-        attempt_3.save()
-
-        # We haven't marked attempt_3 ready yet, so attempt_2 still wins
-        assert_equals(attempt_2, SoftwareSecurePhotoVerification.active_for_user(user))
-
-        # Now we mark attempt_3 ready and expect it to come back
-        attempt_3.mark_ready()
-        assert_equals(attempt_3, SoftwareSecurePhotoVerification.active_for_user(user))
-
-    def test_user_is_verified(self):
-        """
-        Test to make sure we correctly answer whether a user has been verified.
-        """
-        user = UserFactory.create()
-        attempt = SoftwareSecurePhotoVerification(user=user)
-        attempt.save()
-
-        # If it's any of these, they're not verified...
-        for status in ["created", "ready", "denied", "submitted", "must_retry"]:
-            attempt.status = status
-            attempt.save()
-            assert_false(SoftwareSecurePhotoVerification.user_is_verified(user), status)
-
-        attempt.status = "approved"
-        attempt.save()
-        assert_true(SoftwareSecurePhotoVerification.user_is_verified(user), status)
-
-    def test_user_has_valid_or_pending(self):
-        """
-        Determine whether we have to prompt this user to verify, or if they've
-        already at least initiated a verification submission.
-        """
-        user = UserFactory.create()
-        attempt = SoftwareSecurePhotoVerification(user=user)
-
-        # If it's any of these statuses, they don't have anything outstanding
-        for status in ["created", "ready", "denied"]:
-            attempt.status = status
-            attempt.save()
-            assert_false(SoftwareSecurePhotoVerification.user_has_valid_or_pending(user), status)
-
-        # Any of these, and we are. Note the benefit of the doubt we're giving
-        # -- must_retry, and submitted both count until we hear otherwise
-        for status in ["submitted", "must_retry", "approved"]:
-            attempt.status = status
-            attempt.save()
-            assert_true(SoftwareSecurePhotoVerification.user_has_valid_or_pending(user), status)
-
-    def test_user_status(self):
-        # test for correct status when no error returned
-        user = UserFactory.create()
-        status = SoftwareSecurePhotoVerification.user_status(user)
-        self.assertEquals(status, ('none', ''))
-
-        # test for when one has been created
-        attempt = SoftwareSecurePhotoVerification(user=user)
-        attempt.status = 'approved'
-        attempt.save()
-
-        status = SoftwareSecurePhotoVerification.user_status(user)
-        self.assertEquals(status, ('approved', ''))
-
-        # create another one for the same user, make sure the right one is
-        # returned
-        attempt2 = SoftwareSecurePhotoVerification(user=user)
-        attempt2.status = 'denied'
-        attempt2.error_msg = '[{"photoIdReasons": ["Not provided"]}]'
-        attempt2.save()
-
-        status = SoftwareSecurePhotoVerification.user_status(user)
-        self.assertEquals(status, ('approved', ''))
-
-        # now delete the first one and verify that the denial is being handled
-        # properly
-        attempt.delete()
-        status = SoftwareSecurePhotoVerification.user_status(user)
-        self.assertEquals(status, ('must_reverify', "No photo ID was provided."))
-
-        # test for correct status for reverifications
-        window = MidcourseReverificationWindowFactory()
-        reverify_status = SoftwareSecurePhotoVerification.user_status(user=user, window=window)
-        self.assertEquals(reverify_status, ('must_reverify', ''))
-
-        reverify_attempt = SoftwareSecurePhotoVerification(user=user, window=window)
-        reverify_attempt.status = 'approved'
-        reverify_attempt.save()
-
-        reverify_status = SoftwareSecurePhotoVerification.user_status(user=user, window=window)
-        self.assertEquals(reverify_status, ('approved', ''))
-
-        reverify_attempt.status = 'denied'
-        reverify_attempt.save()
-
-        reverify_status = SoftwareSecurePhotoVerification.user_status(user=user, window=window)
-        self.assertEquals(reverify_status, ('denied', ''))
-
-    def test_display(self):
-        user = UserFactory.create()
-        window = MidcourseReverificationWindowFactory()
-        attempt = SoftwareSecurePhotoVerification(user=user, window=window, status="denied")
-        attempt.save()
-
-        # We expect the verification to be displayed by default
-        self.assertEquals(SoftwareSecurePhotoVerification.display_status(user, window), True)
-
-        # Turn it off
-        SoftwareSecurePhotoVerification.display_off(user.id)
-        self.assertEquals(SoftwareSecurePhotoVerification.display_status(user, window), False)
-
+    # pylint: disable=line-too-long
     def test_parse_error_msg_success(self):
         user = UserFactory.create()
         attempt = SoftwareSecurePhotoVerification(user=user)
-        attempt.status = 'denied'
-        attempt.error_msg = '[{"photoIdReasons": ["Not provided"]}]'
+        attempt.status = PhotoVerification.STATUS.denied
+        attempt.error_msg = '[{"userPhotoReasons": ["Face out of view"]}, {"photoIdReasons": ["Photo hidden/No photo", "ID name not provided"]}]'
         parsed_error_msg = attempt.parsed_error_msg()
-        self.assertEquals("No photo ID was provided.", parsed_error_msg)
+        self.assertEqual(
+            sorted(parsed_error_msg),
+            sorted(['id_image_missing_name', 'user_image_not_clear', 'id_image_not_clear'])
+        )
 
-    def test_parse_error_msg_failure(self):
+    @ddt.data(
+        'Not Provided',
+        '{"IdReasons": ["Not provided"]}',
+        u'[{"ïḋṚëäṡöṅṡ": ["Ⓝⓞⓣ ⓟⓡⓞⓥⓘⓓⓔⓓ "]}]',
+    )
+    def test_parse_error_msg_failure(self, msg):
+        user = UserFactory.create()
+        attempt = SoftwareSecurePhotoVerification.objects.create(user=user, status='denied', error_msg=msg)
+        self.assertEqual(attempt.parsed_error_msg(), [])
+
+    def test_active_at_datetime(self):
+        user = UserFactory.create()
+        attempt = SoftwareSecurePhotoVerification.objects.create(user=user)
+        self.verification_active_at_datetime(attempt)
+
+    def test_initial_verification_for_user(self):
+        """Test that method 'get_initial_verification' of model
+        'SoftwareSecurePhotoVerification' always returns the initial
+        verification with field 'photo_id_key' set against a user.
+        """
+        user = UserFactory.create()
+
+        # No initial verification for the user
+        result = SoftwareSecurePhotoVerification.get_initial_verification(user=user)
+        self.assertIs(result, None)
+
+        # Make an initial verification with 'photo_id_key'
+        attempt = SoftwareSecurePhotoVerification(user=user, photo_id_key="dummy_photo_id_key")
+        attempt.status = PhotoVerification.STATUS.approved
+        attempt.save()
+
+        # Check that method 'get_initial_verification' returns the correct
+        # initial verification attempt
+        first_result = SoftwareSecurePhotoVerification.get_initial_verification(user=user)
+        self.assertIsNotNone(first_result)
+
+        # Now create a second verification without 'photo_id_key'
+        attempt = SoftwareSecurePhotoVerification(user=user)
+        attempt.status = PhotoVerification.STATUS.submitted
+        attempt.save()
+
+        # Test method 'get_initial_verification' still returns the correct
+        # initial verification attempt which have 'photo_id_key' set
+        second_result = SoftwareSecurePhotoVerification.get_initial_verification(user=user)
+        self.assertIsNotNone(second_result)
+        self.assertEqual(second_result, first_result)
+
+        # Test method 'get_initial_verification' returns None after expiration
+        expired_future = now() + timedelta(days=(FAKE_SETTINGS['DAYS_GOOD_FOR'] + 1))
+        with freeze_time(expired_future):
+            third_result = SoftwareSecurePhotoVerification.get_initial_verification(user)
+            self.assertIsNone(third_result)
+
+        # Test method 'get_initial_verification' returns correct attempt after system expiration,
+        # but within earliest allowed override.
+        expired_future = now() + timedelta(days=(FAKE_SETTINGS['DAYS_GOOD_FOR'] + 1))
+        earliest_allowed = now() - timedelta(days=1)
+        with freeze_time(expired_future):
+            fourth_result = SoftwareSecurePhotoVerification.get_initial_verification(user, earliest_allowed)
+            self.assertIsNotNone(fourth_result)
+            self.assertEqual(fourth_result, first_result)
+
+    def test_retire_user(self):
+        """
+        Retire user with record(s) in table
+        """
+        user = UserFactory.create()
+        user.profile.name = u"Enrique"
+        attempt = SoftwareSecurePhotoVerification(user=user)
+
+        # Populate Record
+        attempt.mark_ready()
+        attempt.status = PhotoVerification.STATUS.submitted
+        attempt.photo_id_image_url = "https://example.com/test/image/img.jpg"
+        attempt.face_image_url = "https://example.com/test/face/img.jpg"
+        attempt.photo_id_key = 'there_was_an_attempt'
+        attempt.approve()
+
+        # Validate data before retirement
+        self.assertEqual(attempt.name, user.profile.name)
+        self.assertEqual(attempt.photo_id_image_url, 'https://example.com/test/image/img.jpg')
+        self.assertEqual(attempt.face_image_url, 'https://example.com/test/face/img.jpg')
+        self.assertEqual(attempt.photo_id_key, 'there_was_an_attempt')
+
+        # Retire User
+        attempt_again = SoftwareSecurePhotoVerification(user=user)
+        self.assertTrue(attempt_again.retire_user(user_id=user.id))
+
+        # Validate data after retirement
+        self.assertEqual(attempt_again.name, '')
+        self.assertEqual(attempt_again.face_image_url, '')
+        self.assertEqual(attempt_again.photo_id_image_url, '')
+        self.assertEqual(attempt_again.photo_id_key, '')
+
+    def test_retire_nonuser(self):
+        """
+        Attempt to Retire User with no records in table
+        """
         user = UserFactory.create()
         attempt = SoftwareSecurePhotoVerification(user=user)
-        attempt.status = 'denied'
-        # when we can't parse into json
-        bad_messages = {
-            'Not Provided',
-            '[{"IdReasons": ["Not provided"]}]',
-            '{"IdReasons": ["Not provided"]}',
-            u'[{"ïḋṚëäṡöṅṡ": ["Ⓝⓞⓣ ⓟⓡⓞⓥⓘⓓⓔⓓ "]}]',
-        }
-        for msg in bad_messages:
-            attempt.error_msg = msg
-            parsed_error_msg = attempt.parsed_error_msg()
-            self.assertEquals(parsed_error_msg, "There was an error verifying your ID photos.")
+
+        # User with no records in table
+        self.assertFalse(attempt.retire_user(user_id=user.id))
+
+        # No user
+        self.assertFalse(attempt.retire_user(user_id=47))
+
+    def test_get_recent_verification(self):
+        """Test that method 'get_recent_verification' of model
+        'SoftwareSecurePhotoVerification' always returns the most
+        recent 'approved' verification based on updated_at set
+        against a user.
+        """
+        user = UserFactory.create()
+        attempt = None
+
+        for _ in range(2):
+            # Make an approved verification
+            attempt = SoftwareSecurePhotoVerification(user=user)
+            attempt.status = PhotoVerification.STATUS.approved
+            attempt.expiry_date = datetime.now()
+            attempt.save()
+
+        # Test method 'get_recent_verification' returns the most recent
+        # verification attempt based on updated_at
+        recent_verification = SoftwareSecurePhotoVerification.get_recent_verification(user=user)
+        self.assertIsNotNone(recent_verification)
+        self.assertEqual(recent_verification.id, attempt.id)
+
+    def test_get_recent_verification_expiry_null(self):
+        """Test that method 'get_recent_verification' of model
+        'SoftwareSecurePhotoVerification' will return None when expiry_date
+        is NULL for 'approved' verifications based on updated_at value.
+        """
+        user = UserFactory.create()
+        attempt = None
+
+        for _ in range(2):
+            # Make an approved verification
+            attempt = SoftwareSecurePhotoVerification(user=user)
+            attempt.status = PhotoVerification.STATUS.approved
+            attempt.save()
+
+        # Test method 'get_recent_verification' returns None
+        # as attempts don't have an expiry_date
+        recent_verification = SoftwareSecurePhotoVerification.get_recent_verification(user=user)
+        self.assertIsNone(recent_verification)
+
+    def test_no_approved_verification(self):
+        """Test that method 'get_recent_verification' of model
+        'SoftwareSecurePhotoVerification' returns None if no
+        'approved' verification are found
+        """
+        user = UserFactory.create()
+        SoftwareSecurePhotoVerification(user=user)
+
+        result = SoftwareSecurePhotoVerification.get_recent_verification(user=user)
+        self.assertIs(result, None)
+
+    def test_update_expiry_email_date_for_user(self):
+        """Test that method update_expiry_email_date_for_user of
+        model 'SoftwareSecurePhotoVerification' set expiry_email_date
+        if the most recent approved verification is expired.
+        """
+        email_config = getattr(settings, 'VERIFICATION_EXPIRY_EMAIL', {'DAYS_RANGE': 1, 'RESEND_DAYS': 15})
+        user = UserFactory.create()
+        verification = SoftwareSecurePhotoVerification(user=user)
+        verification.expiry_date = now() - timedelta(days=FAKE_SETTINGS['DAYS_GOOD_FOR'])
+        verification.status = PhotoVerification.STATUS.approved
+        verification.save()
+
+        self.assertIsNone(verification.expiry_email_date)
+
+        SoftwareSecurePhotoVerification.update_expiry_email_date_for_user(user, email_config)
+        result = SoftwareSecurePhotoVerification.get_recent_verification(user=user)
+
+        self.assertIsNotNone(result.expiry_email_date)
 
 
-@override_settings(MODULESTORE=TEST_DATA_MONGO_MODULESTORE)
-@patch.dict(settings.VERIFY_STUDENT, FAKE_SETTINGS)
-@patch('verify_student.models.S3Connection', new=MockS3Connection)
-@patch('verify_student.models.Key', new=MockKey)
-@patch('verify_student.models.requests.post', new=mock_software_secure_post)
-class TestMidcourseReverification(TestCase):
-    """ Tests for methods that are specific to midcourse SoftwareSecurePhotoVerification objects """
-    def setUp(self):
-        self.course = CourseFactory.create(org='MITx', number='999', display_name='Robot Super Course')
-        self.user = UserFactory.create()
+class SSOVerificationTest(TestVerificationBase):
+    """
+    Tests for the SSOVerification model
+    """
 
-    def test_user_is_reverified_for_all(self):
+    def test_active_at_datetime(self):
+        user = UserFactory.create()
+        attempt = SSOVerification.objects.create(user=user)
+        self.verification_active_at_datetime(attempt)
 
-        # if there are no windows for a course, this should return True
-        self.assertTrue(SoftwareSecurePhotoVerification.user_is_reverified_for_all(self.course.id, self.user))
 
-        # first, make three windows
-        window1 = MidcourseReverificationWindowFactory(
-            course_id=self.course.id,
-            start_date=datetime.now(pytz.UTC) - timedelta(days=15),
-            end_date=datetime.now(pytz.UTC) - timedelta(days=13),
-        )
+class ManualVerificationTest(TestVerificationBase):
+    """
+    Tests for the ManualVerification model
+    """
 
-        window2 = MidcourseReverificationWindowFactory(
-            course_id=self.course.id,
-            start_date=datetime.now(pytz.UTC) - timedelta(days=10),
-            end_date=datetime.now(pytz.UTC) - timedelta(days=8),
-        )
-
-        window3 = MidcourseReverificationWindowFactory(
-            course_id=self.course.id,
-            start_date=datetime.now(pytz.UTC) - timedelta(days=5),
-            end_date=datetime.now(pytz.UTC) - timedelta(days=3),
-        )
-
-        # make two SSPMidcourseReverifications for those windows
-        attempt1 = SoftwareSecurePhotoVerification(
-            status="approved",
-            user=self.user,
-            window=window1
-        )
-        attempt1.save()
-
-        attempt2 = SoftwareSecurePhotoVerification(
-            status="approved",
-            user=self.user,
-            window=window2
-        )
-        attempt2.save()
-
-        # should return False because only 2 of 3 windows have verifications
-        self.assertFalse(SoftwareSecurePhotoVerification.user_is_reverified_for_all(self.course.id, self.user))
-
-        attempt3 = SoftwareSecurePhotoVerification(
-            status="must_retry",
-            user=self.user,
-            window=window3
-        )
-        attempt3.save()
-
-        # should return False because the last verification exists BUT is not approved
-        self.assertFalse(SoftwareSecurePhotoVerification.user_is_reverified_for_all(self.course.id, self.user))
-
-        attempt3.status = "approved"
-        attempt3.save()
-
-        # should now return True because all windows have approved verifications
-        self.assertTrue(SoftwareSecurePhotoVerification.user_is_reverified_for_all(self.course.id, self.user))
-
-    def test_original_verification(self):
-        orig_attempt = SoftwareSecurePhotoVerification(user=self.user)
-        orig_attempt.save()
-        window = MidcourseReverificationWindowFactory(
-            course_id=self.course.id,
-            start_date=datetime.now(pytz.UTC) - timedelta(days=15),
-            end_date=datetime.now(pytz.UTC) - timedelta(days=13),
-        )
-        midcourse_attempt = SoftwareSecurePhotoVerification(user=self.user, window=window)
-        self.assertEquals(midcourse_attempt.original_verification(user=self.user), orig_attempt)
-
-    def test_user_has_valid_or_pending(self):
-        window = MidcourseReverificationWindowFactory(
-            course_id=self.course.id,
-            start_date=datetime.now(pytz.UTC) - timedelta(days=15),
-            end_date=datetime.now(pytz.UTC) - timedelta(days=13),
-        )
-
-        attempt = SoftwareSecurePhotoVerification(status="must_retry", user=self.user, window=window)
-        attempt.save()
-
-        assert_false(SoftwareSecurePhotoVerification.user_has_valid_or_pending(user=self.user, window=window))
-
-        attempt.status = "approved"
-        attempt.save()
-        assert_true(SoftwareSecurePhotoVerification.user_has_valid_or_pending(user=self.user, window=window))
+    def test_active_at_datetime(self):
+        user = UserFactory.create()
+        verification = ManualVerification.objects.create(user=user)
+        self.verification_active_at_datetime(verification)

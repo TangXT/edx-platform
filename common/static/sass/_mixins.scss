@@ -1,49 +1,76 @@
-// studio - utilities - mixins and extends
+// common - utilities - mixins and extends
 // ====================
 
-// mixins - font sizing
-@mixin font-size($sizeValue: 16){
+// Table of Contents
+// * +Font Sizing - Mixin
+// * +Line Height - Mixin
+// * +Sizing - Mixin
+// * +Square - Mixin
+// * +Placeholder Styling - Mixin
+// * +Flex Support - Mixin
+// * +Flex Polyfill - Extends
+// * +UI - Wrapper - Extends
+// * +UI - Window - Extend
+// * +UI - Visual Link - Extend
+// * +UI - Functional Disable - Extend
+// * +UI - Visual Link - Extend
+// * +UI - Depth Levels - Extends
+// * +UI - Clear Children - Extends
+// * +UI - Buttons - Extends
+// * +UI - Well Archetype - Extends
+// * +Content - No List - Extends
+// * +Content - Hidden Image Text - Extend
+// * +Content - Screenreader Text - Extend
+// * +Content - Text Wrap - Extend
+// * +Content - Text Truncate - Extend
+// * +Icon - Font-Awesome  - Extend
+// * +Icon - SSO icon images
+
+// +Font Sizing - Mixin
+// ====================
+@mixin font-size($sizeValue: 16) {
   font-size: $sizeValue + px;
   font-size: ($sizeValue/10) + rem;
 }
 
-// mixins - line height
-@mixin line-height($fontSize: auto){
+// +Line Height - Mixin
+// ====================
+@mixin line-height($fontSize: auto) {
   line-height: ($fontSize*1.48) + px;
   line-height: (($fontSize/10)*1.48) + rem;
 }
 
+// +Sizing - Mixin
 // ====================
-
-// mixins - sizing
 @mixin size($width: $baseline, $height: $baseline) {
   height: $height;
   width: $width;
 }
 
-// mixins - sizing
+// +Square - Mixin
+// ====================
 @mixin square($size: $baseline) {
   @include size($size);
 }
 
+// +Placeholder Styling - Mixin
 // ====================
-
-// mixins - placeholder styling
 @mixin placeholder($color) {
   :-moz-placeholder {
     color: $color;
   }
+
   ::-webkit-input-placeholder {
     color: $color;
   }
+
   :-ms-input-placeholder {
-     color: $color;
+    color: $color;
   }
 }
 
+// +Flex Support - Mixin
 // ====================
-
-// mixins - flex support
 @mixin ui-flexbox() {
   display: -webkit-box;
   display: -moz-box;
@@ -52,7 +79,10 @@
   display: flex;
 }
 
-// extends - justify-content right for display:flex alignment in older browsers
+// +Flex PolyFill - Extends
+// ====================
+
+// justify-content right for display:flex alignment in older browsers
 %ui-justify-right-flex {
   -webkit-box-pack: flex-end;
   -moz-box-pack: flex-end;
@@ -61,7 +91,7 @@
   justify-content: flex-end;
 }
 
-// extends - justify-content left for display:flex alignment in older browsers
+// justify-content left for display:flex alignment in older browsers
 %ui-justify-left-flex {
   -webkit-box-pack: flex-start;
   -moz-box-pack: flex-start;
@@ -70,7 +100,7 @@
   justify-content: flex-start;
 }
 
-// extends - align items center for display:flex alignment in older browsers
+// align items center for display:flex alignment in older browsers
 %ui-align-center-flex {
   -webkit-flex-align: center;
   -ms-flex-align: center;
@@ -78,38 +108,65 @@
   align-items: center;
 }
 
-// ====================
 
-// extends - UI - used for page/view-level wrappers (for centering/grids)
+// +UI - Wrapper - Extends
+// ====================
+// used for page/view-level wrappers (for centering/grids)
 %ui-wrapper {
   @include clearfix();
-  @include box-sizing(border-box);
+
+  box-sizing: border-box;
   width: 100%;
 }
 
-// extends - UI - window
+// layout placeholders
+.ui-col-wide {
+  width: flex-grid(9, 12);
+
+  @include margin-right(flex-gutter());
+  @include float(left);
+}
+
+.ui-col-narrow {
+  width: flex-grid(3, 12);
+
+  @include float(left);
+}
+
+// +UI - Window - Extends
+// ====================
 %ui-window {
   @include clearfix();
-  border-radius: 3px;
-  box-shadow: 0 1px 1px $shadow-l1;
+
+  border-radius: ($baseline/10);
+  box-shadow: 0 1px 1px $shadow-l2;
   margin-bottom: $baseline;
   border: 1px solid $gray-l2;
   background: $white;
+
+  // STATE: hover/active
+  &:hover,
+  &:active {
+    box-shadow: 0 1px 1px $shadow;
+  }
 }
 
-// extends - UI - visual link
+// +UI - Visual Link - Extends
+// ====================
 %ui-fake-link {
   cursor: pointer;
 }
 
-// extends - UI - functional disable
+// +UI - Functional Disable - Extends
+// ====================
 %ui-disabled {
   pointer-events: none;
   outline: none;
   cursor: default;
 }
 
-// extends - UI - depth levels
+// +UI - Depth Levels - Extends
+// ====================
 %ui-depth0 { z-index: 0; }
 %ui-depth1 { z-index: 10; }
 %ui-depth2 { z-index: 100; }
@@ -118,9 +175,10 @@
 %ui-depth5 { z-index: 100000; }
 
 
-// extends - UI - utility - nth-type style clearing
+// +UI - Clear Children - Extends
+// ====================
+// extends - UI - utility - first child clearing
 %wipe-first-child {
-
   &:first-child {
     margin-top: 0;
     border-top: none;
@@ -128,9 +186,8 @@
   }
 }
 
-// extends - UI - utility - nth-type style clearing
+// extends - UI - utility - last child clearing
 %wipe-last-child {
-
   &:last-child {
     margin-bottom: 0;
     border-bottom: none;
@@ -138,21 +195,24 @@
   }
 }
 
-// extends - UI - buttons
+// +UI - Buttons - Extends
+// ====================
 %ui-btn {
-  @include box-sizing(border-box);
-  @include transition(color 0.25s ease-in-out 0s, border-color 0.25s ease-in-out 0s, background 0.25s ease-in-out 0s, box-shadow 0.25s ease-in-out 0s);
+  box-sizing: border-box;
+
+  @include transition(color $tmg-f2 ease-in-out 0s, border-color $tmg-f2 ease-in-out 0s, background $tmg-f2 ease-in-out 0s, box-shadow $tmg-f2 ease-in-out 0s);
+
   display: inline-block;
   cursor: pointer;
 
-  &:hover, &:active {
-
-  }
-
-  &.disabled, &[disabled], &.is-disabled {
+  &.disabled,
+  &[disabled],
+  &.is-disabled {
     cursor: default;
     pointer-events: none;
-    opacity: 0.5;
+    border: 1px solid $gray-l3;
+    background-color: $gray-l3;
+    color: $gray-l5;
   }
 
   .icon-inline {
@@ -175,20 +235,28 @@
 %ui-btn-primary {
   @extend %ui-btn;
   @extend %ui-btn-pill;
-  padding:($baseline/2) $baseline;
+  @extend %t-strong;
+
+  padding: ($baseline/2) $baseline;
   border-width: 1px;
   border-style: solid;
+  box-shadow: none;
   line-height: 1.5em;
   text-align: center;
 
-  &:hover, &:active, &:focus {
-    box-shadow: 0 2px 1px $shadow-l1;
+  &:hover,
+  &:active,
+  &:focus {
+    box-shadow: 0 2px 1px $shadow;
   }
 
-  &.current, &.active {
+  &.current,
+  &.active {
     box-shadow: inset 1px 1px 2px $shadow-d1;
 
-    &:hover, &:active, &:focus {
+    &:hover,
+    &:active,
+    &:focus {
       box-shadow: inset 1px 1px 1px $shadow-d1;
     }
   }
@@ -198,85 +266,119 @@
 %ui-btn-secondary {
   @extend %ui-btn;
   @extend %ui-btn-pill;
+
   border-width: 1px;
   border-style: solid;
-  padding:($baseline/2) $baseline;
+  padding: ($baseline/2) $baseline;
   background: transparent;
   line-height: 1.5em;
   text-align: center;
-
-  &:hover, &:active, &:focus {
-
-  }
-
-  &.current, &.active {
-
-  }
 }
 
 %ui-btn-flat-outline {
+  @include transition(all 0.15s);
+
+  @extend %t-strong;
   @extend %t-action4;
-  @include transition(all .15s);
-  font-weight: 600;
+
   text-align: center;
   border-radius: ($baseline/4);
-  border: 1px solid $blue-l2;
+  border: 1px solid theme-color("primary");
   padding: 1px ($baseline/2) 2px ($baseline/2);
-  background-color: $white;
-  color: $blue-l2;
+  background-color: theme-color("inverse");
+  color: theme-color("primary");
 
-  &:hover, &:focus {
-    border: 1px solid $blue;
-    background-color: $blue;
-    color: $white;
+  &:hover,
+  &:focus {
+    border: 1px solid $uxpl-blue-hover-active;
+    background-color: $uxpl-blue-hover-active;
+    color: theme-color("inverse");
   }
 
   &.is-disabled,
-  &[disabled="disabled"]{
-   border: 1px solid $gray-l2;
-   background-color: $gray-l4;
-   color: $gray-l2;
-   pointer-events: none;
+  &[disabled="disabled"] {
+    border: 1px solid $gray-l2;
+    background-color: $gray-l4;
+    color: $gray-l2;
+    pointer-events: none;
   }
 }
 
 // button with no button shell until hover for understated actions
 %ui-btn-non {
-  @include transition(all .15s);
-  border: none;
-  border-radius: ($baseline/4);
-  background: none;
-  padding: 3px ($baseline/2);
+  @include transition(all 0.15s);
+
+  @extend %ui-btn-pill;
+
+  @include transition(all $tmg-f2 linear 0s);
+
+  display: inline-block;
   vertical-align: middle;
+  border: none;
+  padding: 3px ($baseline/2);
+  background: none;
   color: $gray-l1;
 
-  &:hover, &:focus {
+  &:hover,
+  &:focus {
     background-color: $gray-l1;
     color: $white;
   }
+}
 
-  span {
-    @extend %cont-text-sr;
+// button with no button shell until hover for understated actions
+%ui-btn-non-blue {
+  @extend %ui-btn-non;
+
+  &:hover,
+  &:focus {
+    background-color: theme-color("primary");
+    color: theme-color("inverse");
   }
 }
 
-// extends - UI archetypes - well
+// +UI - Well Archetype - Extends
+// ====================
 %ui-well {
   box-shadow: inset 0 1px 2px 1px $shadow;
   padding: ($baseline*0.75) $baseline;
 }
 
+%no-content {
+  @extend %ui-well;
+
+  padding: ($baseline*2);
+  background-color: $gray-l4;
+  text-align: center;
+  color: $gray;
+
+  .button,
+  .action {
+    @extend %btn-primary-green;
+    @extend %t-action3;
+
+    margin-left: $baseline;
+
+    .icon {
+      margin-right: ($baseline/2);
+    }
+  }
+}
+
 .ui-loading {
   @include animation(fadeIn $tmg-f2 linear 1);
+
   @extend %ui-well;
   @extend %t-copy-base;
-  opacity: .6;
+
+  opacity: 0.6;
   background-color: $white;
   padding: ($baseline*1.5) $baseline;
   text-align: center;
 
   .spin {
     @extend %anim-rotateCW;
+
     display: inline-block;
   }
 
@@ -289,9 +391,9 @@
   display: none;
 }
 
+// +Content - No List - Extends
 // ====================
-
-// extends - content - removes list styling/spacing when using uls, ols for navigation and less content-centric cases
+// removes list styling/spacing when using uls, ols for navigation and less content-centric cases
 %cont-no-list {
   list-style: none;
   margin: 0;
@@ -304,37 +406,73 @@
   }
 }
 
-// extends - content - image-replacement hidden text
+// +Content - Hidden Image Text - Extend
+// ====================
+// image-replacement hidden text
 %cont-text-hide {
   text-indent: 100%;
   white-space: nowrap;
   overflow: hidden;
 }
 
-// extends - content - hidden elems - screenreaders
+// +Content - Screenreader Text - Extend
+// ====================
 %cont-text-sr {
-  border: 0;
-  clip: rect(0 0 0 0);
-  height: 1px;
-  margin: -1px;
-  overflow: hidden;
-  padding: 0;
+  // clip has been deprecated but is still supported
+  clip: rect(1px 1px 1px 1px);
+  clip: rect(1px, 1px, 1px, 1px);
   position: absolute;
+  margin: -1px;
+  height: 1px;
   width: 1px;
+  border: 0;
+  padding: 0;
+  overflow: hidden;
+  // ensure there are spaces in sr text
+  word-wrap: normal;
 }
 
-// extends - content - wrapping
+// +Content - Text Wrap - Extend
+// ====================
 %cont-text-wrap {
-  text-wrap: wrap;
-  white-space: pre-wrap;
-  white-space: -moz-pre-wrap;
   word-wrap: break-word;
 }
 
-// extends - content - text overflow by ellipsis
+// +Content - Text Truncate - Extend
+// ====================
 %cont-truncated {
-  @include box-sizing(border-box);
+  box-sizing: border-box;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+// * +Icon - Font-Awesome  - Extend
+// ====================
+%use-font-awesome {
+  display: inline-block;
+  font-family: FontAwesome;
+  -webkit-font-smoothing: antialiased;
+  speak: none;
+}
+
+%btn-no-style {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+
+// * +Icon - SSO icon images
+// ====================
+
+%sso-icon {
+  .icon-image {
+    width: auto;
+    height: auto;
+    max-height: 2em;
+    max-width: 2em;
+    margin-top: -2px;
+  }
 }

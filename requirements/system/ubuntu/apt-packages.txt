@@ -31,8 +31,9 @@ libreadline6
 libreadline6-dev
 mongodb
 nodejs
-coffeescript
 mysql-client
 virtualenvwrapper
 libgeos-ruby1.8
 lynx-cur
+libxmlsec1-dev
+swig

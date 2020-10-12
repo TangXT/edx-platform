@@ -1,8 +1,11 @@
-(function () {
+/* global _ */
+
+(function() {
     'use strict';
+    var origAjax = $.ajax;
 
     var stubbedYT = {
-        Player: function () {
+        Player: function() {
             var Player = jasmine.createSpyObj(
                 'YT.Player',
                 [
@@ -15,9 +18,9 @@
                 ]
             );
 
-            Player.getDuration.andReturn(60);
-            Player.getAvailablePlaybackRates.andReturn([0.50, 1.0, 1.50, 2.0]);
-            Player.getAvailableQualityLevels.andReturn(
+            Player.getDuration.and.returnValue(60);
+            Player.getAvailablePlaybackRates.and.returnValue([0.50, 1.0, 1.50, 2.0]);
+            Player.getAvailableQualityLevels.and.returnValue(
                 ['highres', 'hd1080', 'hd720', 'large', 'medium', 'small']
             );
 
@@ -32,17 +35,17 @@
             BUFFERING: 3,
             CUED: 5
         },
-        ready: function (f) {
+        ready: function(f) {
             return f();
         }
     };
-
+    jasmine.YT = stubbedYT;
     // Stub YouTube API.
     window.YT = stubbedYT;
 
     window.STATUS = window.YT.PlayerState;
 
-    window.onTouchBasedDevice = function () {
+    window.onTouchBasedDevice = function() {
         return navigator.userAgent.match(/iPhone|iPod|iPad/i);
     };
 
@@ -76,23 +79,31 @@
 
     jasmine.stubbedMetadata = {
         '7tqY6eQzVhE': {
-            id: '7tqY6eQzVhE',
-            duration: 300
+            contentDetails: {
+                id: '7tqY6eQzVhE',
+                duration: 'PT5M0S'
+            }
         },
-        'cogebirgzzM': {
-            id: 'cogebirgzzM',
-            duration: 200
+        cogebirgzzM: {
+            contentDetails: {
+                id: 'cogebirgzzM',
+                duration: 'PT3M20S'
+            }
         },
-        'abcdefghijkl': {
-            id: 'abcdefghijkl',
-            duration: 400
+        abcdefghijkl: {
+            contentDetails: {
+                id: 'abcdefghijkl',
+                duration: 'PT6M40S'
+            }
         },
         bogus: {
-            duration: 100
+            contentDetails: {
+                duration: 'PT1M40S'
+            }
         }
     };
 
-    jasmine.fireEvent = function (el, eventName) {
+    jasmine.fireEvent = function(el, eventName) {
         var event;
 
         if (document.createEvent) {
@@ -114,20 +125,20 @@
 
     jasmine.stubbedHtml5Speeds = ['0.75', '1.0', '1.25', '1.50'];
 
-    jasmine.stubRequests = function () {
+    jasmine.stubRequests = function() {
         var spy = $.ajax;
-
-        if (!($.ajax.isSpy)) {
+        if (!jasmine.isSpy($.ajax)) {
             spy = spyOn($, 'ajax');
         }
-        return spy.andCallFake(function (settings) {
+
+        return spy.and.callFake(function(settings) {
             var match = settings.url
-                    .match(/youtube\.com\/.+\/videos\/(.+)\?v=2&alt=jsonc/),
+                    .match(/googleapis\.com\/.+\/videos\/\?id=(.+)&part=contentDetails/),
                 status, callCallback;
             if (match) {
                 status = match[1].split('_');
                 if (status && status[0] === 'status') {
-                    callCallback = function (callback) {
+                    callCallback = function(callback) {
                         callback.call(window, {}, status[1]);
                     };
 
@@ -138,14 +149,14 @@
                     };
                 } else if (settings.success) {
                     return settings.success({
-                        data: jasmine.stubbedMetadata[match[1]]
+                        items: jasmine.stubbedMetadata[match[1]]
                     });
                 } else {
                     return {
-                        always: function (callback) {
+                        always: function(callback) {
                             return callback.call(window, {}, 'success');
                         },
-                        done: function (callback) {
+                        done: function(callback) {
                             return callback.call(window, {}, 'success');
                         }
                     };
@@ -165,55 +176,19 @@
                 settings.url.match(/.+\/problem_(check|reset|show|save)$/)
             ) {
                 // Do nothing.
-                return;
+                return {};
             } else if (settings.url === '/save_user_state') {
                 return {success: true};
-            } else if (settings.url === 'http://www.youtube.com/iframe_api') {
-                // Stub YouTube API.
-                window.YT = stubbedYT;
-
-                // Call the callback that must be called when YouTube API is
-                // loaded. By specification.
-                window.onYouTubeIframeAPIReady();
-
-                return {success: true};
+            } else if (settings.url.match(new RegExp(jasmine.getFixtures().fixturesPath + '.+', 'g'))) {
+                return origAjax(settings);
             } else {
-                throw 'External request attempted for ' +
-                    settings.url +
-                    ', which is not defined.';
+                return $.ajax.and.callThrough();
             }
         });
     };
 
-    // Add custom Jasmine matchers.
-    beforeEach(function () {
-        this.addMatchers({
-            toHaveAttrs: function (attrs) {
-                var element;
-
-                if ($.isEmptyObject(attrs)) {
-                    return false;
-                }
-
-                element = this.actual;
-
-                return _.every(attrs, function (value, name) {
-                    return element.attr(name) === value;
-                });
-            },
-            toBeInRange: function (min, max) {
-                return min <= this.actual && this.actual <= max;
-            },
-            toBeInArray: function (array) {
-                return $.inArray(this.actual, array) > -1;
-            }
-        });
-
-        return this.addMatchers(window.imagediff.jasmine);
-    });
-
-    // Stub jQuery.cookie module.
-    $.cookie = jasmine.createSpy('jQuery.cookie').andReturn('1.0');
+   // Stub jQuery.cookie module.
+    $.cookie = jasmine.createSpy('jQuery.cookie').and.returnValue('1.0');
 
     // # Stub jQuery.qtip module.
     $.fn.qtip = jasmine.createSpy('jQuery.qtip');
@@ -221,8 +196,8 @@
     // Stub jQuery.scrollTo module.
     $.fn.scrollTo = jasmine.createSpy('jQuery.scrollTo');
 
-    jasmine.initializePlayer = function (fixture, params) {
-        var state;
+    jasmine.initializePlayer = function(fixture, params) {
+        var state, metadata;
 
         if (_.isString(fixture)) {
             // `fixture` is a name of a fixture file.
@@ -239,18 +214,17 @@
             loadFixtures('video_all.html');
         }
 
-        // If `params` is an object, assign it's properties as data attributes
+        // If `params` is an object, assign its properties as data attributes
         // to the main video DIV element.
         if (_.isObject(params)) {
-            $('#example')
-                .find('#video_id')
-                .data(params);
+            metadata = _.extend($('#video_id').data('metadata'), params);
+            $('#video_id').data('metadata', metadata);
         }
 
         jasmine.stubRequests();
         state = new window.Video('#example');
 
-        state.resizer = (function () {
+        state.resizer = (function() {
             var methods = [
                     'align',
                     'alignByWidthOnly',
@@ -261,13 +235,13 @@
                 ],
                 obj = {},
                 delta = {
-                    add: jasmine.createSpy().andReturn(obj),
-                    substract: jasmine.createSpy().andReturn(obj),
-                    reset: jasmine.createSpy().andReturn(obj)
+                    add: jasmine.createSpy().and.returnValue(obj),
+                    substract: jasmine.createSpy().and.returnValue(obj),
+                    reset: jasmine.createSpy().and.returnValue(obj)
                 };
 
-            $.each(methods, function (index, method) {
-                obj[method] = jasmine.createSpy(method).andReturn(obj);
+            $.each(methods, function(index, method) {
+                obj[method] = jasmine.createSpy(method).and.returnValue(obj);
             });
 
             obj.delta = delta;
@@ -279,8 +253,49 @@
         return state;
     };
 
-    jasmine.initializePlayerYouTube = function (params) {
+    jasmine.initializeHLSPlayer = function(params) {
+        return jasmine.initializePlayer('video_hls.html', params);
+    };
+
+    jasmine.initializePlayerYouTube = function(params) {
         // "video.html" contains HTML template for a YouTube video.
         return jasmine.initializePlayer('video.html', params);
+    };
+
+    jasmine.DescribeInfo = function(description, specDefinitions) {
+        this.description = description;
+        this.specDefinitions = specDefinitions;
+    };
+
+    // This HTML Fullscreen API mock should use promises or async functions
+    // as the spec defines. We do not use them here because we're locked
+    // in to a version of jasmine that doesn't fully support async functions
+    // or promises. This mock also assumes that if non-vendor prefixed methods
+    // and properties are missing, then we'll use mozilla prefixed names since
+    // automated tests happen in firefox.
+    jasmine.mockFullscreenAPI = function() {
+        var fullscreenElement;
+        var vendorChangeEvent = 'fullscreenEnabled' in document ?
+            'fullscreenchange' : 'mozfullscreenchange';
+        var vendorRequestFullscreen = 'requestFullscreen' in window.HTMLElement.prototype ?
+            'requestFullscreen' : 'mozRequestFullScreen';
+        var vendorExitFullscreen = 'exitFullscreen' in document ?
+            'exitFullscreen' : 'mozCancelFullScreen';
+        var vendorFullscreenElement = 'fullscreenEnabled' in document ?
+            'fullscreenElement' : 'mozFullScreenElement';
+
+        spyOn(window.HTMLElement.prototype, vendorRequestFullscreen).and.callFake(function() {
+            fullscreenElement = this;
+            document.dispatchEvent(new Event(vendorChangeEvent));
+        });
+
+        spyOn(document, vendorExitFullscreen).and.callFake(function() {
+            fullscreenElement = null;
+            document.dispatchEvent(new Event(vendorChangeEvent));
+        });
+
+        spyOnProperty(document, vendorFullscreenElement).and.callFake(function() {
+            return fullscreenElement;
+        });
     };
 }).call(this);

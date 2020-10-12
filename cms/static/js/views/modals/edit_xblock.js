@@ -3,23 +3,29 @@
  * It is invoked using the edit method which is passed an existing rendered xblock,
  * and upon save an optional refresh function can be invoked to update the display.
  */
-define(["jquery", "underscore", "gettext", "js/views/modals/base_modal",
-    "js/models/xblock_info", "js/views/xblock_editor"],
-    function($, _, gettext, BaseModal, XBlockInfo, XBlockEditorView) {
+define(['jquery', 'underscore', 'backbone', 'gettext', 'js/views/modals/base_modal',
+    'common/js/components/utils/view_utils', 'js/views/utils/xblock_utils', 'js/views/xblock_editor'],
+    function($, _, Backbone, gettext, BaseModal, ViewUtils, XBlockViewUtils, XBlockEditorView) {
+        'use strict';
+
         var EditXBlockModal = BaseModal.extend({
-            events : {
-                "click .action-save": "save",
-                "click .action-modes a": "changeMode"
-            },
+            events: _.extend({}, BaseModal.prototype.events, {
+                'click .action-save': 'save',
+                'click .action-modes a': 'changeMode',
+                'click .title-edit-button': 'clickTitleButton'
+            }),
 
             options: $.extend({}, BaseModal.prototype.options, {
                 modalName: 'edit-xblock',
-                addSaveButton: true
+                view: 'studio_view',
+                viewSpecificClasses: 'modal-editor confirm',
+                // Translators: "title" is the name of the current component being edited.
+                titleFormat: gettext('Editing: {title}'),
+                addPrimaryActionButton: true
             }),
 
             initialize: function() {
                 BaseModal.prototype.initialize.call(this);
-                this.events = _.extend({}, BaseModal.prototype.events, this.events);
                 this.template = this.loadTemplate('edit-xblock-modal');
                 this.editorModeButtonTemplate = this.loadTemplate('editor-mode-button');
             },
@@ -32,9 +38,10 @@ define(["jquery", "underscore", "gettext", "js/views/modals/base_modal",
              */
             edit: function(xblockElement, rootXBlockInfo, options) {
                 this.xblockElement = xblockElement;
-                this.xblockInfo = this.findXBlockInfo(xblockElement, rootXBlockInfo);
+                this.xblockInfo = XBlockViewUtils.findXBlockInfo(xblockElement, rootXBlockInfo);
                 this.options.modalType = this.xblockInfo.get('category');
                 this.editOptions = options;
+
                 this.render();
                 this.show();
 
@@ -55,24 +62,26 @@ define(["jquery", "underscore", "gettext", "js/views/modals/base_modal",
             displayXBlock: function() {
                 this.editorView = new XBlockEditorView({
                     el: this.$('.xblock-editor'),
-                    model: this.xblockInfo
+                    model: this.xblockInfo,
+                    view: this.options.view
                 });
                 this.editorView.render({
                     success: _.bind(this.onDisplayXBlock, this)
                 });
             },
 
+            createTitleEditor: function(title) {
+                // xss-lint: disable=javascript-jquery-html
+                this.$('.modal-window-title').html(this.loadTemplate('edit-title-button')({title: title}));
+            },
+
             onDisplayXBlock: function() {
                 var editorView = this.editorView,
                     title = this.getTitle(),
-                    xblock = editorView.xblock,
-                    runtime = xblock.runtime;
+                    readOnlyView = (this.editOptions && this.editOptions.readOnlyView) || !this.canSave();
 
                 // Notify the runtime that the modal has been shown
-                if (runtime) {
-                    this.runtime = runtime;
-                    runtime.notify('modal-shown', this);
-                }
+                editorView.notifyRuntime('modal-shown', this);
 
                 // Update the modal's header
                 if (editorView.hasCustomTabs()) {
@@ -81,41 +90,55 @@ define(["jquery", "underscore", "gettext", "js/views/modals/base_modal",
 
                     // Update the custom editor's title
                     editorView.$('.component-name').text(title);
+                } else if (editorView.getDataEditor() && editorView.getMetadataEditor()) {
+                    this.createTitleEditor(title);
+                    this.addDefaultModes();
+                    // If the plugins content element exists, add a button to reveal it.
+                    if (this.$('.wrapper-comp-plugins').length > 0) {
+                        this.addModeButton('plugins', gettext('Plugins'));
+                    }
+                    this.selectMode(editorView.mode);
                 } else {
                     this.$('.modal-window-title').text(title);
-                    if (editorView.getDataEditor() && editorView.getMetadataEditor()) {
-                        this.addDefaultModes();
-                        this.selectMode(editorView.mode);
-                    }
                 }
 
                 // If the xblock is not using custom buttons then choose which buttons to show
                 if (!editorView.hasCustomButtons()) {
                     // If the xblock does not support save then disable the save button
-                    if (!xblock.save) {
+                    if (readOnlyView) {
                         this.disableSave();
                     }
                     this.getActionBar().show();
                 }
-
-                // Resize the modal to fit the window
                 this.resize();
+            },
+
+            canSave: function() {
+                return this.editorView.xblock.save || this.editorView.xblock.collectFieldData;
             },
 
             disableSave: function() {
                 var saveButton = this.getActionButton('save'),
                     cancelButton = this.getActionButton('cancel');
-                saveButton.hide();
-                cancelButton.text(gettext('OK'));
+                saveButton.parent().hide();
+                cancelButton.text(gettext('Close'));
                 cancelButton.addClass('action-primary');
             },
 
             getTitle: function() {
                 var displayName = this.xblockInfo.get('display_name');
                 if (!displayName) {
-                    displayName = gettext('Component');
+                    if (this.xblockInfo.isVertical()) {
+                        displayName = gettext('Unit');
+                    } else {
+                        displayName = gettext('Component');
+                    }
                 }
-                return interpolate(gettext("Editing: %(title)s"), { title: displayName }, true);
+                return edx.StringUtils.interpolate(
+                    this.options.titleFormat, {
+                        title: displayName
+                    }
+                );
             },
 
             addDefaultModes: function() {
@@ -128,9 +151,8 @@ define(["jquery", "underscore", "gettext", "js/views/modals/base_modal",
             },
 
             changeMode: function(event) {
-                this.removeCheatsheetVisibility();
-                var parent = $(event.target.parentElement),
-                    mode = parent.data('mode');
+                var $parent = $(event.target.parentElement),
+                    mode = $parent.data('mode');
                 event.preventDefault();
                 this.selectMode(mode);
             },
@@ -147,10 +169,19 @@ define(["jquery", "underscore", "gettext", "js/views/modals/base_modal",
             },
 
             save: function(event) {
+                var self = this,
+                    editorView = this.editorView,
+                    xblockInfo = this.xblockInfo,
+                    data = editorView.getXBlockFieldData();
                 event.preventDefault();
-                this.editorView.save({
-                    success: _.bind(this.onSave, this)
-                });
+                if (data) {
+                    ViewUtils.runOperationShowingMessage(gettext('Saving'),
+                        function() {
+                            return xblockInfo.save(data);
+                        }).done(function() {
+                            self.onSave();
+                        });
+                }
             },
 
             onSave: function() {
@@ -162,53 +193,48 @@ define(["jquery", "underscore", "gettext", "js/views/modals/base_modal",
             },
 
             hide: function() {
+                // Notify child views to stop listening events
+                Backbone.trigger('xblock:editorModalHidden');
+
                 BaseModal.prototype.hide.call(this);
 
                 // Notify the runtime that the modal has been hidden
-                if (this.runtime) {
-                    this.runtime.notify('modal-hidden');
-                }
-            },
-
-            findXBlockInfo: function(xblockWrapperElement, defaultXBlockInfo) {
-                var xblockInfo = defaultXBlockInfo,
-                    xblockElement,
-                    displayName;
-                if (xblockWrapperElement.length > 0) {
-                    xblockElement = xblockWrapperElement.find('.xblock');
-                    displayName = xblockWrapperElement.find('.xblock-header .header-details .xblock-display-name').text().trim();
-                    // If not found, try looking for the old unit page style rendering
-                    if (!displayName) {
-                        displayName = this.xblockElement.find('.component-header').text().trim();
-                    }
-                    xblockInfo = new XBlockInfo({
-                        id: xblockWrapperElement.data('locator'),
-                        courseKey: xblockWrapperElement.data('course-key'),
-                        category: xblockElement.data('block-type'),
-                        display_name: displayName
-                    });
-                }
-                return xblockInfo;
+                this.editorView.notifyRuntime('modal-hidden');
             },
 
             addModeButton: function(mode, displayName) {
                 var buttonPanel = this.$('.editor-modes');
+                // xss-lint: disable=javascript-jquery-append
                 buttonPanel.append(this.editorModeButtonTemplate({
                     mode: mode,
                     displayName: displayName
                 }));
             },
 
-            removeCheatsheetVisibility: function() {
-                var cheatsheet = $('article.simple-editor-open-ended-cheatsheet');
-                if (cheatsheet.length === 0) {
-                    cheatsheet = $('article.simple-editor-cheatsheet');
-                }
-                if (cheatsheet.hasClass('shown')) {
-                    cheatsheet.removeClass('shown');
-                    $('.modal-content').removeClass('cheatsheet-is-shown');
-                }
+            clickTitleButton: function(event) {
+                var self = this,
+                    oldTitle = this.xblockInfo.get('display_name'),
+                    titleElt = this.$('.modal-window-title'),
+                    $input = $('<input type="text" size="40" />'),
+                    changeFunc = function(evt) {
+                        var newTitle = $(evt.target).val();
+                        if (oldTitle !== newTitle) {
+                            self.xblockInfo.set('display_name', newTitle);
+                            self.xblockInfo.save({metadata: {display_name: newTitle}});
+                        }
+                        self.createTitleEditor(self.getTitle());
+                        return true;
+                    };
+                event.preventDefault();
+
+                $input.val(oldTitle);
+                $input.change(changeFunc).blur(changeFunc);
+                titleElt.html($input);  // xss-lint: disable=javascript-jquery-html
+                $input.focus().select();
+                $(event.target).remove();
+                return true;
             }
+
         });
 
         return EditXBlockModal;

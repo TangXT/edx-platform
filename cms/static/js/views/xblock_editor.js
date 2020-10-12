@@ -2,10 +2,9 @@
  * XBlockEditorView displays the authoring view of an xblock, and allows the user to switch between
  * the available modes.
  */
-define(["jquery", "underscore", "gettext", "js/views/feedback_notification", "js/views/xblock",
-        "js/views/metadata", "js/collections/metadata", "jquery.inputnumber"],
-    function ($, _, gettext, NotificationView, XBlockView, MetadataView, MetadataCollection) {
-
+define(['jquery', 'underscore', 'gettext', 'js/views/baseview', 'js/views/xblock', 'js/views/metadata', 'js/collections/metadata',
+    'jquery.inputnumber'],
+    function($, _, gettext, BaseView, XBlockView, MetadataView, MetadataCollection) {
         var XBlockEditorView = XBlockView.extend({
             // takes XBlockInfo as a model
 
@@ -25,6 +24,7 @@ define(["jquery", "underscore", "gettext", "js/views/feedback_notification", "js
 
             initializeEditors: function() {
                 var metadataEditor,
+                    pluginEl,
                     defaultMode = 'editor';
                 metadataEditor = this.createMetadataEditor();
                 this.metadataEditor = metadataEditor;
@@ -36,12 +36,18 @@ define(["jquery", "underscore", "gettext", "js/views/feedback_notification", "js
                     }
                     this.selectMode(defaultMode);
                 }
+                pluginEl = this.$('.wrapper-comp-plugins');
+                if (pluginEl.length > 0) {
+                    this.pluginEditor = new BaseView({
+                        el: pluginEl
+                    });
+                }
             },
 
             getDefaultModes: function() {
                 return [
-                    { id: 'editor', name: gettext("Editor")},
-                    { id: 'settings', name: gettext("Settings")}
+                    {id: 'editor', name: gettext('Editor')},
+                    {id: 'settings', name: gettext('Settings')}
                 ];
             },
 
@@ -88,38 +94,28 @@ define(["jquery", "underscore", "gettext", "js/views/feedback_notification", "js
                 return this.metadataEditor;
             },
 
-            save: function(options) {
-                var xblockInfo = this.model,
-                    data,
-                    saving;
-                data = this.getXModuleData();
-                if (data) {
-                    saving = new NotificationView.Mini({
-                        title: gettext('Saving&hellip;')
-                    });
-                    saving.show();
-                    return xblockInfo.save(data).done(function() {
-                        var success = options.success;
-                        saving.hide();
-                        if (success) {
-                            success();
-                        }
-                    });
-                }
+            getPluginEditor: function() {
+                return this.pluginEditor;
             },
 
             /**
-             * Returns the data saved for the xmodule. Note that this *does not* work for XBlocks.
+             * Returns the updated field data for the xblock. Note that this works for all
+             * XModules as well as for XBlocks that provide a 'collectFieldData' API.
              */
-            getXModuleData: function() {
+            getXBlockFieldData: function() {
                 var xblock = this.xblock,
                     metadataEditor = this.getMetadataEditor(),
                     data = null;
-                if (xblock.save) {
+                // If the xblock supports returning its field data then collect it
+                if (xblock.collectFieldData) {
+                    data = xblock.collectFieldData();
+                // ... else if this is an XModule then call its save method
+                } else if (xblock.save) {
                     data = xblock.save();
                     if (metadataEditor) {
                         data.metadata = _.extend(data.metadata || {}, this.getChangedMetadata());
                     }
+                // ... else log an error
                 } else {
                     console.error('Cannot save xblock as it has no save method');
                 }
@@ -148,7 +144,7 @@ define(["jquery", "underscore", "gettext", "js/views/feedback_notification", "js
                 metadataNameElements = this.$('[data-metadata-name]');
                 for (i = 0; i < metadataNameElements.length; i++) {
                     element = metadataNameElements[i];
-                    metadataName = $(element).data("metadata-name");
+                    metadataName = $(element).data('metadata-name');
                     metadata[metadataName] = element.value;
                 }
                 return metadata;
@@ -159,14 +155,17 @@ define(["jquery", "underscore", "gettext", "js/views/feedback_notification", "js
             },
 
             selectMode: function(mode) {
-                var showEditor = mode === 'editor',
-                    dataEditor = this.getDataEditor(),
-                    metadataEditor = this.getMetadataEditor();
+                var dataEditor = this.getDataEditor(),
+                    metadataEditor = this.getMetadataEditor(),
+                    pluginEditor = this.getPluginEditor();
                 if (dataEditor) {
-                    this.setEditorActivation(dataEditor, showEditor);
+                    this.setEditorActivation(dataEditor, mode === 'editor');
                 }
                 if (metadataEditor) {
-                    this.setEditorActivation(metadataEditor.$el, !showEditor);
+                    this.setEditorActivation(metadataEditor.$el, mode === 'settings');
+                }
+                if (pluginEditor) {
+                    this.setEditorActivation(pluginEditor.$el, mode === 'plugins');
                 }
                 this.mode = mode;
             },

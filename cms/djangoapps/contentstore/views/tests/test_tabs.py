@@ -1,14 +1,16 @@
 """ Tests for tab functions (just primitive). """
 
+
 import json
-from contentstore.views import tabs
+
 from contentstore.tests.utils import CourseTestCase
-from django.test import TestCase
-from xmodule.x_module import STUDENT_VIEW
-from xmodule.modulestore.tests.factories import CourseFactory, ItemFactory
-from xmodule.tabs import CourseTabList, WikiTab
 from contentstore.utils import reverse_course_url
+from contentstore.views import tabs
 from xmodule.modulestore.django import modulestore
+from xmodule.modulestore.tests.django_utils import ModuleStoreTestCase
+from xmodule.modulestore.tests.factories import CourseFactory, ItemFactory
+from xmodule.tabs import CourseTabList
+from xmodule.x_module import STUDENT_VIEW
 
 
 class TabsPageTests(CourseTestCase):
@@ -35,7 +37,7 @@ class TabsPageTests(CourseTestCase):
         """Verify response is an error listing the invalid_tab_id"""
 
         self.assertEqual(resp.status_code, 400)
-        resp_content = json.loads(resp.content)
+        resp_content = json.loads(resp.content.decode('utf-8'))
         self.assertIn("error", resp_content)
         self.assertIn("invalid_tab_id", resp_content['error'])
 
@@ -51,7 +53,7 @@ class TabsPageTests(CourseTestCase):
             self.client.ajax_post(
                 self.url,
                 data=json.dumps({
-                    'tab_id_locator': {'tab_id': WikiTab.type},
+                    'tab_id_locator': {'tab_id': 'courseware'},
                     'unsupported_request': None,
                 }),
             )
@@ -67,8 +69,7 @@ class TabsPageTests(CourseTestCase):
         """Basic check that the Pages page responds correctly"""
 
         resp = self.client.get_html(self.url)
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn('course-nav-list', resp.content)
+        self.assertContains(resp, 'course-nav-list')
 
     def test_reorder_tabs(self):
         """Test re-ordering of tabs"""
@@ -79,15 +80,15 @@ class TabsPageTests(CourseTestCase):
         num_orig_tabs = len(orig_tab_ids)
 
         # make sure we have enough tabs to play around with
-        self.assertTrue(num_orig_tabs >= 5)
+        self.assertGreaterEqual(num_orig_tabs, 5)
 
         # reorder the last two tabs
         tab_ids[num_orig_tabs - 1], tab_ids[num_orig_tabs - 2] = tab_ids[num_orig_tabs - 2], tab_ids[num_orig_tabs - 1]
 
         # remove the middle tab
         # (the code needs to handle the case where tabs requested for re-ordering is a subset of the tabs in the course)
-        removed_tab = tab_ids.pop(num_orig_tabs / 2)
-        self.assertTrue(len(tab_ids) == num_orig_tabs - 1)
+        removed_tab = tab_ids.pop(num_orig_tabs // 2)
+        self.assertEqual(len(tab_ids), num_orig_tabs - 1)
 
         # post the request
         resp = self.client.ajax_post(
@@ -117,7 +118,7 @@ class TabsPageTests(CourseTestCase):
             data={'tabs': [{'tab_id': tab_id} for tab_id in tab_ids]},
         )
         self.assertEqual(resp.status_code, 400)
-        resp_content = json.loads(resp.content)
+        resp_content = json.loads(resp.content.decode('utf-8'))
         self.assertIn("error", resp_content)
 
     def test_reorder_tabs_invalid_tab(self):
@@ -157,10 +158,9 @@ class TabsPageTests(CourseTestCase):
         self.assertEqual(new_tab.is_hidden, new_is_hidden_setting)
 
     def test_toggle_tab_visibility(self):
-        """Test toggling of tab visiblity"""
-
-        self.check_toggle_tab_visiblity(WikiTab.type, True)
-        self.check_toggle_tab_visiblity(WikiTab.type, False)
+        """Test toggling of tab visibility"""
+        self.check_toggle_tab_visiblity('wiki', True)
+        self.check_toggle_tab_visiblity('wiki', False)
 
     def test_toggle_invalid_tab_visibility(self):
         """Test toggling visibility of an invalid tab"""
@@ -182,7 +182,7 @@ class TabsPageTests(CourseTestCase):
 
         resp = self.client.get(preview_url, HTTP_ACCEPT='application/json')
         self.assertEqual(resp.status_code, 200)
-        resp_content = json.loads(resp.content)
+        resp_content = json.loads(resp.content.decode('utf-8'))
         html = resp_content['html']
 
         # Verify that the HTML contains the expected elements
@@ -192,37 +192,36 @@ class TabsPageTests(CourseTestCase):
         self.assertIn('<span data-tooltip="Drag to reorder" class="drag-handle action"></span>', html)
 
 
-
-class PrimitiveTabEdit(TestCase):
+class PrimitiveTabEdit(ModuleStoreTestCase):
     """Tests for the primitive tab edit data manipulations"""
 
     def test_delete(self):
         """Test primitive tab deletion."""
-        course = CourseFactory.create(org='edX', course='999')
+        course = CourseFactory.create()
         with self.assertRaises(ValueError):
             tabs.primitive_delete(course, 0)
         with self.assertRaises(ValueError):
             tabs.primitive_delete(course, 1)
         with self.assertRaises(IndexError):
-            tabs.primitive_delete(course, 6)
+            tabs.primitive_delete(course, 7)
         tabs.primitive_delete(course, 2)
-        self.assertFalse({u'type': u'textbooks'} in course.tabs)
+        self.assertNotIn({u'type': u'textbooks'}, course.tabs)
         # Check that discussion has shifted up
-        self.assertEquals(course.tabs[2], {'type': 'discussion', 'name': 'Discussion'})
+        self.assertEqual(course.tabs[2], {'type': 'discussion', 'name': 'Discussion'})
 
     def test_insert(self):
         """Test primitive tab insertion."""
-        course = CourseFactory.create(org='edX', course='999')
-        tabs.primitive_insert(course, 2, 'notes', 'aname')
-        self.assertEquals(course.tabs[2], {'type': 'notes', 'name': 'aname'})
+        course = CourseFactory.create()
+        tabs.primitive_insert(course, 2, 'pdf_textbooks', 'aname')
+        self.assertEqual(course.tabs[2], {'type': 'pdf_textbooks', 'name': 'aname'})
         with self.assertRaises(ValueError):
-            tabs.primitive_insert(course, 0, 'notes', 'aname')
+            tabs.primitive_insert(course, 0, 'pdf_textbooks', 'aname')
         with self.assertRaises(ValueError):
             tabs.primitive_insert(course, 3, 'static_tab', 'aname')
 
     def test_save(self):
         """Test course saving."""
-        course = CourseFactory.create(org='edX', course='999')
-        tabs.primitive_insert(course, 3, 'notes', 'aname')
+        course = CourseFactory.create()
+        tabs.primitive_insert(course, 3, 'pdf_textbooks', 'aname')
         course2 = modulestore().get_course(course.id)
-        self.assertEquals(course2.tabs[3], {'type': 'notes', 'name': 'aname'})
+        self.assertEqual(course2.tabs[3], {'type': 'pdf_textbooks', 'name': 'aname'})

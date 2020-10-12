@@ -1,27 +1,32 @@
+
+
 import logging
+import textwrap
 
 from lxml import etree
 from pkg_resources import resource_string
-
-from xmodule.x_module import XModule
-from xmodule.raw_module import RawDescriptor
 from xblock.fields import Scope, String
-import textwrap
+
+from openedx.core.djangolib.markup import HTML, Text
+from xmodule.raw_module import RawDescriptor
+from xmodule.x_module import XModule
 
 log = logging.getLogger(__name__)
 
-# Make '_' a no-op so we can scrape strings
+# Make '_' a no-op so we can scrape strings. Using lambda instead of
+#  `django.utils.translation.ugettext_noop` because Django cannot be imported in this file
 _ = lambda text: text
 
 
 class AnnotatableFields(object):
-    data = String(help=_("XML data for the annotation"), scope=Scope.content,
-        default=textwrap.dedent(
-        """\
+    data = String(
+        help=_("XML data for the annotation"),
+        scope=Scope.content,
+        default=textwrap.dedent(HTML(u"""
         <annotatable>
             <instructions>
                 <p>Enter your (optional) instructions for the exercise in HTML format.</p>
-                <p>Annotations are specified by an <code>&lt;annotation&gt;</code> tag which may may have the following attributes:</p>
+                <p>Annotations are specified by an <code>{}annotation{}</code> tag which may may have the following attributes:</p>
                 <ul class="instructions-template">
                     <li><code>title</code> (optional). Title of the annotation. Defaults to <i>Commentary</i> if omitted.</li>
                     <li><code>body</code> (<b>required</b>). Text of the annotation.</li>
@@ -33,10 +38,11 @@ class AnnotatableFields(object):
             <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. <annotation title="My title" body="My comment" highlight="yellow" problem="0">Ut sodales laoreet est, egestas gravida felis egestas nec.</annotation> Aenean at volutpat erat. Cras commodo viverra nibh in aliquam.</p>
             <p>Nulla facilisi. <annotation body="Basic annotation example." problem="1">Pellentesque id vestibulum libero.</annotation> Suspendisse potenti. Morbi scelerisque nisi vitae felis dictum mattis. Nam sit amet magna elit. Nullam volutpat cursus est, sit amet sagittis odio vulputate et. Curabitur euismod, orci in vulputate imperdiet, augue lorem tempor purus, id aliquet augue turpis a est. Aenean a sagittis libero. Praesent fringilla pretium magna, non condimentum risus elementum nec. Pellentesque faucibus elementum pharetra. Pellentesque vitae metus eros.</p>
         </annotatable>
-        """))
+        """).format(Text('<'), Text('>')))
+    )
     display_name = String(
         display_name=_("Display Name"),
-        help=_("Display name for this module"),
+        help=_("The display name for this component."),
         scope=Scope.settings,
         default=_('Annotation'),
     )
@@ -44,12 +50,10 @@ class AnnotatableFields(object):
 
 class AnnotatableModule(AnnotatableFields, XModule):
     js = {
-        'coffee': [
-            resource_string(__name__, 'js/src/javascript_loader.coffee'),
-            resource_string(__name__, 'js/src/html/display.coffee'),
-            resource_string(__name__, 'js/src/annotatable/display.coffee'),
-        ],
         'js': [
+            resource_string(__name__, 'js/src/html/display.js'),
+            resource_string(__name__, 'js/src/annotatable/display.js'),
+            resource_string(__name__, 'js/src/javascript_loader.js'),
             resource_string(__name__, 'js/src/collapsible.js'),
         ]
     }
@@ -147,7 +151,7 @@ class AnnotatableModule(AnnotatableFields, XModule):
     def get_html(self):
         """ Renders parameters to template. """
         context = {
-            'display_name': self.display_name_with_default,
+            'display_name': self.display_name_with_default_escaped,
             'element_id': self.element_id,
             'instructions_html': self.instructions,
             'content_html': self._render_content()
@@ -159,3 +163,4 @@ class AnnotatableModule(AnnotatableFields, XModule):
 class AnnotatableDescriptor(AnnotatableFields, RawDescriptor):
     module_class = AnnotatableModule
     mako_template = "widgets/raw-edit.html"
+    resources_dir = None

@@ -1,33 +1,45 @@
 """
 Tests for XML importer.
 """
+
+
+import importlib
+import os
+import unittest
+from uuid import uuid4
+
 import mock
-from xblock.core import XBlock
-from xblock.fields import String, Scope, ScopeIds
-from xblock.runtime import Runtime, KvsFieldData, DictKeyValueStore
-from xmodule.x_module import XModuleMixin
-from opaque_keys.edx.locations import Location
+import six
+from opaque_keys.edx.keys import CourseKey
+from opaque_keys.edx.locator import BlockUsageLocator, CourseLocator
+from path import Path as path
+from xblock.fields import List, Scope, ScopeIds, String
+from xblock.runtime import DictKeyValueStore, KvsFieldData, Runtime
+
 from xmodule.modulestore import ModuleStoreEnum
 from xmodule.modulestore.inheritance import InheritanceMixin
-from xmodule.modulestore.xml_importer import _import_module_and_update_references
-from opaque_keys.edx.locations import SlashSeparatedCourseKey
+from xmodule.modulestore.tests.mongo_connection import MONGO_HOST, MONGO_PORT_NUM
+from xmodule.modulestore.xml_importer import StaticContentImporter, _update_and_import_module, _update_module_location
 from xmodule.tests import DATA_DIR
-from uuid import uuid4
-import unittest
-import importlib
+from xmodule.x_module import XModuleMixin
+
+if six.PY2:
+    OPEN_BUILTIN = '__builtin__.open'
+else:
+    OPEN_BUILTIN = 'builtins.open'
 
 
 class ModuleStoreNoSettings(unittest.TestCase):
     """
     A mixin to create a mongo modulestore that avoids settings
     """
-    HOST = 'localhost'
-    PORT = 27017
+    HOST = MONGO_HOST
+    PORT = MONGO_PORT_NUM
     DB = 'test_mongo_%s' % uuid4().hex[:5]
     COLLECTION = 'modulestore'
     FS_ROOT = DATA_DIR
     DEFAULT_CLASS = 'xmodule.modulestore.tests.test_xml_importer.StubXBlock'
-    RENDER_TEMPLATE = lambda t_n, d, ctx = None, nsp = 'main': ''
+    RENDER_TEMPLATE = lambda t_n, d, ctx=None, nsp='main': ''
 
     modulestore_options = {
         'default_class': DEFAULT_CLASS,
@@ -36,6 +48,7 @@ class ModuleStoreNoSettings(unittest.TestCase):
     }
     DOC_STORE_CONFIG = {
         'host': HOST,
+        'port': PORT,
         'db': DB,
         'collection': COLLECTION,
     }
@@ -82,23 +95,23 @@ def modulestore():
         options.update(ModuleStoreNoSettings.MODULESTORE['OPTIONS'])
         options['render_template'] = render_to_template_mock
 
-        # pylint: disable=W0142
+        # pylint: disable=star-args
         ModuleStoreNoSettings.modulestore = class_(
             None,  # contentstore
             ModuleStoreNoSettings.MODULESTORE['DOC_STORE_CONFIG'],
-            branch_setting_func = lambda: ModuleStoreEnum.Branch.draft_preferred,
+            branch_setting_func=lambda: ModuleStoreEnum.Branch.draft_preferred,
             **options
         )
 
     return ModuleStoreNoSettings.modulestore
 
 
-# pylint: disable=W0613
+# pylint: disable=unused-argument
 def render_to_template_mock(*args):
     pass
 
 
-class StubXBlock(XBlock, XModuleMixin, InheritanceMixin):
+class StubXBlock(XModuleMixin, InheritanceMixin):
     """
     Stub XBlock used for testing.
     """
@@ -133,7 +146,7 @@ class RemapNamespaceTest(ModuleStoreNoSettings):
     def test_remap_namespace_native_xblock(self):
 
         # Set the XBlock's location
-        self.xblock.location = Location("org", "import", "run", "category", "stubxblock")
+        self.xblock.location = BlockUsageLocator(CourseLocator("org", "import", "run"), "category", "stubxblock")
 
         # Explicitly set the content and settings fields
         self.xblock.test_content_field = "Explicitly set"
@@ -141,8 +154,8 @@ class RemapNamespaceTest(ModuleStoreNoSettings):
         self.xblock.save()
 
         # Move to different runtime w/ different course id
-        target_location_namespace = SlashSeparatedCourseKey("org", "course", "run")
-        new_version = _import_module_and_update_references(
+        target_location_namespace = CourseKey.from_string("org/course/run")
+        new_version = _update_and_import_module(
             self.xblock,
             modulestore(),
             999,
@@ -172,14 +185,14 @@ class RemapNamespaceTest(ModuleStoreNoSettings):
     def test_remap_namespace_native_xblock_default_values(self):
 
         # Set the XBlock's location
-        self.xblock.location = Location("org", "import", "run", "category", "stubxblock")
+        self.xblock.location = BlockUsageLocator(CourseLocator("org", "import", "run"), "category", "stubxblock")
 
         # Do NOT set any values, so the fields should use the defaults
         self.xblock.save()
 
         # Remap the namespace
-        target_location_namespace = Location("org", "course", "run", "category", "stubxblock")
-        new_version = _import_module_and_update_references(
+        target_location_namespace = BlockUsageLocator(CourseLocator("org", "course", "run"), "category", "stubxblock")
+        new_version = _update_and_import_module(
             self.xblock,
             modulestore(),
             999,
@@ -206,12 +219,12 @@ class RemapNamespaceTest(ModuleStoreNoSettings):
     def test_remap_namespace_native_xblock_inherited_values(self):
 
         # Set the XBlock's location
-        self.xblock.location = Location("org", "import", "run", "category", "stubxblock")
+        self.xblock.location = BlockUsageLocator(CourseLocator("org", "import", "run"), "category", "stubxblock")
         self.xblock.save()
 
         # Remap the namespace
-        target_location_namespace = Location("org", "course", "run", "category", "stubxblock")
-        new_version = _import_module_and_update_references(
+        target_location_namespace = BlockUsageLocator(CourseLocator("org", "course", "run"), "category", "stubxblock")
+        new_version = _update_and_import_module(
             self.xblock,
             modulestore(),
             999,
@@ -227,3 +240,155 @@ class RemapNamespaceTest(ModuleStoreNoSettings):
         self.assertNotIn(
             'graded', new_version.get_explicitly_set_fields_by_scope(scope=Scope.settings)
         )
+
+    def test_xblock_invalid_field_value_type(self):
+        # Setting the wrong field-value in Xblock-field will raise TypeError.
+        # Example if xblock-field is of 'Dictionary' type by setting the 'List' value in that dict-type will raise
+        # TypeError.
+
+        # Set the XBlock's location
+        self.xblock.location = BlockUsageLocator(CourseLocator("org", "import", "run"), "category", "stubxblock")
+        # Explicitly set the content field
+        self.xblock.test_content_field = ['Explicitly set']
+        self.xblock.save()
+
+        # clearing the dirty fields and removing value from cache will fetch the value from field-data.
+        self.xblock._dirty_fields = {}  # pylint: disable=protected-access
+        self.xblock.fields['test_content_field']._del_cached_value(self.xblock)  # pylint: disable=protected-access
+        with self.assertRaises(TypeError):
+            self.xblock.get_explicitly_set_fields_by_scope(scope=Scope.content)
+
+
+class StubXBlockWithMutableFields(StubXBlock):
+    """
+    Stub XBlock used for testing mutable fields and children
+    """
+    has_children = True
+
+    test_mutable_content_field = List(
+        help="A mutable content field that will be explicitly set",
+        scope=Scope.content,
+    )
+
+    test_mutable_settings_field = List(
+        help="A mutable settings field that will be explicitly set",
+        scope=Scope.settings,
+    )
+
+
+class UpdateLocationTest(ModuleStoreNoSettings):
+    """
+    Test that updating location preserves "is_set_on" status on fields
+    """
+    CONTENT_FIELDS = ['test_content_field', 'test_mutable_content_field']
+    SETTINGS_FIELDS = ['test_settings_field', 'test_mutable_settings_field']
+    CHILDREN_FIELDS = ['children']
+
+    def setUp(self):
+        """
+        Create a stub XBlock backed by in-memory storage.
+        """
+        self.runtime = mock.MagicMock(Runtime)
+        self.field_data = KvsFieldData(kvs=DictKeyValueStore())
+        self.scope_ids = ScopeIds('Bob', 'mutablestubxblock', '123', 'import')
+        self.xblock = StubXBlockWithMutableFields(self.runtime, self.field_data, self.scope_ids)
+
+        self.fake_children_locations = [
+            BlockUsageLocator(CourseLocator('org', 'course', 'run'), 'mutablestubxblock', 'child1'),
+            BlockUsageLocator(CourseLocator('org', 'course', 'run'), 'mutablestubxblock', 'child2'),
+        ]
+
+        super(UpdateLocationTest, self).setUp()
+
+    def _check_explicitly_set(self, block, scope, expected_explicitly_set_fields, should_be_set=False):
+        """ Gets fields that are explicitly set on block and checks if they are marked as explicitly set or not """
+        actual_explicitly_set_fields = block.get_explicitly_set_fields_by_scope(scope=scope)
+        assertion = self.assertIn if should_be_set else self.assertNotIn
+        for field in expected_explicitly_set_fields:
+            assertion(field, actual_explicitly_set_fields)
+
+    def test_update_locations_native_xblock(self):
+        """ Update locations updates location and keeps values and "is_set_on" status """
+        # Set the XBlock's location
+        self.xblock.location = BlockUsageLocator(CourseLocator("org", "import", "run"), "category", "stubxblock")
+
+        # Explicitly set the content, settings and children fields
+        self.xblock.test_content_field = 'Explicitly set'
+        self.xblock.test_settings_field = 'Explicitly set'
+        self.xblock.test_mutable_content_field = [1, 2, 3]
+        self.xblock.test_mutable_settings_field = ["a", "s", "d"]
+        self.xblock.children = self.fake_children_locations  # pylint:disable=attribute-defined-outside-init
+        self.xblock.save()
+
+        # Update location
+        target_location = self.xblock.location.replace(revision='draft')
+        _update_module_location(self.xblock, target_location)
+        new_version = self.xblock  # _update_module_location updates in-place
+
+        # Check the XBlock's location
+        self.assertEqual(new_version.location, target_location)
+
+        # Check the values of the fields.
+        # The content, settings and children fields should be preserved
+        self.assertEqual(new_version.test_content_field, 'Explicitly set')
+        self.assertEqual(new_version.test_settings_field, 'Explicitly set')
+        self.assertEqual(new_version.test_mutable_content_field, [1, 2, 3])
+        self.assertEqual(new_version.test_mutable_settings_field, ["a", "s", "d"])
+        self.assertEqual(new_version.children, self.fake_children_locations)
+
+        # Expect that these fields are marked explicitly set
+        self._check_explicitly_set(new_version, Scope.content, self.CONTENT_FIELDS, should_be_set=True)
+        self._check_explicitly_set(new_version, Scope.settings, self.SETTINGS_FIELDS, should_be_set=True)
+        self._check_explicitly_set(new_version, Scope.children, self.CHILDREN_FIELDS, should_be_set=True)
+
+        # Expect these fields pass "is_set_on" test
+        for field in self.CONTENT_FIELDS + self.SETTINGS_FIELDS + self.CHILDREN_FIELDS:
+            self.assertTrue(new_version.fields[field].is_set_on(new_version))
+
+
+class StaticContentImporterTest(unittest.TestCase):
+
+    def setUp(self):
+        self.course_data_path = path('/path')
+        self.mocked_content_store = mock.Mock()
+        self.static_content_importer = StaticContentImporter(
+            static_content_store=self.mocked_content_store,
+            course_data_path=self.course_data_path,
+            target_id=CourseKey.from_string('course-v1:edX+DemoX+Demo_Course')
+        )
+
+    def test_import_static_content_directory(self):
+        static_content_dir = 'static'
+        expected_base_dir = path(self.course_data_path / static_content_dir)
+        mocked_os_walk_yield = [
+            ('static', None, ['file1.txt', 'file2.txt']),
+            ('static/inner', None, ['file1.txt']),
+        ]
+        with mock.patch(
+            'xmodule.modulestore.xml_importer.os.walk',
+            return_value=mocked_os_walk_yield
+        ), mock.patch.object(
+            self.static_content_importer, 'import_static_file'
+        ) as patched_import_static_file:
+            self.static_content_importer.import_static_content_directory('static')
+            patched_import_static_file.assert_any_call(
+                'static/file1.txt', base_dir=expected_base_dir
+            )
+            patched_import_static_file.assert_any_call(
+                'static/file2.txt', base_dir=expected_base_dir
+            )
+            patched_import_static_file.assert_any_call(
+                'static/inner/file1.txt', base_dir=expected_base_dir
+            )
+
+    def test_import_static_file(self):
+        base_dir = path('/path/to/dir')
+        full_file_path = os.path.join(base_dir, 'static/some_file.txt')
+        self.mocked_content_store.generate_thumbnail.return_value = (None, None)
+        with mock.patch(OPEN_BUILTIN, mock.mock_open(read_data=b"data")) as mock_file:
+            self.static_content_importer.import_static_file(
+                full_file_path=full_file_path,
+                base_dir=base_dir
+            )
+            mock_file.assert_called_with(full_file_path, 'rb')
+            self.mocked_content_store.generate_thumbnail.assert_called_once()

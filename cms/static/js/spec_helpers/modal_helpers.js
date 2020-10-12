@@ -1,30 +1,30 @@
 /**
  * Provides helper methods for invoking Studio modal windows in Jasmine tests.
  */
-define(["jquery", "js/spec_helpers/view_helpers"],
-    function($, view_helpers) {
-        var installModalTemplates,
-            getModalElement,
-            isShowingModal,
-            hideModalIfShowing,
-            pressModalButton,
-            cancelModal,
-            cancelModalIfShowing;
+define(['jquery', 'common/js/spec_helpers/template_helpers', 'common/js/spec_helpers/view_helpers'],
+    function($, TemplateHelpers, ViewHelpers) {
+        var installModalTemplates, getModalElement, getModalWindow, getModalTitle, isShowingModal,
+            hideModalIfShowing, pressModalButton, cancelModal, cancelModalIfShowing;
 
         installModalTemplates = function(append) {
-            view_helpers.installViewTemplates(append);
-            view_helpers.installTemplate('basic-modal');
-            view_helpers.installTemplate('modal-button');
+            ViewHelpers.installViewTemplates(append);
+            TemplateHelpers.installTemplate('basic-modal');
+            TemplateHelpers.installTemplate('modal-button');
         };
 
         getModalElement = function(modal) {
-            var modalElement;
+            var $modalElement;
             if (modal) {
-                modalElement = modal.$('.wrapper-modal-window');
+                $modalElement = modal.$('.wrapper-modal-window');
             } else {
-                modalElement = $('.wrapper-modal-window');
+                $modalElement = $('.wrapper-modal-window');
             }
-            return modalElement;
+            return $modalElement;
+        };
+
+        getModalWindow = function(modal) {
+            var modalElement = getModalElement(modal);
+            return modalElement.find('.modal-window');
         };
 
         getModalTitle = function(modal) {
@@ -61,14 +61,15 @@ define(["jquery", "js/spec_helpers/view_helpers"],
             }
         };
 
-        return $.extend(view_helpers, {
-            'getModalElement': getModalElement,
-            'getModalTitle': getModalTitle,
-            'installModalTemplates': installModalTemplates,
-            'isShowingModal': isShowingModal,
-            'hideModalIfShowing': hideModalIfShowing,
-            'pressModalButton': pressModalButton,
-            'cancelModal': cancelModal,
-            'cancelModalIfShowing': cancelModalIfShowing
+        return $.extend(ViewHelpers, {
+            getModalElement: getModalElement,
+            getModalWindow: getModalWindow,
+            getModalTitle: getModalTitle,
+            installModalTemplates: installModalTemplates,
+            isShowingModal: isShowingModal,
+            hideModalIfShowing: hideModalIfShowing,
+            pressModalButton: pressModalButton,
+            cancelModal: cancelModal,
+            cancelModalIfShowing: cancelModalIfShowing
         });
     });

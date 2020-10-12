@@ -2,11 +2,13 @@
 Convenience methods for working with datetime objects
 """
 
-from datetime import timedelta
-import re
 
-from pytz import timezone, UTC, UnknownTimeZoneError
+import re
+from datetime import datetime, timedelta
+
+import six
 from django.utils.translation import pgettext, ugettext
+from pytz import UnknownTimeZoneError, timezone, utc
 
 
 def get_default_time_display(dtime):
@@ -52,12 +54,12 @@ def get_time_display(dtime, format_string=None, coerce_tz=None):
         try:
             to_tz = timezone(coerce_tz)
         except UnknownTimeZoneError:
-            to_tz = UTC
+            to_tz = utc
         dtime = to_tz.normalize(dtime.astimezone(to_tz))
     if dtime is None or format_string is None:
         return get_default_time_display(dtime)
     try:
-        return unicode(strftime_localized(dtime, format_string))
+        return six.text_type(strftime_localized(dtime, format_string))
     except ValueError:
         return get_default_time_display(dtime)
 
@@ -73,10 +75,32 @@ def almost_same_datetime(dt1, dt2, allowed_delta=timedelta(minutes=1)):
     return abs(dt1 - dt2) < allowed_delta
 
 
+def to_timestamp(datetime_value):
+    """
+    Convert a datetime into a timestamp, represented as the number
+    of seconds since January 1, 1970 UTC.
+    """
+    return int((datetime_value - datetime(1970, 1, 1, tzinfo=utc)).total_seconds())
+
+
+def from_timestamp(timestamp):
+    """
+    Convert a timestamp (number of seconds since Jan 1, 1970 UTC)
+    into a timezone-aware datetime.
+
+    If the timestamp cannot be converted, returns None instead.
+    """
+    try:
+        return datetime.utcfromtimestamp(int(timestamp)).replace(tzinfo=utc)
+    except (ValueError, TypeError):
+        return None
+
+
 DEFAULT_SHORT_DATE_FORMAT = "%b %d, %Y"
 DEFAULT_LONG_DATE_FORMAT = "%A, %B %d, %Y"
 DEFAULT_TIME_FORMAT = "%I:%M:%S %p"
 DEFAULT_DATE_TIME_FORMAT = "%b %d, %Y at %H:%M"
+DEFAULT_DAY_AND_TIME_FORMAT = "%A at %-I%P"
 
 
 def strftime_localized(dtime, format):      # pylint: disable=redefined-builtin
@@ -126,6 +150,8 @@ def strftime_localized(dtime, format):      # pylint: disable=redefined-builtin
         format = ugettext("DATE_TIME_FORMAT")
         if format == "DATE_TIME_FORMAT":
             format = DEFAULT_DATE_TIME_FORMAT
+    elif format == "DAY_AND_TIME":
+        format = DEFAULT_DAY_AND_TIME_FORMAT
     elif format == "TIME":
         format = "%X"
 
@@ -183,7 +209,7 @@ def strftime_localized(dtime, format):      # pylint: disable=redefined-builtin
 
         return part
 
-    formatted_date = re.sub(r"%.|%", process_percent_code, format)
+    formatted_date = re.sub(r"%-.|%.|%", process_percent_code, format)
     return formatted_date
 
 

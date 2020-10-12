@@ -3,11 +3,59 @@ Classes used to model the roles used in the courseware. Each role is responsible
 adding users, removing users, and listing members
 """
 
-from abc import ABCMeta, abstractmethod
 
+import logging
+from abc import ABCMeta, abstractmethod
+from collections import defaultdict
+
+import six
 from django.contrib.auth.models import User
+from opaque_keys.edx.django.models import CourseKeyField
+
+from openedx.core.lib.cache_utils import get_cache
 from student.models import CourseAccessRole
-from xmodule_django.models import CourseKeyField
+
+log = logging.getLogger(__name__)
+
+# A list of registered access roles.
+REGISTERED_ACCESS_ROLES = {}
+
+
+def register_access_role(cls):
+    """
+    Decorator that allows access roles to be registered within the roles module and referenced by their
+    string values.
+
+    Assumes that the decorated class has a "ROLE" attribute, defining its type.
+
+    """
+    try:
+        role_name = cls.ROLE
+        REGISTERED_ACCESS_ROLES[role_name] = cls
+    except AttributeError:
+        log.exception(u"Unable to register Access Role with attribute 'ROLE'.")
+    return cls
+
+
+class BulkRoleCache(object):
+    CACHE_NAMESPACE = u"student.roles.BulkRoleCache"
+    CACHE_KEY = u'roles_by_user'
+
+    @classmethod
+    def prefetch(cls, users):
+        roles_by_user = defaultdict(set)
+        get_cache(cls.CACHE_NAMESPACE)[cls.CACHE_KEY] = roles_by_user
+
+        for role in CourseAccessRole.objects.filter(user__in=users).select_related('user'):
+            roles_by_user[role.user.id].add(role)
+
+        users_without_roles = [u for u in users if u.id not in roles_by_user]
+        for user in users_without_roles:
+            roles_by_user[user.id] = set()
+
+    @classmethod
+    def get_user_roles(cls, user):
+        return get_cache(cls.CACHE_NAMESPACE)[cls.CACHE_KEY][user.id]
 
 
 class RoleCache(object):
@@ -15,9 +63,12 @@ class RoleCache(object):
     A cache of the CourseAccessRoles held by a particular user
     """
     def __init__(self, user):
-        self._roles = set(
-            CourseAccessRole.objects.filter(user=user).all()
-        )
+        try:
+            self._roles = BulkRoleCache.get_user_roles(user)
+        except KeyError:
+            self._roles = set(
+                CourseAccessRole.objects.filter(user=user).all()
+            )
 
     def has_role(self, role, course_id, org):
         """
@@ -31,14 +82,13 @@ class RoleCache(object):
         )
 
 
-class AccessRole(object):
+class AccessRole(six.with_metaclass(ABCMeta, object)):
     """
     Object representing a role with particular access to a resource
     """
-    __metaclass__ = ABCMeta
 
     @abstractmethod
-    def has_user(self, user):  # pylint: disable=unused-argument
+    def has_user(self, user):
         """
         Return whether the supplied django user has access to this role.
         """
@@ -71,11 +121,11 @@ class GlobalStaff(AccessRole):
     The global staff role
     """
     def has_user(self, user):
-        return user.is_staff
+        return bool(user and user.is_staff)
 
     def add_users(self, *users):
         for user in users:
-            if (user.is_authenticated() and user.is_active):
+            if user.is_authenticated and user.is_active:
                 user.is_staff = True
                 user.save()
 
@@ -106,11 +156,19 @@ class RoleBase(AccessRole):
         self.course_key = course_key
         self._role_name = role_name
 
-    def has_user(self, user):
+    # pylint: disable=arguments-differ
+    def has_user(self, user, check_user_activation=True):
         """
-        Return whether the supplied django user has access to this role.
+        Check if the supplied django user has access to this role.
+
+        Arguments:
+            user: user to check against access to role
+            check_user_activation: Indicating whether or not we need to check
+                user activation while checking user roles
+        Return:
+            bool identifying if user has that particular role or not
         """
-        if not (user.is_authenticated() and user.is_active):
+        if check_user_activation and not (user.is_authenticated and user.is_active):
             return False
 
         # pylint: disable=protected-access
@@ -127,6 +185,7 @@ class RoleBase(AccessRole):
         """
         # silently ignores anonymous and inactive users so that any that are
         # legit get updated.
+        from student.models import CourseAccessRole
         for user in users:
             if user.is_authenticated and user.is_active and not self.has_user(user):
                 entry = CourseAccessRole(user=user, role=self._role_name, course_id=self.course_key, org=self.org)
@@ -176,15 +235,19 @@ class CourseRole(RoleBase):
     def course_group_already_exists(self, course_key):
         return CourseAccessRole.objects.filter(org=course_key.org, course_id=course_key).exists()
 
+    def __repr__(self):
+        return '<{}: course_key={}>'.format(self.__class__.__name__, self.course_key)
+
 
 class OrgRole(RoleBase):
     """
     A named role in a particular org independent of course
     """
-    def __init__(self, role, org):
-        super(OrgRole, self).__init__(role, org)
+    def __repr__(self):
+        return '<{}>'.format(self.__class__.__name__)
 
 
+@register_access_role
 class CourseStaffRole(CourseRole):
     """A Staff member of a course"""
     ROLE = 'staff'
@@ -193,6 +256,7 @@ class CourseStaffRole(CourseRole):
         super(CourseStaffRole, self).__init__(self.ROLE, *args, **kwargs)
 
 
+@register_access_role
 class CourseInstructorRole(CourseRole):
     """A course Instructor"""
     ROLE = 'instructor'
@@ -201,19 +265,60 @@ class CourseInstructorRole(CourseRole):
         super(CourseInstructorRole, self).__init__(self.ROLE, *args, **kwargs)
 
 
+@register_access_role
 class CourseFinanceAdminRole(CourseRole):
-    """A course Instructor"""
+    """A course staff member with privileges to review financial data."""
     ROLE = 'finance_admin'
 
     def __init__(self, *args, **kwargs):
         super(CourseFinanceAdminRole, self).__init__(self.ROLE, *args, **kwargs)
 
+
+@register_access_role
+class CourseSalesAdminRole(CourseRole):
+    """A course staff member with privileges to perform sales operations. """
+    ROLE = 'sales_admin'
+
+    def __init__(self, *args, **kwargs):
+        super(CourseSalesAdminRole, self).__init__(self.ROLE, *args, **kwargs)
+
+
+@register_access_role
 class CourseBetaTesterRole(CourseRole):
     """A course Beta Tester"""
     ROLE = 'beta_testers'
 
     def __init__(self, *args, **kwargs):
         super(CourseBetaTesterRole, self).__init__(self.ROLE, *args, **kwargs)
+
+
+@register_access_role
+class LibraryUserRole(CourseRole):
+    """
+    A user who can view a library and import content from it, but not edit it.
+    Used in Studio only.
+    """
+    ROLE = 'library_user'
+
+    def __init__(self, *args, **kwargs):
+        super(LibraryUserRole, self).__init__(self.ROLE, *args, **kwargs)
+
+
+class CourseCcxCoachRole(CourseRole):
+    """A CCX Coach"""
+    ROLE = 'ccx_coach'
+
+    def __init__(self, *args, **kwargs):
+        super(CourseCcxCoachRole, self).__init__(self.ROLE, *args, **kwargs)
+
+
+@register_access_role
+class CourseDataResearcherRole(CourseRole):
+    """A Data Researcher"""
+    ROLE = 'data_researcher'
+
+    def __init__(self, *args, **kwargs):
+        super(CourseDataResearcherRole, self).__init__(self.ROLE, *args, **kwargs)
 
 
 class OrgStaffRole(OrgRole):
@@ -228,6 +333,26 @@ class OrgInstructorRole(OrgRole):
         super(OrgInstructorRole, self).__init__('instructor', *args, **kwargs)
 
 
+class OrgLibraryUserRole(OrgRole):
+    """
+    A user who can view any libraries in an org and import content from them, but not edit them.
+    Used in Studio only.
+    """
+    ROLE = LibraryUserRole.ROLE
+
+    def __init__(self, *args, **kwargs):
+        super(OrgLibraryUserRole, self).__init__(self.ROLE, *args, **kwargs)
+
+
+class OrgDataResearcherRole(OrgRole):
+    """A Data Researcher"""
+    ROLE = 'data_researcher'
+
+    def __init__(self, *args, **kwargs):
+        super(OrgDataResearcherRole, self).__init__(self.ROLE, *args, **kwargs)
+
+
+@register_access_role
 class CourseCreatorRole(RoleBase):
     """
     This is the group of people who have permission to create new courses (we may want to eventually
@@ -237,6 +362,17 @@ class CourseCreatorRole(RoleBase):
 
     def __init__(self, *args, **kwargs):
         super(CourseCreatorRole, self).__init__(self.ROLE, *args, **kwargs)
+
+
+@register_access_role
+class SupportStaffRole(RoleBase):
+    """
+    Student support team members.
+    """
+    ROLE = "support"
+
+    def __init__(self, *args, **kwargs):
+        super(SupportStaffRole, self).__init__(self.ROLE, *args, **kwargs)
 
 
 class UserBasedRole(object):
@@ -254,7 +390,7 @@ class UserBasedRole(object):
         """
         Return whether the role's user has the configured role access to the passed course
         """
-        if not (self.user.is_authenticated() and self.user.is_active):
+        if not (self.user.is_authenticated and self.user.is_active):
             return False
 
         # pylint: disable=protected-access

@@ -1,25 +1,26 @@
 # disable missing docstring
-# pylint: disable=C0111
+# pylint: disable=missing-docstring
+
 
 import unittest
 
 from mock import Mock
-from nose.tools import assert_equals, assert_not_equals, assert_true, assert_false, assert_in, assert_not_in  # pylint: disable=E0611
-
+from opaque_keys.edx.locator import BlockUsageLocator, CourseLocator
+from six.moves import range
 from xblock.field_data import DictFieldData
-from xblock.fields import Scope, String, Dict, Boolean, Integer, Float, Any, List
-from xblock.runtime import KvsFieldData, DictKeyValueStore
+from xblock.fields import Any, Boolean, Dict, Float, Integer, List, Scope, String
+from xblock.runtime import DictKeyValueStore, KvsFieldData
 
-from xmodule.fields import Date, Timedelta, RelativeTime
-from xmodule.modulestore.inheritance import InheritanceKeyValueStore, InheritanceMixin, InheritingFieldData
-from xmodule.xml_module import XmlDescriptor, serialize_field, deserialize_field
 from xmodule.course_module import CourseDescriptor
+from xmodule.fields import Date, RelativeTime, Timedelta
+from xmodule.modulestore.inheritance import InheritanceKeyValueStore, InheritanceMixin, InheritingFieldData
+from xmodule.modulestore.split_mongo.split_mongo_kvs import SplitMongoKVS
 from xmodule.seq_module import SequenceDescriptor
-from xmodule.x_module import XModuleMixin
-
 from xmodule.tests import get_test_descriptor_system
 from xmodule.tests.xml import XModuleXmlImportTest
-from xmodule.tests.xml.factories import CourseFactory, SequenceFactory, ProblemFactory
+from xmodule.tests.xml.factories import CourseFactory, ProblemFactory, SequenceFactory
+from xmodule.x_module import XModuleMixin
+from xmodule.xml_module import XmlDescriptor, deserialize_field, serialize_field
 
 
 class CrazyJsonString(String):
@@ -35,8 +36,12 @@ class TestFields(object):
     # Will not be returned by editable_metadata_fields because is not Scope.settings.
     student_answers = Dict(scope=Scope.user_state)
     # Will be returned, and can override the inherited value from XModule.
-    display_name = String(scope=Scope.settings, default='local default', display_name='Local Display Name',
-                          help='local help')
+    display_name = String(
+        scope=Scope.settings,
+        default='local default',
+        display_name='Local Display Name',
+        help='local help'
+    )
     # Used for testing select type, effect of to_json method
     string_select = CrazyJsonString(
         scope=Scope.settings,
@@ -56,14 +61,20 @@ class TestFields(object):
 
 
 class InheritingFieldDataTest(unittest.TestCase):
-    """Tests of InheritingFieldData."""
+    """
+    Tests of InheritingFieldData.
+    """
 
     class TestableInheritingXBlock(XmlDescriptor):
-        """An XBlock we can use in these tests."""
+        """
+        An XBlock we can use in these tests.
+        """
         inherited = String(scope=Scope.settings, default="the default")
         not_inherited = String(scope=Scope.settings, default="nothing")
 
     def setUp(self):
+        super(InheritingFieldDataTest, self).setUp()
+        self.dummy_course_key = CourseLocator('test_org', 'test_123', 'test_run')
         self.system = get_test_descriptor_system()
         self.all_blocks = {}
         self.system.get_block = self.all_blocks.get
@@ -72,11 +83,34 @@ class InheritingFieldDataTest(unittest.TestCase):
             kvs=DictKeyValueStore({}),
         )
 
+    def get_block_using_split_kvs(self, block_type, block_id, fields, defaults):
+        """
+        Construct an Xblock with split mongo kvs.
+        """
+        kvs = SplitMongoKVS(
+            definition=Mock(),
+            initial_values=fields,
+            default_values=defaults,
+            parent=None
+        )
+        self.field_data = InheritingFieldData(
+            inheritable_names=['inherited'],
+            kvs=kvs,
+        )
+        block = self.get_a_block(
+            usage_id=self.get_usage_id(block_type, block_id)
+        )
+
+        return block
+
     def get_a_block(self, usage_id=None):
-        """Construct an XBlock for testing with."""
+        """
+        Construct an XBlock for testing with.
+        """
         scope_ids = Mock()
         if usage_id is None:
-            usage_id = "_auto%d" % len(self.all_blocks)
+            block_id = "_auto{id}".format(id=len(self.all_blocks))
+            usage_id = self.get_usage_id("course", block_id)
         scope_ids.usage_id = usage_id
         block = self.system.construct_xblock_from_class(
             self.TestableInheritingXBlock,
@@ -86,14 +120,24 @@ class InheritingFieldDataTest(unittest.TestCase):
         self.all_blocks[usage_id] = block
         return block
 
+    def get_usage_id(self, block_type, block_id):
+        """
+        Constructs usage id using 'block_type' and 'block_id'
+        """
+        return BlockUsageLocator(self.dummy_course_key, block_type=block_type, block_id=block_id)
+
     def test_default_value(self):
-        # Blocks with nothing set with return the fields' defaults.
+        """
+        Test that the Blocks with nothing set with return the fields' defaults.
+        """
         block = self.get_a_block()
         self.assertEqual(block.inherited, "the default")
         self.assertEqual(block.not_inherited, "nothing")
 
     def test_set_value(self):
-        # If you set a value, that's what you get back.
+        """
+        Test that If you set a value, that's what you get back.
+        """
         block = self.get_a_block()
         block.inherited = "Changed!"
         block.not_inherited = "New Value!"
@@ -101,39 +145,89 @@ class InheritingFieldDataTest(unittest.TestCase):
         self.assertEqual(block.not_inherited, "New Value!")
 
     def test_inherited(self):
-        # A child with get a value inherited from the parent.
-        parent = self.get_a_block(usage_id="parent")
-        parent.inherited = "Changed!"
-        self.assertEqual(parent.inherited, "Changed!")
+        """
+        Test that a child with get a value inherited from the parent.
+        """
+        parent_block = self.get_a_block(usage_id=self.get_usage_id("course", "parent"))
+        parent_block.inherited = "Changed!"
+        self.assertEqual(parent_block.inherited, "Changed!")
 
-        child = self.get_a_block(usage_id="child")
-        child.parent = "parent"
+        child = self.get_a_block(usage_id=self.get_usage_id("vertical", "child"))
+        child.parent = parent_block.location
         self.assertEqual(child.inherited, "Changed!")
 
     def test_inherited_across_generations(self):
-        # A child with get a value inherited from a great-grandparent.
-        parent = self.get_a_block(usage_id="parent")
+        """
+        Test that a child with get a value inherited from a great-grandparent.
+        """
+        parent = self.get_a_block(usage_id=self.get_usage_id("course", "parent"))
         parent.inherited = "Changed!"
         self.assertEqual(parent.inherited, "Changed!")
         for child_num in range(10):
-            usage_id = "child_{}".format(child_num)
+            usage_id = self.get_usage_id("vertical", "child_{}".format(child_num))
             child = self.get_a_block(usage_id=usage_id)
-            child.parent = "parent"
+            child.parent = parent.location
             self.assertEqual(child.inherited, "Changed!")
 
     def test_not_inherited(self):
-        # Fields not in the inherited_names list won't be inherited.
-        parent = self.get_a_block(usage_id="parent")
+        """
+        Test that the fields not in the inherited_names list won't be inherited.
+        """
+        parent = self.get_a_block(usage_id=self.get_usage_id("course", "parent"))
         parent.not_inherited = "Changed!"
         self.assertEqual(parent.not_inherited, "Changed!")
 
-        child = self.get_a_block(usage_id="child")
-        child.parent = "parent"
+        child = self.get_a_block(usage_id=self.get_usage_id("vertical", "child"))
+        child.parent = parent.location
         self.assertEqual(child.not_inherited, "nothing")
 
+    def test_non_defaults_inherited_across_lib(self):
+        """
+        Test that a child inheriting from library_content block, inherits fields
+        from parent if these fields are not in its defaults.
+        """
+        parent_block = self.get_block_using_split_kvs(
+            block_type="library_content",
+            block_id="parent",
+            fields=dict(inherited="changed!"),
+            defaults=dict(inherited="parent's default"),
+        )
+        self.assertEqual(parent_block.inherited, "changed!")
+
+        child = self.get_block_using_split_kvs(
+            block_type="problem",
+            block_id="child",
+            fields={},
+            defaults={},
+        )
+        child.parent = parent_block.location
+        self.assertEqual(child.inherited, "changed!")
+
+    def test_defaults_not_inherited_across_lib(self):
+        """
+        Test that a child inheriting from library_content block, does not inherit
+        fields from parent if these fields are in its defaults already.
+        """
+        parent_block = self.get_block_using_split_kvs(
+            block_type="library_content",
+            block_id="parent",
+            fields=dict(inherited="changed!"),
+            defaults=dict(inherited="parent's default"),
+        )
+        self.assertEqual(parent_block.inherited, "changed!")
+
+        child = self.get_block_using_split_kvs(
+            block_type="library_content",
+            block_id="parent",
+            fields={},
+            defaults=dict(inherited="child's default"),
+        )
+        child.parent = parent_block.location
+        self.assertEqual(child.inherited, "child's default")
 
 
 class EditableMetadataFieldsTest(unittest.TestCase):
+
     def test_display_name_field(self):
         editable_fields = self.get_xml_editable_fields(DictFieldData({}))
         # Tests that the xblock fields (currently tags and name) get filtered out.
@@ -276,30 +370,32 @@ class EditableMetadataFieldsTest(unittest.TestCase):
 
 class TestSerialize(unittest.TestCase):
     """ Tests the serialize, method, which is not dependent on type. """
+
     def test_serialize(self):
-        assert_equals('null', serialize_field(None))
-        assert_equals('-2', serialize_field(-2))
-        assert_equals('2', serialize_field('2'))
-        assert_equals('-3.41', serialize_field(-3.41))
-        assert_equals('2.589', serialize_field('2.589'))
-        assert_equals('false', serialize_field(False))
-        assert_equals('false', serialize_field('false'))
-        assert_equals('fAlse', serialize_field('fAlse'))
-        assert_equals('hat box', serialize_field('hat box'))
-        assert_equals('{"bar": "hat", "frog": "green"}', serialize_field({'bar': 'hat', 'frog': 'green'}))
-        assert_equals('[3.5, 5.6]', serialize_field([3.5, 5.6]))
-        assert_equals('["foo", "bar"]', serialize_field(['foo', 'bar']))
-        assert_equals('2012-12-31T23:59:59Z', serialize_field("2012-12-31T23:59:59Z"))
-        assert_equals('1 day 12 hours 59 minutes 59 seconds',
-                      serialize_field("1 day 12 hours 59 minutes 59 seconds"))
+        assert serialize_field(None) == 'null'
+        assert serialize_field(-2) == '-2'
+        assert serialize_field('2') == '2'
+        assert serialize_field(-3.41) == '-3.41'
+        assert serialize_field('2.589') == '2.589'
+        assert serialize_field(False) == 'false'
+        assert serialize_field('false') == 'false'
+        assert serialize_field('fAlse') == 'fAlse'
+        assert serialize_field('hat box') == 'hat box'
+        serialized_dict = serialize_field({'bar': 'hat', 'frog': 'green'})
+        assert serialized_dict == '{"bar": "hat", "frog": "green"}' or serialized_dict == '{"frog": "green", "bar": "hat"}'
+        assert serialize_field([3.5, 5.6]) == '[3.5, 5.6]'
+        assert serialize_field(['foo', 'bar']) == '["foo", "bar"]'
+        assert serialize_field("2012-12-31T23:59:59Z") == '2012-12-31T23:59:59Z'
+        assert serialize_field("1 day 12 hours 59 minutes 59 seconds") == '1 day 12 hours 59 minutes 59 seconds'
 
 
 class TestDeserialize(unittest.TestCase):
+
     def assertDeserializeEqual(self, expected, arg):
         """
         Asserts the result of deserialize_field.
         """
-        assert_equals(expected, deserialize_field(self.test_field(), arg))
+        assert deserialize_field(self.field_type(), arg) == expected
 
     def assertDeserializeNonString(self):
         """
@@ -318,7 +414,7 @@ class TestDeserialize(unittest.TestCase):
 class TestDeserializeInteger(TestDeserialize):
     """ Tests deserialize as related to Integer type. """
 
-    test_field = Integer
+    field_type = Integer
 
     def test_deserialize(self):
         self.assertDeserializeEqual(-2, '-2')
@@ -330,7 +426,6 @@ class TestDeserializeInteger(TestDeserialize):
         self.assertDeserializeEqual(True, 'true')
         # 2.78 can be converted to int, so the string will be deserialized
         self.assertDeserializeEqual(-2.78, '-2.78')
-
 
     def test_deserialize_unsupported_types(self):
         self.assertDeserializeEqual('[3]', '[3]')
@@ -344,7 +439,7 @@ class TestDeserializeInteger(TestDeserialize):
 class TestDeserializeFloat(TestDeserialize):
     """ Tests deserialize as related to Float type. """
 
-    test_field = Float
+    field_type = Float
 
     def test_deserialize(self):
         self.assertDeserializeEqual(-2, '-2')
@@ -367,7 +462,7 @@ class TestDeserializeFloat(TestDeserialize):
 class TestDeserializeBoolean(TestDeserialize):
     """ Tests deserialize as related to Boolean type. """
 
-    test_field = Boolean
+    field_type = Boolean
 
     def test_deserialize(self):
         # json.loads converts the value to Python bool
@@ -392,7 +487,7 @@ class TestDeserializeBoolean(TestDeserialize):
 class TestDeserializeString(TestDeserialize):
     """ Tests deserialize as related to String type. """
 
-    test_field = String
+    field_type = String
 
     def test_deserialize(self):
         self.assertDeserializeEqual('hAlf', '"hAlf"')
@@ -410,12 +505,12 @@ class TestDeserializeString(TestDeserialize):
 class TestDeserializeAny(TestDeserialize):
     """ Tests deserialize as related to Any type. """
 
-    test_field = Any
+    field_type = Any
 
     def test_deserialize(self):
         self.assertDeserializeEqual('hAlf', '"hAlf"')
         self.assertDeserializeEqual('false', '"false"')
-        self.assertDeserializeEqual({'bar': 'hat', 'frog' : 'green'}, '{"bar": "hat", "frog": "green"}')
+        self.assertDeserializeEqual({'bar': 'hat', 'frog': 'green'}, '{"bar": "hat", "frog": "green"}')
         self.assertDeserializeEqual([3.5, 5.6], '[3.5, 5.6]')
         self.assertDeserializeEqual('[', '[')
         self.assertDeserializeEqual(False, 'false')
@@ -426,7 +521,7 @@ class TestDeserializeAny(TestDeserialize):
 class TestDeserializeList(TestDeserialize):
     """ Tests deserialize as related to List type. """
 
-    test_field = List
+    field_type = List
 
     def test_deserialize(self):
         self.assertDeserializeEqual(['foo', 'bar'], '["foo", "bar"]')
@@ -443,7 +538,7 @@ class TestDeserializeList(TestDeserialize):
 class TestDeserializeDate(TestDeserialize):
     """ Tests deserialize as related to Date type. """
 
-    test_field = Date
+    field_type = Date
 
     def test_deserialize(self):
         self.assertDeserializeEqual('2012-12-31T23:59:59Z', "2012-12-31T23:59:59Z")
@@ -454,20 +549,24 @@ class TestDeserializeDate(TestDeserialize):
 class TestDeserializeTimedelta(TestDeserialize):
     """ Tests deserialize as related to Timedelta type. """
 
-    test_field = Timedelta
+    field_type = Timedelta
 
     def test_deserialize(self):
-        self.assertDeserializeEqual('1 day 12 hours 59 minutes 59 seconds',
-            '1 day 12 hours 59 minutes 59 seconds')
-        self.assertDeserializeEqual('1 day 12 hours 59 minutes 59 seconds',
-            '"1 day 12 hours 59 minutes 59 seconds"')
+        self.assertDeserializeEqual(
+            '1 day 12 hours 59 minutes 59 seconds',
+            '1 day 12 hours 59 minutes 59 seconds'
+        )
+        self.assertDeserializeEqual(
+            '1 day 12 hours 59 minutes 59 seconds',
+            '"1 day 12 hours 59 minutes 59 seconds"'
+        )
         self.assertDeserializeNonString()
 
 
 class TestDeserializeRelativeTime(TestDeserialize):
     """ Tests deserialize as related to Timedelta type. """
 
-    test_field = RelativeTime
+    field_type = RelativeTime
 
     def test_deserialize(self):
         """
@@ -489,20 +588,20 @@ class TestDeserializeRelativeTime(TestDeserialize):
 class TestXmlAttributes(XModuleXmlImportTest):
 
     def test_unknown_attribute(self):
-        assert_false(hasattr(CourseDescriptor, 'unknown_attr'))
+        assert not hasattr(CourseDescriptor, 'unknown_attr')
         course = self.process_xml(CourseFactory.build(unknown_attr='value'))
-        assert_false(hasattr(course, 'unknown_attr'))
-        assert_equals('value', course.xml_attributes['unknown_attr'])
+        assert not hasattr(course, 'unknown_attr')
+        assert course.xml_attributes['unknown_attr'] == 'value'
 
     def test_known_attribute(self):
-        assert_true(hasattr(CourseDescriptor, 'show_chat'))
-        course = self.process_xml(CourseFactory.build(show_chat='true'))
-        assert_true(course.show_chat)
-        assert_not_in('show_chat', course.xml_attributes)
+        assert hasattr(CourseDescriptor, 'show_calculator')
+        course = self.process_xml(CourseFactory.build(show_calculator='true'))
+        assert course.show_calculator
+        assert 'show_calculator' not in course.xml_attributes
 
     def test_rerandomize_in_policy(self):
         # Rerandomize isn't a basic attribute of Sequence
-        assert_false(hasattr(SequenceDescriptor, 'rerandomize'))
+        assert not hasattr(SequenceDescriptor, 'rerandomize')
 
         root = SequenceFactory.build(policy={'rerandomize': 'never'})
         ProblemFactory.build(parent=root)
@@ -510,15 +609,15 @@ class TestXmlAttributes(XModuleXmlImportTest):
         seq = self.process_xml(root)
 
         # Rerandomize is added to the constructed sequence via the InheritanceMixin
-        assert_equals('never', seq.rerandomize)
+        assert seq.rerandomize == 'never'
 
         # Rerandomize is a known value coming from policy, and shouldn't appear
         # in xml_attributes
-        assert_not_in('rerandomize', seq.xml_attributes)
+        assert 'rerandomize' not in seq.xml_attributes
 
     def test_attempts_in_policy(self):
         # attempts isn't a basic attribute of Sequence
-        assert_false(hasattr(SequenceDescriptor, 'attempts'))
+        assert not hasattr(SequenceDescriptor, 'attempts')
 
         root = SequenceFactory.build(policy={'attempts': '1'})
         ProblemFactory.build(parent=root)
@@ -527,38 +626,38 @@ class TestXmlAttributes(XModuleXmlImportTest):
 
         # attempts isn't added to the constructed sequence, because
         # it's not in the InheritanceMixin
-        assert_false(hasattr(seq, 'attempts'))
+        assert not hasattr(seq, 'attempts')
 
         # attempts is an unknown attribute, so we should include it
         # in xml_attributes so that it gets written out (despite the misleading
         # name)
-        assert_in('attempts', seq.xml_attributes)
+        assert 'attempts' in seq.xml_attributes
 
     def check_inheritable_attribute(self, attribute, value):
         # `attribute` isn't a basic attribute of Sequence
-        assert_false(hasattr(SequenceDescriptor, attribute))
+        assert not hasattr(SequenceDescriptor, attribute)
 
         # `attribute` is added by InheritanceMixin
-        assert_true(hasattr(InheritanceMixin, attribute))
+        assert hasattr(InheritanceMixin, attribute)
 
         root = SequenceFactory.build(policy={attribute: str(value)})
         ProblemFactory.build(parent=root)
 
         # InheritanceMixin will be used when processing the XML
-        assert_in(InheritanceMixin, root.xblock_mixins)
+        assert InheritanceMixin in root.xblock_mixins
 
         seq = self.process_xml(root)
 
-        assert_equals(seq.unmixed_class, SequenceDescriptor)
-        assert_not_equals(type(seq), SequenceDescriptor)
+        assert seq.unmixed_class == SequenceDescriptor
+        assert type(seq) != SequenceDescriptor
 
         # `attribute` is added to the constructed sequence, because
         # it's in the InheritanceMixin
-        assert_equals(value, getattr(seq, attribute))
+        assert getattr(seq, attribute) == value
 
         # `attribute` is a known attribute, so we shouldn't include it
         # in xml_attributes
-        assert_not_in(attribute, seq.xml_attributes)
+        assert attribute not in seq.xml_attributes
 
     def test_inheritable_attributes(self):
         self.check_inheritable_attribute('days_early_for_beta', 2)

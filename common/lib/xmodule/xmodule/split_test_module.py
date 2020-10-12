@@ -2,98 +2,76 @@
 Module for running content split tests
 """
 
-import logging
+
 import json
-from webob import Response
+import logging
+import threading
+from functools import reduce
+from operator import itemgetter
 from uuid import uuid4
 
+import six
+from lxml import etree
+from six import text_type
+from web_fragments.fragment import Fragment
+from webob import Response
+from xblock.core import XBlock
+from xblock.fields import Integer, ReferenceValueDict, Scope, String
+from xmodule.modulestore.inheritance import UserPartitionList
 from xmodule.progress import Progress
 from xmodule.seq_module import SequenceDescriptor
-from xmodule.studio_editable import StudioEditableModule, StudioEditableDescriptor
-from xmodule.x_module import XModule, module_attr, STUDENT_VIEW
-from xmodule.modulestore.inheritance import UserPartitionList
-
-from lxml import etree
-
-from xblock.core import XBlock
-from xblock.fields import Scope, Integer, String, ReferenceValueDict
-from xblock.fragment import Fragment
+from xmodule.studio_editable import StudioEditableDescriptor, StudioEditableModule
+from xmodule.validation import StudioValidation, StudioValidationMessage
+from xmodule.x_module import STUDENT_VIEW, XModule, module_attr
 
 log = logging.getLogger('edx.' + __name__)
 
-# Make '_' a no-op so we can scrape strings
+# Make '_' a no-op so we can scrape strings. Using lambda instead of
+#  `django.utils.translation.ugettext_noop` because Django cannot be imported in this file
 _ = lambda text: text
 
+DEFAULT_GROUP_NAME = _(u'Group ID {group_id}')
 
-class ValidationMessageType(object):
-    """
-    The type for a validation message -- currently 'information', 'warning' or 'error'.
-    """
-    information = 'information'
-    warning = 'warning'
-    error = 'error'
 
-    @staticmethod
-    def display_name(message_type):
+class UserPartitionValues(threading.local):
+    """
+    A thread-local storage for available user_partitions
+    """
+    def __init__(self):
+        super().__init__()
+        self.values = []
+
+    def build_partition_values(self, all_user_partitions, selected_user_partition):
         """
-        Returns the display name for the specified validation message type.
+        This helper method builds up the user_partition values that will
+        be passed to the Studio editor
         """
-        if message_type == ValidationMessageType.warning:
-            # Translators: This message will be added to the front of messages of type warning,
-            # e.g. "Warning: this component has not been configured yet".
-            return _(u"Warning")
-        elif message_type == ValidationMessageType.error:
-            # Translators: This message will be added to the front of messages of type error,
-            # e.g. "Error: required field is missing".
-            return _(u"Error")
-        else:
-            return None
+        self.values = []
+        # Add "No selection" value if there is not a valid selected user partition.
+        if not selected_user_partition:
+            self.values.append(SplitTestFields.no_partition_selected)
+        for user_partition in get_split_user_partitions(all_user_partitions):
+            self.values.append(
+                {"display_name": user_partition.name, "value": user_partition.id}
+            )
+        return self.values
 
 
-# TODO: move this into the xblock repo once it has a formal validation contract
-class ValidationMessage(object):
-    """
-    Represents a single validation message for an xblock.
-    """
-    def __init__(self, xblock, message_text, message_type, action_class=None, action_label=None):
-        assert isinstance(message_text, unicode)
-        self.xblock = xblock
-        self.message_text = message_text
-        self.message_type = message_type
-        self.action_class = action_class
-        self.action_label = action_label
-
-    def __unicode__(self):
-        return self.message_text
+# All available user partitions (with value and display name). This is updated each time
+# editable_metadata_fields is called.
+user_partition_values = UserPartitionValues()
 
 
 class SplitTestFields(object):
     """Fields needed for split test module"""
     has_children = True
 
-    # All available user partitions (with value and display name). This is updated each time
-    # editable_metadata_fields is called.
-    user_partition_values = []
     # Default value used for user_partition_id
     no_partition_selected = {'display_name': _("Not Selected"), 'value': -1}
 
-    @staticmethod
-    def build_partition_values(all_user_partitions, selected_user_partition):
-        """
-        This helper method builds up the user_partition values that will
-        be passed to the Studio editor
-        """
-        SplitTestFields.user_partition_values = []
-        # Add "No selection" value if there is not a valid selected user partition.
-        if not selected_user_partition:
-            SplitTestFields.user_partition_values.append(SplitTestFields.no_partition_selected)
-        for user_partition in all_user_partitions:
-            SplitTestFields.user_partition_values.append({"display_name": user_partition.name, "value": user_partition.id})
-        return SplitTestFields.user_partition_values
-
     display_name = String(
         display_name=_("Display Name"),
-        help=_("This name is used for organizing your course content, but is not shown to students."),
+        help=_("The display name for this component. (Not shown to learners)"),
         scope=Scope.settings,
         default=_("Content Experiment")
     )
@@ -110,7 +88,7 @@ class SplitTestFields(object):
         scope=Scope.content,
         display_name=_("Group Configuration"),
         default=no_partition_selected["value"],
-        values=lambda: SplitTestFields.user_partition_values  # Will be populated before the Studio editor is shown.
+        values=lambda: user_partition_values.values  # Will be populated before the Studio editor is shown.
     )
 
     # group_id is an int
@@ -118,18 +96,23 @@ class SplitTestFields(object):
     # location needs to actually match one of the children of this
     # Block.  (expected invariant that we'll need to test, and handle
     # authoring tools that mess this up)
-
-    # TODO: is there a way to add some validation around this, to
-    # be run on course load or in studio or ....
-
     group_id_to_child = ReferenceValueDict(
         help=_("Which child module students in a particular group_id should see"),
         scope=Scope.content
     )
 
 
+def get_split_user_partitions(user_partitions):
+    """
+    Helper method that filters a list of user_partitions and returns just the
+    ones that are suitable for the split_test module.
+    """
+    return [user_partition for user_partition in user_partitions if user_partition.scheme.name == "random"]
+
+
 @XBlock.needs('user_tags')  # pylint: disable=abstract-method
-@XBlock.wants('partitions')
+@XBlock.needs('partitions')
+@XBlock.needs('user')
 class SplitTestModule(SplitTestFields, XModule, StudioEditableModule):
     """
     Show the user the appropriate child.  Uses the ExperimentState
@@ -208,7 +191,7 @@ class SplitTestModule(SplitTestFields, XModule, StudioEditableModule):
             child_descriptor = self.get_child_descriptor_by_location(child_location)
         else:
             # Oops.  Config error.
-            log.debug("configuration error in split test module: invalid group_id %r (not one of %r).  Showing error", str_group_id, self.group_id_to_child.keys())
+            log.debug("configuration error in split test module: invalid group_id %r (not one of %r).  Showing error", str_group_id, list(self.group_id_to_child.keys()))
 
         if child_descriptor is None:
             # Peak confusion is great.  Now that we set child_descriptor,
@@ -224,33 +207,57 @@ class SplitTestModule(SplitTestFields, XModule, StudioEditableModule):
         Returns the group ID, or None if none is available.
         """
         partitions_service = self.runtime.service(self, 'partitions')
-        if not partitions_service:
-            return None
-        return partitions_service.get_user_group_for_partition(self.user_partition_id)
+        user_service = self.runtime.service(self, 'user')
+        user = user_service._django_user  # pylint: disable=protected-access
+        return partitions_service.get_user_group_id_for_partition(user, self.user_partition_id)
+
+    @property
+    def is_configured(self):
+        """
+        Returns true if the split_test instance is associated with a UserPartition.
+        """
+        return self.descriptor.is_configured
 
     def _staff_view(self, context):
         """
         Render the staff view for a split test module.
         """
         fragment = Fragment()
-        contents = []
+        active_contents = []
+        inactive_contents = []
 
-        for group_id in self.group_id_to_child:
-            child_location = self.group_id_to_child[group_id]
+        for child_location in self.children:  # pylint: disable=no-member
             child_descriptor = self.get_child_descriptor_by_location(child_location)
             child = self.system.get_module(child_descriptor)
             rendered_child = child.render(STUDENT_VIEW, context)
-            fragment.add_frag_resources(rendered_child)
+            fragment.add_fragment_resources(rendered_child)
+            group_name, updated_group_id = self.get_data_for_vertical(child)
 
-            contents.append({
-                'group_id': group_id,
-                'id': child.location.to_deprecated_string(),
-                'content': rendered_child.content
+            if updated_group_id is None:  # inactive group
+                group_name = child.display_name
+                updated_group_id = [g_id for g_id, loc in self.group_id_to_child.items() if loc == child_location][0]
+                inactive_contents.append({
+                    'group_name': _(u'{group_name} (inactive)').format(group_name=group_name),
+                    'id': text_type(child.location),
+                    'content': rendered_child.content,
+                    'group_id': updated_group_id,
+                })
+                continue
+
+            active_contents.append({
+                'group_name': group_name,
+                'id': text_type(child.location),
+                'content': rendered_child.content,
+                'group_id': updated_group_id,
             })
+
+        # Sort active and inactive contents by group name.
+        sorted_active_contents = sorted(active_contents, key=itemgetter('group_name'))
+        sorted_inactive_contents = sorted(inactive_contents, key=itemgetter('group_name'))
 
         # Use the new template
         fragment.add_content(self.system.render_template('split_test_staff_view.html', {
-            'items': contents,
+            'items': sorted_active_contents + sorted_inactive_contents,
         }))
         fragment.add_css('.split-test-child { display: none; }')
         fragment.add_javascript_url(self.runtime.local_resource_url(self, 'public/js/split_test_staff.js'))
@@ -263,7 +270,6 @@ class SplitTestModule(SplitTestFields, XModule, StudioEditableModule):
         """
         fragment = Fragment()
         root_xblock = context.get('root_xblock')
-        is_configured = not self.user_partition_id == SplitTestFields.no_partition_selected['value']
         is_root = root_xblock and root_xblock.location == self.location
         active_groups_preview = None
         inactive_groups_preview = None
@@ -280,7 +286,7 @@ class SplitTestModule(SplitTestFields, XModule, StudioEditableModule):
         fragment.add_content(self.system.render_template('split_test_author_view.html', {
             'split_test': self,
             'is_root': is_root,
-            'is_configured': is_configured,
+            'is_configured': self.is_configured,
             'active_groups_preview': active_groups_preview,
             'inactive_groups_preview': inactive_groups_preview,
             'group_configuration_url': self.descriptor.group_configuration_url,
@@ -299,8 +305,16 @@ class SplitTestModule(SplitTestFields, XModule, StudioEditableModule):
         for active_child_descriptor in children:
             active_child = self.system.get_module(active_child_descriptor)
             rendered_child = active_child.render(StudioEditableModule.get_preview_view_name(active_child), context)
-            fragment.add_frag_resources(rendered_child)
+            if active_child.category == 'vertical':
+                group_name, group_id = self.get_data_for_vertical(active_child)
+                if group_name:
+                    rendered_child.content = rendered_child.content.replace(
+                        DEFAULT_GROUP_NAME.format(group_id=group_id),
+                        group_name
+                    )
+            fragment.add_fragment_resources(rendered_child)
             html = html + rendered_child.content
+
         return html
 
     def student_view(self, context):
@@ -320,19 +334,29 @@ class SplitTestModule(SplitTestFields, XModule, StudioEditableModule):
                 'child_content': child_fragment.content,
                 'child_id': self.child.scope_ids.usage_id,
             }))
-            fragment.add_frag_resources(child_fragment)
+            fragment.add_fragment_resources(child_fragment)
             fragment.add_javascript_url(self.runtime.local_resource_url(self, 'public/js/split_test_student.js'))
             fragment.initialize_js('SplitTestStudentView')
             return fragment
 
     @XBlock.handler
-    def log_child_render(self, request, suffix=''):  # pylint: disable=unused-argument
+    def log_child_render(self, request, suffix=''):
         """
         Record in the tracking logs which child was rendered
         """
         # TODO: use publish instead, when publish is wired to the tracking logs
-        self.system.track_function('xblock.split_test.child_render', {'child-id': self.child.scope_ids.usage_id.to_deprecated_string()})
-        return Response()
+        try:
+            child_id = text_type(self.child.scope_ids.usage_id)
+        except Exception:
+            log.info(
+                "Can't get usage_id of Nonetype object in course {course_key}".format(
+                    course_key=six.text_type(self.location.course_key)
+                )
+            )
+            raise
+        else:
+            self.system.track_function('xblock.split_test.child_render', {'child_id': child_id})
+            return Response()
 
     def get_icon_class(self):
         return self.child.get_icon_class() if self.child else 'other'
@@ -343,17 +367,47 @@ class SplitTestModule(SplitTestFields, XModule, StudioEditableModule):
         progress = reduce(Progress.add_counts, progresses, None)
         return progress
 
+    def get_data_for_vertical(self, vertical):
+        """
+        Return name and id of a group corresponding to `vertical`.
+        """
+        user_partition = self.descriptor.get_selected_partition()
+        if user_partition:
+            for group in user_partition.groups:
+                group_id = six.text_type(group.id)
+                child_location = self.group_id_to_child.get(group_id, None)
+                if child_location == vertical.location:
+                    return (group.name, group.id)
+        return (None, None)
 
-@XBlock.needs('user_tags')  # pylint: disable=abstract-method
-@XBlock.wants('partitions')
-@XBlock.wants('user')
+    @property
+    def tooltip_title(self):
+        return getattr(self.child, 'tooltip_title', '')
+
+    def validate(self):
+        """
+        Message for either error or warning validation message/s.
+
+        Returns message and type. Priority given to error type message.
+        """
+        return self.descriptor.validate()
+
+
+@XBlock.needs('user_tags')
+@XBlock.needs('partitions')
+@XBlock.needs('user')
+# pylint: disable=missing-class-docstring
 class SplitTestDescriptor(SplitTestFields, SequenceDescriptor, StudioEditableDescriptor):
     # the editing interface can be the same as for sequences -- just a container
     module_class = SplitTestModule
 
+    resources_dir = 'assets/split_test'
+
     filename_extension = "xml"
 
     mako_template = "widgets/metadata-only-edit.html"
+
+    show_in_read_only_mode = True
 
     child_descriptor = module_attr('child_descriptor')
     log_child_render = module_attr('log_child_render')
@@ -364,7 +418,7 @@ class SplitTestDescriptor(SplitTestFields, SequenceDescriptor, StudioEditableDes
         renderable_groups = {}
         # json.dumps doesn't know how to handle Location objects
         for group in self.group_id_to_child:
-            renderable_groups[group] = self.group_id_to_child[group].to_deprecated_string()
+            renderable_groups[group] = text_type(self.group_id_to_child[group])
         xml_object.set('group_id_to_child', json.dumps(renderable_groups))
         xml_object.set('user_partition_id', str(self.user_partition_id))
         for child in self.get_children():
@@ -435,7 +489,7 @@ class SplitTestDescriptor(SplitTestFields, SequenceDescriptor, StudioEditableDes
     @property
     def editable_metadata_fields(self):
         # Update the list of partitions based on the currently available user_partitions.
-        SplitTestFields.build_partition_values(self.user_partitions, self.get_selected_partition())
+        user_partition_values.build_partition_values(self.user_partitions, self.get_selected_partition())
 
         editable_fields = super(SplitTestDescriptor, self).editable_metadata_fields
 
@@ -453,7 +507,8 @@ class SplitTestDescriptor(SplitTestFields, SequenceDescriptor, StudioEditableDes
         non_editable_fields = super(SplitTestDescriptor, self).non_editable_metadata_fields
         non_editable_fields.extend([
             SplitTestDescriptor.due,
-            SplitTestDescriptor.user_partitions
+            SplitTestDescriptor.user_partitions,
+            SplitTestDescriptor.group_id_to_child,
         ])
         return non_editable_fields
 
@@ -492,7 +547,7 @@ class SplitTestDescriptor(SplitTestFields, SequenceDescriptor, StudioEditableDes
         # Compute the active children in the order specified by the user partition
         active_children = []
         for group in user_partition.groups:
-            group_id = unicode(group.id)
+            group_id = six.text_type(group.id)
             child_location = self.group_id_to_child.get(group_id, None)
             child = get_child_descriptor(child_location)
             if child:
@@ -503,49 +558,109 @@ class SplitTestDescriptor(SplitTestFields, SequenceDescriptor, StudioEditableDes
 
         return active_children, inactive_children
 
-    def validation_messages(self):
+    @property
+    def is_configured(self):
         """
-        Returns a list of validation messages describing the current state of the block. Each message
-        includes a message type indicating whether the message represents information, a warning or an error.
+        Returns true if the split_test instance is associated with a UserPartition.
         """
-        _ = self.runtime.service(self, "i18n").ugettext  # pylint: disable=redefined-outer-name
-        messages = []
+        return not self.user_partition_id == SplitTestFields.no_partition_selected['value']
+
+    def validate(self):
+        """
+        Validates the state of this split_test instance. This is the override of the general XBlock method,
+        and it will also ask its superclass to validate.
+        """
+        validation = super(SplitTestDescriptor, self).validate()
+        split_test_validation = self.validate_split_test()
+
+        if split_test_validation:
+            return validation
+
+        validation = StudioValidation.copy(validation)
+        if validation and (not self.is_configured and len(split_test_validation.messages) == 1):
+            validation.summary = split_test_validation.messages[0]
+        else:
+            validation.summary = self.general_validation_message(split_test_validation)
+            validation.add_messages(split_test_validation)
+
+        return validation
+
+    def validate_split_test(self):
+        """
+        Returns a StudioValidation object describing the current state of the split_test_module
+        (not including superclass validation messages).
+        """
+        _ = self.runtime.service(self, "i18n").ugettext
+        split_validation = StudioValidation(self.location)
         if self.user_partition_id < 0:
-            messages.append(ValidationMessage(
-                self,
-                _(u"The experiment is not associated with a group configuration."),
-                ValidationMessageType.warning,
-                'edit-button',
-                _(u"Select a Group Configuration")
-            ))
+            split_validation.add(
+                StudioValidationMessage(
+                    StudioValidationMessage.NOT_CONFIGURED,
+                    _(u"The experiment is not associated with a group configuration."),
+                    action_class='edit-button',
+                    action_label=_(u"Select a Group Configuration")
+                )
+            )
         else:
             user_partition = self.get_selected_partition()
             if not user_partition:
-                messages.append(ValidationMessage(
-                    self,
-                    _(u"The experiment uses a deleted group configuration. Select a valid group configuration or delete this experiment."),
-                    ValidationMessageType.error
-                ))
+                split_validation.add(
+                    StudioValidationMessage(
+                        StudioValidationMessage.ERROR,
+                        _(u"The experiment uses a deleted group configuration. Select a valid group configuration or delete this experiment.")
+                    )
+                )
             else:
-                [active_children, inactive_children] = self.active_and_inactive_children()
-                if len(active_children) < len(user_partition.groups):
-                    messages.append(ValidationMessage(
-                        self,
-                        _(u"The experiment does not contain all of the groups in the configuration."),
-                        ValidationMessageType.error,
-                        'add-missing-groups-button',
-                        _(u"Add Missing Groups")
-                    ))
-                if len(inactive_children) > 0:
-                    messages.append(ValidationMessage(
-                        self,
-                        _(u"The experiment has an inactive group. Move content into active groups, then delete the inactive group."),
-                        ValidationMessageType.warning
-                    ))
-        return messages
+                # If the user_partition selected is not valid for the split_test module, error.
+                # This can only happen via XML and import/export.
+                if not get_split_user_partitions([user_partition]):
+                    split_validation.add(
+                        StudioValidationMessage(
+                            StudioValidationMessage.ERROR,
+                            _(u"The experiment uses a group configuration that is not supported for experiments. "
+                              u"Select a valid group configuration or delete this experiment.")
+                        )
+                    )
+                else:
+                    [active_children, inactive_children] = self.active_and_inactive_children()
+                    if len(active_children) < len(user_partition.groups):
+                        split_validation.add(
+                            StudioValidationMessage(
+                                StudioValidationMessage.ERROR,
+                                _(u"The experiment does not contain all of the groups in the configuration."),
+                                action_runtime_event='add-missing-groups',
+                                action_label=_(u"Add Missing Groups")
+                            )
+                        )
+                    if len(inactive_children) > 0:
+                        split_validation.add(
+                            StudioValidationMessage(
+                                StudioValidationMessage.WARNING,
+                                _(u"The experiment has an inactive group. "
+                                  u"Move content into active groups, then delete the inactive group.")
+                            )
+                        )
+        return split_validation
+
+    def general_validation_message(self, validation=None):
+        """
+        Returns just a summary message about whether or not this split_test instance has
+        validation issues (not including superclass validation messages). If the split_test instance
+        validates correctly, this method returns None.
+        """
+        if validation is None:
+            validation = self.validate_split_test()
+
+        if not validation:
+            has_error = any(message.type == StudioValidationMessage.ERROR for message in validation.messages)
+            return StudioValidationMessage(
+                StudioValidationMessage.ERROR if has_error else StudioValidationMessage.WARNING,
+                _(u"This content experiment has issues that affect content visibility.")
+            )
+        return None
 
     @XBlock.handler
-    def add_missing_groups(self, request, suffix=''):  # pylint: disable=unused-argument
+    def add_missing_groups(self, request, suffix=''):
         """
         Create verticals for any missing groups in the split test instance.
 
@@ -555,14 +670,14 @@ class SplitTestDescriptor(SplitTestFields, SequenceDescriptor, StudioEditableDes
 
         changed = False
         for group in user_partition.groups:
-            str_group_id = unicode(group.id)
+            str_group_id = six.text_type(group.id)
             if str_group_id not in self.group_id_to_child:
-                user_id = self.runtime.service(self, 'user').user_id
+                user_id = self.runtime.service(self, 'user').get_current_user().opt_attrs['edx-platform.user_id']
                 self._create_vertical_for_group(group, user_id)
                 changed = True
 
         if changed:
-            # TODO user.id - to be fixed by Publishing team
+            # user.id - to be fixed by Publishing team
             self.system.modulestore.update_item(self, None)
         return Response()
 
@@ -577,7 +692,7 @@ class SplitTestDescriptor(SplitTestFields, SequenceDescriptor, StudioEditableDes
             user_partition = self.get_selected_partition()
             if user_partition:
                 group_configuration_url = "{url}#{configuration_id}".format(
-                    url='/group_configurations/' + unicode(self.location.course_key),
+                    url='/group_configurations/' + six.text_type(self.location.course_key),
                     configuration_id=str(user_partition.id)
                 )
 
@@ -595,7 +710,7 @@ class SplitTestDescriptor(SplitTestFields, SequenceDescriptor, StudioEditableDes
             "editor_saved should only be called when a mutable modulestore is available"
         modulestore = self.system.modulestore
         dest_usage_key = self.location.replace(category="vertical", name=uuid4().hex)
-        metadata = {'display_name': group.name}
+        metadata = {'display_name': DEFAULT_GROUP_NAME.format(group_id=group.id)}
         modulestore.create_item(
             user_id,
             self.location.course_key,
@@ -606,4 +721,6 @@ class SplitTestDescriptor(SplitTestFields, SequenceDescriptor, StudioEditableDes
             runtime=self.system,
         )
         self.children.append(dest_usage_key)  # pylint: disable=no-member
-        self.group_id_to_child[unicode(group.id)] = dest_usage_key
+        self.group_id_to_child[six.text_type(group.id)] = dest_usage_key
+
+    tooltip_title = module_attr('tooltip_title')

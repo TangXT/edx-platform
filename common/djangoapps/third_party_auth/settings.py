@@ -1,91 +1,31 @@
 """Settings for the third-party auth module.
 
-Defers configuration of settings so we can inspect the provider registry and
-create settings placeholders for only those values actually needed by a given
-deployment. Required by Django; consequently, this file must not invoke the
-Django armature.
-
 The flow for settings registration is:
 
 The base settings file contains a boolean, ENABLE_THIRD_PARTY_AUTH, indicating
-whether this module is enabled. Ancillary settings files (aws.py, dev.py) put
-options in THIRD_PARTY_SETTINGS. startup.py probes the ENABLE_THIRD_PARTY_AUTH.
+whether this module is enabled. startup.py probes the ENABLE_THIRD_PARTY_AUTH.
 If true, it:
 
     a) loads this module.
-    b) calls apply_settings(), passing in settings.THIRD_PARTY_AUTH.
-       THIRD_PARTY AUTH is a dict of the form
-
-       'THIRD_PARTY_AUTH': {
-            '<PROVIDER_NAME>': {
-                '<PROVIDER_SETTING_NAME>': '<PROVIDER_SETTING_VALUE>',
-                [...]
-            },
-            [...]
-       }
-
-       If you are using a dev settings file, your settings dict starts at the
-       level of <PROVIDER_NAME> and is a map of provider name string to
-       settings dict. If you are using an auth.json file, it should contain a
-       THIRD_PARTY_AUTH entry as above.
-    c) apply_settings() builds a list of <PROVIDER_NAMES>. These are the
-       enabled third party auth providers for the deployment. These are enabled
-       in provider.Registry, the canonical list of enabled providers.
-    d) then, it sets global, provider-independent settings.
-    e) then, it sets provider-specific settings. For each enabled provider, we
-       read its SETTINGS member. These are merged onto the Django settings
-       object. In most cases these are stubs and the real values are set from
-       THIRD_PARTY_AUTH. All values that are set from this dict must first be
-       initialized from SETTINGS. This allows us to validate the dict and
-       ensure that the values match expected configuration options on the
-       provider.
-    f) finally, the (key, value) pairs from the dict file are merged onto the
-       django settings object.
+    b) calls apply_settings(), passing in the Django settings
 """
 
-from . import provider
+
+from django.conf import settings
+from openedx.features.enterprise_support.api import insert_enterprise_pipeline_elements
 
 
-_FIELDS_STORED_IN_SESSION = ['auth_entry']
-_MIDDLEWARE_CLASSES = (
-    'third_party_auth.middleware.ExceptionMiddleware',
-)
-_SOCIAL_AUTH_LOGIN_REDIRECT_URL = '/dashboard'
-
-
-def _merge_auth_info(django_settings, auth_info):
-    """Merge auth_info dict onto django_settings module."""
-    enabled_provider_names = []
-    to_merge = []
-
-    for provider_name, provider_dict in auth_info.items():
-        enabled_provider_names.append(provider_name)
-        # Merge iff all settings have been intialized.
-        for key in provider_dict:
-            if key not in dir(django_settings):
-                raise ValueError('Auth setting %s not initialized' % key)
-        to_merge.append(provider_dict)
-
-    for passed_validation in to_merge:
-        for key, value in passed_validation.iteritems():
-            setattr(django_settings, key, value)
-
-
-def _set_global_settings(django_settings):
+def apply_settings(django_settings):
     """Set provider-independent settings."""
 
     # Whitelisted URL query parameters retrained in the pipeline session.
     # Params not in this whitelist will be silently dropped.
-    django_settings.FIELDS_STORED_IN_SESSION = _FIELDS_STORED_IN_SESSION
-
-    # Register and configure python-social-auth with Django.
-    django_settings.INSTALLED_APPS += (
-        'social.apps.django_app.default',
-        'third_party_auth',
-    )
+    django_settings.FIELDS_STORED_IN_SESSION = ['auth_entry', 'next']
 
     # Inject exception middleware to make redirects fire.
-    django_settings.MIDDLEWARE_CLASSES += _MIDDLEWARE_CLASSES
+    django_settings.MIDDLEWARE.extend(
+        ['third_party_auth.middleware.ExceptionMiddleware']
+    )
 
     # Where to send the user if there's an error during social authentication
     # and we cannot send them to a more specific URL
@@ -93,23 +33,45 @@ def _set_global_settings(django_settings):
     django_settings.SOCIAL_AUTH_LOGIN_ERROR_URL = '/'
 
     # Where to send the user once social authentication is successful.
-    django_settings.SOCIAL_AUTH_LOGIN_REDIRECT_URL = _SOCIAL_AUTH_LOGIN_REDIRECT_URL
+    django_settings.SOCIAL_AUTH_LOGIN_REDIRECT_URL = '/dashboard'
+
+    # Disable sanitizing of redirect urls in social-auth since the platform
+    # already does its own sanitization via the LOGIN_REDIRECT_WHITELIST setting.
+    django_settings.SOCIAL_AUTH_SANITIZE_REDIRECTS = False
+
+    # Adding extra key value pair in the url query string for microsoft as per request
+    django_settings.SOCIAL_AUTH_AZUREAD_OAUTH2_AUTH_EXTRA_ARGUMENTS = {'msafed': 0}
+
+    # Avoid default username check to allow non-ascii characters
+    django_settings.SOCIAL_AUTH_CLEAN_USERNAMES = not settings.FEATURES.get("ENABLE_UNICODE_USERNAME")
 
     # Inject our customized auth pipeline. All auth backends must work with
     # this pipeline.
-    django_settings.SOCIAL_AUTH_PIPELINE = (
+    django_settings.SOCIAL_AUTH_PIPELINE = [
         'third_party_auth.pipeline.parse_query_params',
-        'social.pipeline.social_auth.social_details',
-        'social.pipeline.social_auth.social_uid',
-        'social.pipeline.social_auth.auth_allowed',
-        'social.pipeline.social_auth.social_user',
-        'social.pipeline.user.get_username',
-        'third_party_auth.pipeline.redirect_to_supplementary_form',
-        'social.pipeline.user.create_user',
-        'social.pipeline.social_auth.associate_user',
-        'social.pipeline.social_auth.load_extra_data',
-        'social.pipeline.user.user_details',
-    )
+        'social_core.pipeline.social_auth.social_details',
+        'social_core.pipeline.social_auth.social_uid',
+        'social_core.pipeline.social_auth.auth_allowed',
+        'social_core.pipeline.social_auth.social_user',
+        'third_party_auth.pipeline.associate_by_email_if_login_api',
+        'third_party_auth.pipeline.get_username',
+        'third_party_auth.pipeline.set_pipeline_timeout',
+        'third_party_auth.pipeline.ensure_user_information',
+        'social_core.pipeline.user.create_user',
+        'social_core.pipeline.social_auth.associate_user',
+        'social_core.pipeline.social_auth.load_extra_data',
+        'social_core.pipeline.user.user_details',
+        'third_party_auth.pipeline.user_details_force_sync',
+        'third_party_auth.pipeline.set_id_verification_status',
+        'third_party_auth.pipeline.set_logged_in_cookies',
+        'third_party_auth.pipeline.login_analytics',
+    ]
+
+    # Add enterprise pipeline elements if the enterprise app is installed
+    insert_enterprise_pipeline_elements(django_settings.SOCIAL_AUTH_PIPELINE)
+
+    # Required so that we can use unmodified PSA OAuth2 backends:
+    django_settings.SOCIAL_AUTH_STRATEGY = 'third_party_auth.strategy.ConfigurationModelStrategy'
 
     # We let the user specify their email address during signup.
     django_settings.SOCIAL_AUTH_PROTECTED_USER_FIELDS = ['email']
@@ -119,33 +81,24 @@ def _set_global_settings(django_settings):
     # enable this when you want to get stack traces rather than redirections.
     django_settings.SOCIAL_AUTH_RAISE_EXCEPTIONS = False
 
+    # Clean username to make sure username is compatible with our system requirements
+    django_settings.SOCIAL_AUTH_CLEAN_USERNAME_FUNCTION = 'third_party_auth.models.clean_username'
+
+    # Allow users to login using social auth even if their account is not verified yet
+    # This is required since we [ab]use django's 'is_active' flag to indicate verified
+    # accounts; without this set to True, python-social-auth won't allow us to link the
+    # user's account to the third party account during registration (since the user is
+    # not verified at that point).
+    # We also generally allow unverified third party auth users to login (see the logic
+    # in ensure_user_information in pipeline.py) because otherwise users who use social
+    # auth to register with an invalid email address can become "stuck".
+    # TODO: Remove the following if/when email validation is separated from the is_active flag.
+    django_settings.SOCIAL_AUTH_INACTIVE_USER_LOGIN = True
+    django_settings.SOCIAL_AUTH_INACTIVE_USER_URL = '/auth/inactive'
+
     # Context processors required under Django.
     django_settings.SOCIAL_AUTH_UUID_LENGTH = 4
-    django_settings.TEMPLATE_CONTEXT_PROCESSORS += (
-        'social.apps.django_app.context_processors.backends',
-        'social.apps.django_app.context_processors.login_redirect',
+    django_settings.DEFAULT_TEMPLATE_ENGINE['OPTIONS']['context_processors'] += (
+        'social_django.context_processors.backends',
+        'social_django.context_processors.login_redirect',
     )
-
-
-def _set_provider_settings(django_settings, enabled_providers, auth_info):
-    """Sets provider-specific settings."""
-    # Must prepend here so we get called first.
-    django_settings.AUTHENTICATION_BACKENDS = (
-        tuple(enabled_provider.get_authentication_backend() for enabled_provider in enabled_providers) +
-        django_settings.AUTHENTICATION_BACKENDS)
-
-    # Merge settings from provider classes, and configure all placeholders.
-    for enabled_provider in enabled_providers:
-        enabled_provider.merge_onto(django_settings)
-
-    # Merge settings from <deployment>.auth.json, overwriting placeholders.
-    _merge_auth_info(django_settings, auth_info)
-
-
-def apply_settings(auth_info, django_settings):
-    """Applies settings from auth_info dict to django_settings module."""
-    provider_names = auth_info.keys()
-    provider.Registry.configure_once(provider_names)
-    enabled_providers = provider.Registry.enabled()
-    _set_global_settings(django_settings)
-    _set_provider_settings(django_settings, enabled_providers, auth_info)

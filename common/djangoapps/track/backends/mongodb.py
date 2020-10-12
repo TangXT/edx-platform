@@ -1,15 +1,14 @@
 """MongoDB event tracker backend."""
 
-from __future__ import absolute_import
 
 import logging
 
 import pymongo
+from bson.errors import BSONError
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
 from track.backends import BaseBackend
-
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +28,7 @@ class MongoBackend(BaseBackend):
           - `password`: collection user password
           - `database`: name of the database
           - `collection`: name of the collection
+          - 'authsource': name of the authentication database
           - `extra`: parameters to pymongo.MongoClient not listed above
 
         """
@@ -45,6 +45,8 @@ class MongoBackend(BaseBackend):
 
         db_name = kwargs.get('database', 'track')
         collection_name = kwargs.get('collection', 'events')
+
+        auth_source = kwargs.get('authsource') or None
 
         # Other mongo connection arguments
         extra = kwargs.get('extra', {})
@@ -67,7 +69,7 @@ class MongoBackend(BaseBackend):
         database = self.connection[db_name]
 
         if user or password:
-            database.authenticate(user, password)
+            database.authenticate(user, password, source=auth_source)
 
         self.collection = database[collection_name]
 
@@ -82,15 +84,16 @@ class MongoBackend(BaseBackend):
         # TODO: The creation of indexes can be moved to a Django
         # management command or equivalent. There is also an option to
         # run the indexing on the background, without locking.
-        self.collection.ensure_index([('time', pymongo.DESCENDING)])
-        self.collection.ensure_index('event_type')
+        self.collection.ensure_index([('time', pymongo.DESCENDING)], background=True)
+        self.collection.ensure_index('event_type', background=True)
 
     def send(self, event):
         """Insert the event in to the Mongo collection"""
         try:
             self.collection.insert(event, manipulate=False)
-        except PyMongoError:
-            # The event will be lost in case of a connection error.
+        except (PyMongoError, BSONError):
+            # The event will be lost in case of a connection error or any error
+            # that occurs when trying to insert the event into Mongo.
             # pymongo will re-connect/re-authenticate automatically
             # during the next event.
             msg = 'Error inserting to MongoDB event tracker backend'

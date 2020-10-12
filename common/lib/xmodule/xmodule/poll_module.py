@@ -6,45 +6,73 @@ If student does not yet anwered - Question with set of choices.
 If student have answered - Question with statistics for each answers.
 """
 
-import cgi
+
+import html
 import json
 import logging
-from copy import deepcopy
 from collections import OrderedDict
+from copy import deepcopy
 
-from lxml import etree
 from pkg_resources import resource_string
 
-from xmodule.x_module import XModule
-from xmodule.stringify import stringify_children
+import six
+from lxml import etree
+from openedx.core.djangolib.markup import Text, HTML
+from xblock.fields import Boolean, Dict, List, Scope, String
 from xmodule.mako_module import MakoModuleDescriptor
+from xmodule.stringify import stringify_children
+from xmodule.x_module import XModule
 from xmodule.xml_module import XmlDescriptor
-from xblock.fields import Scope, String, Dict, Boolean, List
 
 log = logging.getLogger(__name__)
+_ = lambda text: text
 
 
 class PollFields(object):
     # Name of poll to use in links to this poll
-    display_name = String(help="Display name for this module", scope=Scope.settings)
+    display_name = String(
+        help=_("The display name for this component."),
+        scope=Scope.settings
+    )
 
-    voted = Boolean(help="Whether this student has voted on the poll", scope=Scope.user_state, default=False)
-    poll_answer = String(help="Student answer", scope=Scope.user_state, default='')
-    poll_answers = Dict(help="All possible answers for the poll fro other students", scope=Scope.user_state_summary)
+    voted = Boolean(
+        help=_("Whether this student has voted on the poll"),
+        scope=Scope.user_state,
+        default=False
+    )
+    poll_answer = String(
+        help=_("Student answer"),
+        scope=Scope.user_state,
+        default=''
+    )
+    poll_answers = Dict(
+        help=_("Poll answers from all students"),
+        scope=Scope.user_state_summary
+    )
 
     # List of answers, in the form {'id': 'some id', 'text': 'the answer text'}
-    answers = List(help="Poll answers from xml", scope=Scope.content, default=[])
+    answers = List(
+        help=_("Poll answers from xml"),
+        scope=Scope.content,
+        default=[]
+    )
 
-    question = String(help="Poll question", scope=Scope.content, default='')
+    question = String(
+        help=_("Poll question"),
+        scope=Scope.content,
+        default=''
+    )
 
 
 class PollModule(PollFields, XModule):
     """Poll Module"""
     js = {
-      'coffee': [resource_string(__name__, 'js/src/javascript_loader.coffee')],
-      'js': [resource_string(__name__, 'js/src/poll/poll.js'),
-             resource_string(__name__, 'js/src/poll/poll_main.js')]
-         }
+        'js': [
+            resource_string(__name__, 'js/src/javascript_loader.js'),
+            resource_string(__name__, 'js/src/poll/poll.js'),
+            resource_string(__name__, 'js/src/poll/poll_main.js')
+        ]
+    }
     css = {'scss': [resource_string(__name__, 'css/poll/display.scss')]}
     js_module_name = "Poll"
 
@@ -94,11 +122,11 @@ class PollModule(PollFields, XModule):
     def get_html(self):
         """Renders parameters to template."""
         params = {
-                  'element_id': self.location.html_id(),
-                  'element_class': self.location.category,
-                  'ajax_url': self.system.ajax_url,
-                  'configuration_json': self.dump_poll(),
-                  }
+            'element_id': self.location.html_id(),
+            'element_class': self.location.block_type,
+            'ajax_url': self.system.ajax_url,
+            'configuration_json': self.dump_poll(),
+        }
         self.content = self.system.render_template('poll.html', params)
         return self.content
 
@@ -119,21 +147,23 @@ class PollModule(PollFields, XModule):
         # Now we use this hack.
         temp_poll_answers = self.poll_answers
 
-         # Fill self.poll_answers, prepare data for template context.
+        # Fill self.poll_answers, prepare data for template context.
         for answer in self.answers:
             # Set default count for answer = 0.
             if answer['id'] not in temp_poll_answers:
                 temp_poll_answers[answer['id']] = 0
-            answers_to_json[answer['id']] = cgi.escape(answer['text'])
+            answers_to_json[answer['id']] = html.escape(answer['text'], quote=False)
         self.poll_answers = temp_poll_answers
 
-        return json.dumps({'answers': answers_to_json,
-            'question': cgi.escape(self.question),
+        return json.dumps({
+            'answers': answers_to_json,
+            'question': html.escape(self.question, quote=False),
             # to show answered poll after reload:
             'poll_answer': self.poll_answer,
             'poll_answers': self.poll_answers if self.voted else {},
             'total': sum(self.poll_answers.values()) if self.voted else 0,
-            'reset': str(self.descriptor.xml_attributes.get('reset', 'true')).lower()})
+            'reset': str(self.descriptor.xml_attributes.get('reset', 'true')).lower()
+        })
 
 
 class PollDescriptor(PollFields, MakoModuleDescriptor, XmlDescriptor):
@@ -141,6 +171,7 @@ class PollDescriptor(PollFields, MakoModuleDescriptor, XmlDescriptor):
     _child_tag_name = 'answer'
 
     module_class = PollModule
+    resources_dir = None
 
     @classmethod
     def definition_from_xml(cls, xml_object, system):
@@ -184,15 +215,22 @@ class PollDescriptor(PollFields, MakoModuleDescriptor, XmlDescriptor):
 
     def definition_to_xml(self, resource_fs):
         """Return an xml element representing to this definition."""
-        poll_str = u'<{tag_name}>{text}</{tag_name}>'.format(
+        poll_str = HTML('<{tag_name}>{text}</{tag_name}>').format(
             tag_name=self._tag_name, text=self.question)
         xml_object = etree.fromstring(poll_str)
         xml_object.set('display_name', self.display_name)
 
         def add_child(xml_obj, answer):
-            child_str = u'<{tag_name} id="{id}">{text}</{tag_name}>'.format(
-                tag_name=self._child_tag_name, id=answer['id'],
-                text=answer['text'])
+            # Escape answer text before adding to xml tree.
+            answer_text = str(answer['text'])
+            child_str = Text('{tag_begin}{text}{tag_end}').format(
+                tag_begin=HTML('<{tag_name} id="{id}">').format(
+                    tag_name=self._child_tag_name,
+                    id=answer['id']
+                ),
+                text=answer_text,
+                tag_end=HTML('</{tag_name}>').format(tag_name=self._child_tag_name)
+            )
             child_node = etree.fromstring(child_str)
             xml_object.append(child_node)
 

@@ -1,81 +1,76 @@
+<%page expression_filter="h"/>
 <%inherit file="base.html" />
-<%def name="online_help_token()"><% return "checklist" %></%def>
+<%def name="online_help_token()"><% return "files" %></%def>
 <%!
-  from django.core.urlresolvers import reverse
+  import six
+
+  from cms.djangoapps.contentstore import utils
+  from cms.djangoapps.contentstore.config.waffle_utils import should_show_checklists_quality
+  from django.urls import reverse
   from django.utils.translation import ugettext as _
+  from openedx.core.djangolib.markup import HTML, Text
+  from openedx.core.djangolib.js_utils import js_escaped_string, dump_js_escaped_json
+  from util.course import has_certificates_enabled
 %>
-<%block name="title">${_("Course Checklists")}</%block>
+<%block name="title">${_("Checklists")}</%block>
 <%block name="bodyclass">is-signedin course view-checklists</%block>
 
 <%namespace name='static' file='static_content.html'/>
 
 <%block name="header_extras">
-% for template_name in ["checklist"]:
-  <script type="text/template" id="${template_name}-tpl">
-    <%static:include path="js/${template_name}.underscore" />
-  </script>
-% endfor
+    % if not settings.STUDIO_FRONTEND_CONTAINER_URL:
+        <link rel="stylesheet" type="text/css" href="${static.url('common/css/vendor/common.min.css')}" />
+        <link rel="stylesheet" type="text/css" href="${static.url('common/css/vendor/courseHealthCheck.min.css')}" />
+    % endif
 </%block>
-
-<%block name="jsextra">
-<script type="text/javascript">
-require(["domReady!", "jquery", "js/collections/checklist", "js/views/checklist"],
-        function(doc, $, ChecklistCollection, ChecklistView) {
-    var checklistCollection = new ChecklistCollection();
-    checklistCollection.url = "${handler_url}";
-
-    var editor = new ChecklistView({
-        el: $('.course-checklists'),
-        collection: checklistCollection
-    });
-    checklistCollection.fetch({reset: true});
-});
-</script>
-</%block>
-
 
 <%block name="content">
+
 <div class="wrapper-mast wrapper">
-  <header class="mast has-actions has-subtitle">
-    <h1 class="page-header">
-      <small class="subtitle">${_("Tools")}</small>
-      <span class="sr">&gt; </span>${_("Course Checklists")}
-    </h1>
-  </header>
+    <header class="mast has-actions has-subtitle">
+        <h2 class="page-header">
+            <small class="subtitle">${_("Tools")}</small>
+            <span class="sr">- </span>${_("Checklists")}
+        </h2>
+    </header>
 </div>
 
 <div class="wrapper-content wrapper">
-  <section class="content">
-    <article class="content-primary" role="main">
-      <form id="course-checklists" class="course-checklists" method="post" action="">
-        <h2 class="title title-3 sr">${_("Current Checklists")}</h2>
-      </form>
-    </article>
+    <div class="content">
+        <%static:studiofrontend entry="courseHealthCheck">
 
-    <aside class="content-supplementary" role="complimentary">
-      <div class="bit">
-        <h3 class="title title-3">${_("What are course checklists?")}</h3>
-        <p>
-          ${_("Course checklists are tools to help you understand and keep track of all the steps necessary to get your course ready for students.")}
-        </p>
-        <p>
-          ${_("Any changes you make to these checklists are saved automatically and are immediately visible to other course team members.")}
-        </p>
-      </div>
-
-      <div class="bit">
-        <h3 class="title title-3">${_("Studio checklists")}</h3>
-        <nav class="nav-page checklists-current">
-          <ol>
-            % for checklist in checklists:
-            <li class="nav-item">
-              <a rel="view" href="${'#course-checklist' + str(loop.index)}">${checklist['short_description']}</a>
-            </li>
-            % endfor
-          </ol>
-        </nav>
-      </div>
-    </aside>
-  </section>
+            <%
+                course_key = six.text_type(context_course.id)
+                certificates_url = ''
+                if has_certificates_enabled(context_course):
+                    certificates_url = utils.reverse_course_url('certificates_list_handler', course_key)
+            %>
+            {
+                "lang": "${language_code | n, js_escaped_string}",
+                "course": {
+                    "id": "${context_course.id | n, js_escaped_string}",
+                    "name": "${context_course.display_name_with_default | n, js_escaped_string}",
+                    "is_course_self_paced": ${context_course.self_paced | n, dump_js_escaped_json},
+                    "url_name": "${context_course.location.name | n, js_escaped_string}",
+                    "org": "${context_course.location.org | n, js_escaped_string}",
+                    "num": "${context_course.location.course | n, js_escaped_string}",
+                    "display_course_number": "${context_course.display_coursenumber | n, js_escaped_string}",
+                    "revision": "${context_course.location.revision | n, js_escaped_string}"
+                },
+                "help_tokens": {
+                    "files": "${get_online_help_info(online_help_token())['doc_url'] | n, js_escaped_string}"
+                },
+                "enable_quality": ${should_show_checklists_quality(context_course.id) | n, dump_js_escaped_json},
+                "links": {
+                    "certificates": ${certificates_url | n, dump_js_escaped_json},
+                    "course_outline": ${utils.reverse_course_url('course_handler', course_key) | n, dump_js_escaped_json},
+                    "course_updates": ${utils.reverse_course_url('course_info_handler', course_key) | n, dump_js_escaped_json},
+                    "grading_policy": ${utils.reverse_course_url('grading_handler', course_key) | n, dump_js_escaped_json},
+                    "settings": ${utils.reverse_course_url('settings_handler', course_key) | n, dump_js_escaped_json}
+                }
+            }
+        </%static:studiofrontend>
+    </div>
 </div>
+
 </%block>

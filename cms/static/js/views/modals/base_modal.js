@@ -1,21 +1,49 @@
 /**
  * This is a base modal implementation that provides common utilities.
+ *
+ * A modal implementation should override the following methods:
+ *
+ *   getTitle():
+ *     returns the title for the modal.
+ *   getContentHtml():
+ *     returns the HTML content to be shown inside the modal.
+ *
+ * A modal implementation should also provide the following options:
+ *
+ *   modalName: A string identifying the modal.
+ *   modalType: A string identifying the type of the modal.
+ *   modalSize: A string, either 'sm', 'med', or 'lg' indicating the
+ *     size of the modal.
+ *   viewSpecificClasses: A string of CSS classes to be attached to
+ *     the modal window.
+ *   addPrimaryActionButton: A boolean indicating whether to include a primary action
+ *     button on the modal.
+ *   primaryActionButtonType: A string to be used as type for primary action button.
+ *   primaryActionButtonTitle: A string to be used as title for primary action button.
+ *   showEditorModeButtons: Whether to show editor mode button in the modal header.
  */
-define(["jquery", "underscore", "gettext", "js/views/baseview"],
+define(['jquery', 'underscore', 'gettext', 'js/views/baseview'],
     function($, _, gettext, BaseView) {
         var BaseModal = BaseView.extend({
-            events : {
+            events: {
                 'click .action-cancel': 'cancel'
             },
 
-            options: $.extend({}, BaseView.prototype.options, {
+            options: _.extend({}, BaseView.prototype.options, {
                 type: 'prompt',
                 closeIcon: false,
                 icon: false,
                 modalName: 'basic',
                 modalType: 'generic',
                 modalSize: 'lg',
-                title: ''
+                title: '',
+                modalWindowClass: '.modal-window',
+                // A list of class names, separated by space.
+                viewSpecificClasses: '',
+                addPrimaryActionButton: false,
+                primaryActionButtonType: 'save',
+                primaryActionButtonTitle: gettext('Save'),
+                showEditorModeButtons: true
             }),
 
             initialize: function() {
@@ -26,7 +54,7 @@ define(["jquery", "underscore", "gettext", "js/views/baseview"],
                 if (parent) {
                     parentElement = parent.$el;
                 } else if (!parentElement) {
-                    parentElement = this.$el.closest('.modal-window');
+                    parentElement = this.$el.closest(this.options.modalWindowClass);
                     if (parentElement.length === 0) {
                         parentElement = $('body');
                     }
@@ -35,19 +63,28 @@ define(["jquery", "underscore", "gettext", "js/views/baseview"],
             },
 
             render: function() {
+                // xss-lint: disable=javascript-jquery-html
                 this.$el.html(this.modalTemplate({
                     name: this.options.modalName,
                     type: this.options.modalType,
                     size: this.options.modalSize,
-                    title: this.options.title
+                    title: this.getTitle(),
+                    modalSRTitle: this.options.modalSRTitle,
+                    showEditorModeButtons: this.options.showEditorModeButtons,
+                    viewSpecificClasses: this.options.viewSpecificClasses
                 }));
                 this.addActionButtons();
                 this.renderContents();
                 this.parentElement.append(this.$el);
             },
 
+            getTitle: function() {
+                return this.options.title;
+            },
+
             renderContents: function() {
                 var contentHtml = this.getContentHtml();
+                // xss-lint: disable=javascript-jquery-html
                 this.$('.modal-content').html(contentHtml);
             },
 
@@ -58,10 +95,17 @@ define(["jquery", "underscore", "gettext", "js/views/baseview"],
                 return '';
             },
 
-            show: function() {
+            show: function(focusModal) {
+                var focusModalWindow = focusModal === undefined;
                 this.render();
                 this.resize();
                 $(window).resize(_.bind(this.resize, this));
+
+                // child may want to have its own focus management
+                if (focusModalWindow) {
+                    // after showing and resizing, send focus
+                    this.$el.find(this.options.modalWindowClass).focus();
+                }
             },
 
             hide: function() {
@@ -82,8 +126,12 @@ define(["jquery", "underscore", "gettext", "js/views/baseview"],
              * Adds the action buttons to the modal.
              */
             addActionButtons: function() {
-                if (this.options.addSaveButton) {
-                    this.addActionButton('save', gettext('Save'), true);
+                if (this.options.addPrimaryActionButton) {
+                    this.addActionButton(
+                        this.options.primaryActionButtonType,
+                        this.options.primaryActionButtonTitle,
+                        true
+                    );
                 }
                 this.addActionButton('cancel', gettext('Cancel'));
             },
@@ -100,6 +148,7 @@ define(["jquery", "underscore", "gettext", "js/views/baseview"],
                     name: name,
                     isPrimary: isPrimary
                 });
+                // xss-lint: disable=javascript-jquery-append
                 this.getActionBar().find('ul').append(html);
             },
 
@@ -107,7 +156,7 @@ define(["jquery", "underscore", "gettext", "js/views/baseview"],
              * Returns the action bar that contains the modal's action buttons.
              */
             getActionBar: function() {
-                return this.$('.modal-window > div > .modal-actions');
+                return this.$(this.options.modalWindowClass + ' > div > .modal-actions');
             },
 
             /**
@@ -117,15 +166,23 @@ define(["jquery", "underscore", "gettext", "js/views/baseview"],
                 return this.getActionBar().find('.action-' + type);
             },
 
+            enableActionButton: function(type) {
+                this.getActionBar().find('.action-' + type).prop('disabled', false).removeClass('is-disabled');
+            },
+
+            disableActionButton: function(type) {
+                this.getActionBar().find('.action-' + type).prop('disabled', true).addClass('is-disabled');
+            },
+
             resize: function() {
                 var top, left, modalWindow, modalWidth, modalHeight,
                     availableWidth, availableHeight, maxWidth, maxHeight;
 
-                modalWindow = this.$('.modal-window');
+                modalWindow = this.$el.find(this.options.modalWindowClass);
                 availableWidth = $(window).width();
                 availableHeight = $(window).height();
-                maxWidth = availableWidth * 0.80;
-                maxHeight = availableHeight * 0.80;
+                maxWidth = availableWidth * 0.98;
+                maxHeight = availableHeight * 0.98;
                 modalWidth = Math.min(modalWindow.outerWidth(), maxWidth);
                 modalHeight = Math.min(modalWindow.outerHeight(), maxHeight);
 

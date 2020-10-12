@@ -9,9 +9,11 @@ samples.
 """
 
 # should this move to cms since it's really only for module crud?
-import logging
 
+
+import logging
 from collections import defaultdict
+
 from xblock.core import XBlock
 
 log = logging.getLogger(__name__)

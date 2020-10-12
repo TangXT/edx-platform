@@ -10,22 +10,29 @@ sessions. Assumes structure:
 
 # We intentionally define lots of variables that aren't used, and
 # want to import all variables from base settings files
-# pylint: disable=W0401, W0614
+# pylint: disable=wildcard-import, unused-wildcard-import
+
+
+from openedx.core.lib.derived import derive_settings
+from openedx.core.lib.logsettings import get_logger_config
 
 from .common import *
-from logsettings import get_logger_config
 
 STATIC_GRAB = True
 
 LOGGING = get_logger_config(ENV_ROOT / "log",
-                            logging_env="dev",
-                            tracking_filename="tracking.log",
-                            debug=False)
+                            logging_env="dev")
 
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': ENV_ROOT / "db" / "edx.db",
+        'ATOMIC_REQUESTS': True,
+    },
+    'student_module_history': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': ENV_ROOT / "db" / "student_module_history.db",
+        'ATOMIC_REQUESTS': True,
     }
 }
 
@@ -59,7 +66,11 @@ DEFAULT_FILE_STORAGE = 'django.core.files.storage.FileSystemStorage'
 MEDIA_ROOT = ENV_ROOT / "uploads"
 MEDIA_URL = "/discussion/upfiles/"
 FILE_UPLOAD_TEMP_DIR = ENV_ROOT / "uploads"
-FILE_UPLOAD_HANDLERS = (
+FILE_UPLOAD_HANDLERS = [
     'django.core.files.uploadhandler.MemoryFileUploadHandler',
     'django.core.files.uploadhandler.TemporaryFileUploadHandler',
-)
+]
+
+########################## Derive Any Derived Settings  #######################
+
+derive_settings(__name__)

@@ -1,48 +1,85 @@
 define([
-    'jquery', 'underscore', 'gettext', 'js/views/baseview',
-    'js/views/group_configurations_list'
+    'jquery', 'underscore', 'gettext', 'js/views/pages/base_page',
+    'js/views/group_configurations_list', 'js/views/partition_group_list'
 ],
-function ($, _, gettext, BaseView, GroupConfigurationsList) {
+function($, _, gettext, BasePage, GroupConfigurationsListView, PartitionGroupListView) {
     'use strict';
-    var GroupConfigurationsPage = BaseView.extend({
-        initialize: function() {
-            BaseView.prototype.initialize.call(this);
-            this.listView = new GroupConfigurationsList({
-                collection: this.collection
-            });
-        },
+    var GroupConfigurationsPage = BasePage.extend({
+        initialize: function(options) {
+            var currentScheme,
+                i;
 
-        render: function() {
-            var hash = this.getLocationHash();
-            this.hideLoadingIndicator();
-            this.$('.content-primary').append(this.listView.render().el);
-            this.addButtonActions();
-            this.addWindowActions();
-            if (hash) {
-                // Strip leading '#' to get id string to match
-                this.expandConfiguration(hash.replace('#', ''))
+            BasePage.prototype.initialize.call(this);
+            this.experimentsEnabled = options.experimentsEnabled;
+            if (this.experimentsEnabled) {
+                this.experimentGroupConfigurations = options.experimentGroupConfigurations;
+                this.experimentGroupsListView = new GroupConfigurationsListView({
+                    collection: this.experimentGroupConfigurations
+                });
+            }
+
+            this.allGroupConfigurations = options.allGroupConfigurations || [];
+            this.allGroupViewList = [];
+            for (i = 0; i < this.allGroupConfigurations.length; i++) {
+                currentScheme = this.allGroupConfigurations[i].get('scheme');
+                this.allGroupViewList.push(
+                    new PartitionGroupListView({
+                        collection: this.allGroupConfigurations[i].get('groups'),
+                        restrictEditing: this.allGroupConfigurations[i].get('read_only'),
+                        scheme: currentScheme
+                    })
+                );
             }
         },
 
-        addButtonActions: function () {
-            this.$('.nav-actions .new-button').click(function (event) {
-                this.listView.addOne(event);
-            }.bind(this));
+        renderPage: function() {
+            var hash = this.getLocationHash(),
+                i,
+                currentClass;
+            if (this.experimentsEnabled) {
+                this.$('.wrapper-groups.experiment-groups').append(this.experimentGroupsListView.render().el);
+            }
+
+            // Render the remaining Configuration groups
+            for (i = 0; i < this.allGroupViewList.length; i++) {
+                currentClass = '.wrapper-groups.content-groups.' + this.allGroupViewList[i].scheme;
+                this.$(currentClass).append(this.allGroupViewList[i].render().el);
+            }
+
+            this.addWindowActions();
+            if (hash) {
+                // Strip leading '#' to get id string to match
+                this.expandConfiguration(hash.replace('#', ''));
+            }
+            return $.Deferred().resolve().promise();
         },
 
-        addWindowActions: function () {
+        addWindowActions: function() {
             $(window).on('beforeunload', this.onBeforeUnload.bind(this));
         },
 
-        onBeforeUnload: function () {
-            var dirty = this.collection.find(function(configuration) {
-                return configuration.isDirty();
-            });
+        /**
+         * Checks the Partition Group Configurations to see if the isDirty bit is set
+         * @returns {boolean} True if any partition group has the dirty bit set.
+         */
+        areAnyConfigurationsDirty: function() {
+            var i;
+            for (i = 0; i < this.allGroupConfigurations.length; i++) {
+                if (this.allGroupConfigurations[i].isDirty()) {
+                    return true;
+                }
+            }
+            return false;
+        },
 
-            if(dirty) {
-                return gettext(
-                    'You have unsaved changes. Do you really want to leave this page?'
-                );
+        onBeforeUnload: function() {
+            var dirty = this.areAnyConfigurationsDirty() ||
+                (this.experimentsEnabled && this.experimentGroupConfigurations.find(function(configuration) {
+                    return configuration.isDirty();
+                }));
+
+            if (dirty) {
+                return gettext('You have unsaved changes. Do you really want to leave this page?');
             }
         },
 
@@ -58,8 +95,8 @@ function ($, _, gettext, BaseView, GroupConfigurationsList) {
          * Focus on and expand group configuration with peculiar id.
          * @param {String|Number} Id of the group configuration.
          */
-        expandConfiguration: function (id) {
-            var groupConfig = this.collection.findWhere({
+        expandConfiguration: function(id) {
+            var groupConfig = this.experimentsEnabled && this.experimentGroupConfigurations.findWhere({
                 id: parseInt(id)
             });
 

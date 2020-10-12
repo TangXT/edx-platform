@@ -1,7 +1,14 @@
-from __future__ import print_function
-import sys
-from paver.easy import *
+"""
+Open edX Documentation Builder
+Ties into Sphinx to generate files at the specified location(s)
+"""
 
+
+import sys
+
+from paver.easy import cmdopts, needs, sh, task
+
+from .utils.timer import timed
 
 DOC_PATHS = {
     "dev": "docs/en_us/developers",
@@ -15,7 +22,7 @@ def valid_doc_types():
     """
     Return a comma-separated string of valid doc types.
     """
-    return ", ".join(DOC_PATHS.keys())
+    return ", ".join(list(DOC_PATHS.keys()))
 
 
 def doc_path(options, allow_default=True):
@@ -59,6 +66,7 @@ def doc_path(options, allow_default=True):
     ("type=", "t", "Type of docs to compile"),
     ("verbose", "v", "Display verbose output"),
 ])
+@timed
 def build_docs(options):
     """
     Invoke sphinx 'make build' to generate docs.

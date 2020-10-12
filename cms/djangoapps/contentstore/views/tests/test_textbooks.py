@@ -1,10 +1,12 @@
+""" Test cases for the textbook index page. """
+
+
 import json
 from unittest import TestCase
+
 from contentstore.tests.utils import CourseTestCase
 from contentstore.utils import reverse_course_url
-
-from contentstore.views.course import (
-    validate_textbooks_json, validate_textbook_json, TextbookValidationError)
+from contentstore.views.course import TextbookValidationError, validate_textbook_json, validate_textbooks_json
 
 
 class TextbookIndexTestCase(CourseTestCase):
@@ -20,7 +22,7 @@ class TextbookIndexTestCase(CourseTestCase):
         self.assertEqual(resp.status_code, 200)
         # we don't have resp.context right now,
         # due to bugs in our testing harness :(
-        if resp.context:
+        if resp.context and resp.context.get('course'):
             self.assertEqual(resp.context['course'], self.course)
 
     def test_view_index_xhr(self):
@@ -31,7 +33,7 @@ class TextbookIndexTestCase(CourseTestCase):
             HTTP_X_REQUESTED_WITH='XMLHttpRequest'
         )
         self.assertEqual(resp.status_code, 200)
-        obj = json.loads(resp.content)
+        obj = json.loads(resp.content.decode('utf-8'))
         self.assertEqual(self.course.pdf_textbooks, obj)
 
     def test_view_index_xhr_content(self):
@@ -64,7 +66,7 @@ class TextbookIndexTestCase(CourseTestCase):
             HTTP_X_REQUESTED_WITH='XMLHttpRequest'
         )
         self.assertEqual(resp.status_code, 200)
-        obj = json.loads(resp.content)
+        obj = json.loads(resp.content.decode('utf-8'))
 
         self.assertEqual(content, obj)
 
@@ -101,7 +103,7 @@ class TextbookIndexTestCase(CourseTestCase):
             HTTP_X_REQUESTED_WITH='XMLHttpRequest'
         )
         self.assertEqual(resp.status_code, 400)
-        obj = json.loads(resp.content)
+        obj = json.loads(resp.content.decode('utf-8'))
         self.assertIn("error", obj)
 
 
@@ -132,7 +134,7 @@ class TextbookCreateTestCase(CourseTestCase):
         )
         self.assertEqual(resp.status_code, 201)
         self.assertIn("Location", resp)
-        textbook = json.loads(resp.content)
+        textbook = json.loads(resp.content.decode('utf-8'))
         self.assertIn("id", textbook)
         del textbook["id"]
         self.assertEqual(self.textbook, textbook)
@@ -148,7 +150,7 @@ class TextbookCreateTestCase(CourseTestCase):
             HTTP_X_REQUESTED_WITH="XMLHttpRequest",
         )
         self.assertEqual(resp.status_code, 201)
-        textbook = json.loads(resp.content)
+        textbook = json.loads(resp.content.decode('utf-8'))
         self.assertEqual(self.textbook, textbook)
 
     def test_invalid_id(self):
@@ -210,14 +212,14 @@ class TextbookDetailTestCase(CourseTestCase):
         "Get the first textbook"
         resp = self.client.get(self.url1)
         self.assertEqual(resp.status_code, 200)
-        compare = json.loads(resp.content)
+        compare = json.loads(resp.content.decode('utf-8'))
         self.assertEqual(compare, self.textbook1)
 
     def test_get_2(self):
         "Get the second textbook"
         resp = self.client.get(self.url2)
         self.assertEqual(resp.status_code, 200)
-        compare = json.loads(resp.content)
+        compare = json.loads(resp.content.decode('utf-8'))
         self.assertEqual(compare, self.textbook2)
 
     def test_get_nonexistant(self):
@@ -255,7 +257,7 @@ class TextbookDetailTestCase(CourseTestCase):
         self.assertEqual(resp.status_code, 201)
         resp2 = self.client.get(url)
         self.assertEqual(resp2.status_code, 200)
-        compare = json.loads(resp2.content)
+        compare = json.loads(resp2.content.decode('utf-8'))
         self.assertEqual(compare, textbook)
         self.reload_course()
         self.assertEqual(
@@ -278,7 +280,7 @@ class TextbookDetailTestCase(CourseTestCase):
         self.assertEqual(resp.status_code, 201)
         resp2 = self.client.get(self.url2)
         self.assertEqual(resp2.status_code, 200)
-        compare = json.loads(resp2.content)
+        compare = json.loads(resp2.content.decode('utf-8'))
         self.assertEqual(compare, replacement)
         course = self.store.get_item(self.course.location)
         self.assertEqual(
@@ -292,6 +294,8 @@ class TextbookValidationTestCase(TestCase):
 
     def setUp(self):
         "Set some useful content for tests"
+        super(TextbookValidationTestCase, self).setUp()
+
         self.tb1 = {
             "tab_title": "Hi, mom!",
             "url": "/mom.pdf"

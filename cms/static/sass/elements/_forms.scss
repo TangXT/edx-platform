@@ -1,130 +1,169 @@
 // studio - elements - forms
 // ====================
 
-// forms - general
+// Table of Contents
+// * +Forms - General
+// * +Field - Is Editable
+// * +Field - With Error
+// * +Forms - Additional UI
+// * +Form - Create New
+// * +Form - Inline Name Edit
+// * +Form - Create New Wrapper
+// * +Form - Grandfathered
+
+// +Forms - General
+// ====================
+// element-specific utilities
+// --------------------
+// UI: checkbox/radio inputs
+%input-tickable {
+  ~ label {
+    color: $color-copy-base;
+  }
+
+  // STATE: checked/selected
+  &:checked ~ label {
+    @extend %t-strong;
+
+    color: $ui-action-primary-color-focus;
+  }
+}
+
 input[type="text"],
 input[type="email"],
 input[type="password"],
 textarea.text {
+  box-sizing: border-box;
+
+  @include linear-gradient($gray-l5, $white);
+
+  @extend %t-copy-sub2;
+  @extend %t-demi-strong;
+
   padding: 6px 8px 8px;
-  @include box-sizing(border-box);
   border: 1px solid $gray-l2;
   border-radius: 2px;
-  @include linear-gradient($gray-l5, $white);
   background-color: $gray-l5;
   box-shadow: inset 0 1px 2px $shadow-l1;
   font-family: 'Open Sans', sans-serif;
-  font-size: 11px;
-  color: $baseFontColor;
+  color: $color-copy-emphasized;
   outline: 0;
 
   &::-webkit-input-placeholder,
   &:-moz-placeholder,
   &:-ms-input-placeholder {
-      color: $gray-l2;
+    color: $gray-l2;
   }
 
   &:focus {
     @include linear-gradient($paleYellow, tint($paleYellow, 90%));
+
     outline: 0;
   }
 }
 
+// +Fields - Not Editable
 // ====================
-
-// forms - fields - not editable
 .field.is-not-editable {
-
   & label.is-focused {
-   color: $gray-d2;
+    color: $gray-d2;
   }
 
-  label, input, textarea {
+  label,
+  input,
+  textarea {
     pointer-events: none;
   }
 }
 
+// +Fields - With Error
 // ====================
-
-// field with error
 .field.error {
-
-  input, textarea {
+  input,
+  textarea {
     border-color: $red;
   }
 }
 
+// +Forms - Additional UI
 // ====================
-
-// forms - additional UI
 form {
 
-  input[type=file] {
-    @include font-size(14);
-    line-height: 1;
+  // CASE: cosmetic checkbox input
+  .checkbox-cosmetic {
+    .input-checkbox-checked,
+    .input-checkbox-unchecked,
+    .label {
+      display: inline-block;
+      vertical-align: middle;
+    }
+
+    .input-checkbox-checked,
+    .input-checkbox-unchecked {
+      width: ($baseline*0.75);
+    }
+
+    .input-checkbox {
+      @extend %cont-text-sr;
+
+      // CASE: unchecked
+      ~ label .input-checkbox-checked {
+        display: none;
+      }
+
+      ~ label .input-checkbox-unchecked {
+        display: inline-block;
+      }
+
+      // CASE: checked
+      &:checked {
+        ~ label .input-checkbox-checked {
+          display: inline-block;
+        }
+
+        ~ label .input-checkbox-unchecked {
+          display: none;
+        }
+      }
+    }
+  }
+
+  // CASE: checkbox input
+  .field-checkbox .input-checkbox {
+    @extend %input-tickable;
+  }
+
+  // CASE: radio input
+  .field-radio .input-radio {
+    @extend %input-tickable;
+  }
+
+  // CASE: file input
+  input[type="file"] {
+    @extend %t-copy-sub1;
   }
 
   .note {
-    @include box-sizing(border-box);
-
-    .title {
-
-    }
-
-    .copy {
-
-    }
+    box-sizing: border-box;
 
     // note with actions
     &.has-actions {
       @include clearfix();
-
-      .title {
-
-      }
-
-      .copy {
-
-      }
-
-      .list-actions {
-
-      }
     }
   }
-
-  .note-promotion {
-
-  }
 }
 
-// ELEM: form wrapper
-.wrapper-create-element {
-  height: 0;
-  margin-bottom: $baseline;
-  opacity: 0.0;
-  pointer-events: none;
-  overflow: hidden;
-
-  &.animate {
-    @include transition(opacity $tmg-f1 ease-in-out 0s, height $tmg-f1 ease-in-out 0s);
-  }
-
-  &.is-shown {
-    height: auto; // define a specific height for the animating version of this UI to work properly
-    opacity: 1.0;
-    pointer-events: auto;
-  }
-}
-
-// ELEM: form
+// +Form - Create New
+// ====================
 // form styling for creating a new content item (course, user, textbook)
-form[class^="create-"] {
+// TODO: refactor this into a placeholder to extend.
+.form-create {
   @extend %ui-window;
 
   .title {
     @extend %t-title4;
-    font-weight: 600;
+    @extend %t-strong;
+
     padding: $baseline ($baseline*1.5) 0 ($baseline*1.5);
   }
 
@@ -144,24 +183,27 @@ form[class^="create-"] {
       }
 
       &.required {
-
         label {
-          font-weight: 600;
+          @extend %t-strong;
         }
 
-        label:after {
+        label::after {
           margin-left: ($baseline/4);
           content: "*";
         }
       }
 
-      label, input, textarea {
+      label,
+      input,
+      textarea {
         display: block;
       }
 
       label {
         @extend %t-copy-sub1;
+
         @include transition(color $tmg-f3 ease-in-out 0s);
+
         margin: 0 0 ($baseline/4) 0;
 
         &.is-focused {
@@ -170,9 +212,12 @@ form[class^="create-"] {
       }
 
 
-      input, textarea {
+      input,
+      textarea {
         @extend %t-copy-base;
+
         @include transition(all $tmg-f2 ease-in-out 0s);
+
         height: 100%;
         width: 100%;
         padding: ($baseline/2);
@@ -185,14 +230,9 @@ form[class^="create-"] {
           width: 25%;
         }
 
-        /*@include placeholder {
-          color: $gray-l3;
-        }*/
-
         &:focus {
-
           + .tip {
-            color: $gray;
+            color: $gray-d1;
           }
         }
       }
@@ -214,10 +254,18 @@ form[class^="create-"] {
 
       .tip {
         @extend %t-copy-sub2;
-        @include transition(color, 0.15s, ease-in-out);
+
+        @include transition(color 0.15s ease-in-out);
+
+
         display: block;
         margin-top: ($baseline/4);
-        color: $gray-l3;
+        color: $gray-d1;
+      }
+
+      .tip-note {
+        display: block;
+        margin-top: ($baseline/4);
       }
 
       .tip-error {
@@ -231,11 +279,11 @@ form[class^="create-"] {
         }
 
         .is-showing {
-            @extend %anim-fadeIn;
+          @extend %anim-fadeIn;
         }
 
         .is-hiding {
-            @extend %anim-fadeOut;
+          @extend %anim-fadeOut;
         }
 
         .tip-error {
@@ -250,8 +298,9 @@ form[class^="create-"] {
     }
 
     .field-inline {
-
-      input, textarea, select {
+      input,
+      textarea,
+      select {
         width: 62%;
         display: inline-block;
       }
@@ -262,16 +311,11 @@ form[class^="create-"] {
         width: 35%;
         margin-top: 0;
       }
-
-      &.error {
-        .tip-error {
-        }
-      }
-
     }
 
     .field-group {
       @include clearfix();
+
       margin: 0 0 ($baseline/2) 0;
 
       .field {
@@ -292,7 +336,8 @@ form[class^="create-"] {
           margin-right: 0;
         }
 
-        input, textarea {
+        input,
+        textarea {
           width: 100%;
         }
       }
@@ -308,44 +353,117 @@ form[class^="create-"] {
 
     .action {
       @include transition(all $tmg-f2 linear 0s);
+
+      @extend %t-strong;
+
       display: inline-block;
       padding: ($baseline/5) $baseline;
-      font-weight: 600;
       text-transform: uppercase;
     }
 
     .action-primary {
       @include blue-button;
+
       @extend %t-action2;
     }
 
     .action-secondary {
       @include grey-button;
+
       @extend %t-action2;
     }
   }
 }
 
+// +Form - Inline Name Edit
 // ====================
+// form - inline xblock name edit on unit, container, outline
+// TODO: abstract this out into a Sass placeholder
+.incontext-editor.is-editable {
+  .access-editor-action-wrapper {
+    display: inline-block;
+    vertical-align: middle;
+    max-width: 80%;
 
-// forms - grandfathered
+    .icon.icon {
+      vertical-align: baseline;
+    }
+  }
+
+  .incontext-editor-value,
+  .incontext-editor-action-wrapper {
+    @extend %cont-truncated;
+
+    display: inline-block;
+    vertical-align: middle;
+    max-width: 70%;
+  }
+
+  .incontext-editor-open-action,
+  .access-button {
+    @extend %ui-btn-non-blue;
+    @extend %t-copy-base;
+
+    padding-top: ($baseline/10);
+
+    .icon.icon {
+      vertical-align: baseline;
+    }
+  }
+
+  .incontext-editor-form {
+    display: none;
+  }
+
+  &.is-editing {
+    .incontext-editor-value,
+    .incontext-editor-action-wrapper {
+      display: none;
+    }
+
+    .incontext-editor-form {
+      display: inline-block;
+    }
+  }
+}
+
+// +Form - Create New Wrapper
+// ====================
+.wrapper-create-element {
+  height: auto;
+  opacity: 1;
+  pointer-events: auto;
+  overflow: hidden;
+  display: none;
+
+  &.animate {
+    @include transition(opacity $tmg-f1 ease-in-out 0s, height $tmg-f1 ease-in-out 0s);
+  }
+
+  &.is-shown {
+    display: block;
+  }
+}
+
+// +Form - Grandfathered
+// ====================
 input.search {
   padding: 6px 15px 8px 30px;
-  @include box-sizing(border-box);
+  box-sizing: border-box;
   border: 1px solid $darkGrey;
   border-radius: 20px;
-  background: url(../img/search-icon.png) no-repeat 8px 7px #edf1f5;
+  background: url('#{$static-path}/images/search-icon.png') no-repeat 8px 7px #edf1f5;
   font-family: 'Open Sans', sans-serif;
-  color: $baseFontColor;
+  color: $body-color;
   outline: 0;
 
   &::-webkit-input-placeholder {
-      color: #979faf;
+    color: #979faf;
   }
 }
 
 label {
-  font-size: 12px;
+  @extend %t-copy-sub2;
 }
 
 code {
@@ -356,18 +474,22 @@ code {
 }
 
 .CodeMirror {
-  font-size: 13px;
-  background: #fff;
+  @extend %t-copy-sub1;
+
+  background: $white;
+  font-family: $f-monospace;
 }
 
 .text-editor {
   width: 100%;
   min-height: 80px;
   padding: 10px;
-  @include box-sizing(border-box);
+  box-sizing: border-box;
   border: 1px solid $mediumGrey;
+
   @include linear-gradient(top, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.3));
-  background-color:  #edf1f5;
+
+  background-color: #edf1f5;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1) inset;
   font-family: Monaco, monospace;
 }

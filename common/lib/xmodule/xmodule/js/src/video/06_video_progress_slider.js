@@ -1,5 +1,4 @@
-(function (requirejs, require, define) {
-
+(function(requirejs, require, define) {
 /*
 "This is as true in everyday life as it is in battle: we are given one life
 and the decision is ours whether to wait for circumstances to make up our
@@ -8,19 +7,23 @@ mind, or whether to act, and in acting, to live."
  */
 
 // VideoProgressSlider module.
-define(
+    define(
 'video/06_video_progress_slider.js',
 [],
-function () {
+function() {
+    var template = [
+        '<div class="slider" role="application" title="',
+        gettext('Video position. Press space to toggle playback'),
+        '"></div>'
+    ].join('');
+
     // VideoProgressSlider() function - what this module "exports".
-    return function (state) {
+    return function(state) {
         var dfd = $.Deferred();
 
         state.videoProgressSlider = {};
-
         _makeFunctionsPublic(state);
         _renderElements(state);
-        // No callbacks to DOM events (click, mousemove, etc.).
 
         dfd.resolve();
         return dfd.promise();
@@ -34,8 +37,11 @@ function () {
     //
     //     Functions which will be accessible via 'state' object. When called,
     //     these functions will get the 'state' object as a context.
+
+    /* eslint-disable no-use-before-define */
     function _makeFunctionsPublic(state) {
         var methodsDict = {
+            destroy: destroy,
             buildSlider: buildSlider,
             getRangeParams: getRangeParams,
             onSlide: onSlide,
@@ -43,11 +49,24 @@ function () {
             updatePlayTime: updatePlayTime,
             updateStartEndTimeRegion: updateStartEndTimeRegion,
             notifyThroughHandleEnd: notifyThroughHandleEnd,
-            getTimeDescription: getTimeDescription
+            getTimeDescription: getTimeDescription,
+            focusSlider: focusSlider
         };
 
         state.bindTo(methodsDict, state.videoProgressSlider, state);
     }
+
+    function destroy() {
+        this.videoProgressSlider.el.removeAttr('tabindex').slider('destroy');
+        this.el.off('destroy', this.videoProgressSlider.destroy);
+        delete this.videoProgressSlider;
+    }
+
+    function bindHandlers(state) {
+        state.videoProgressSlider.el.on('keypress', sliderToggle.bind(state));
+        state.el.on('destroy', state.videoProgressSlider.destroy);
+    }
+    /* eslint-enable no-use-before-define */
 
     // function _renderElements(state)
     //
@@ -56,10 +75,12 @@ function () {
     //     via the 'state' object. Much easier to work this way - you don't
     //     have to do repeated jQuery element selects.
     function _renderElements(state) {
-        state.videoProgressSlider.el = state.videoControl.sliderEl;
+        state.videoProgressSlider.el = $(template);
 
+        state.el.find('.video-controls').prepend(state.videoProgressSlider.el);
         state.videoProgressSlider.buildSlider();
         _buildHandle(state);
+        bindHandlers(state);
     }
 
     function _buildHandle(state) {
@@ -68,15 +89,22 @@ function () {
 
         // ARIA
         // We just want the knob to be selectable with keyboard
-        state.videoProgressSlider.el.attr('tabindex', -1);
-        // Let screen readers know that this anchor, representing the slider
+        state.videoProgressSlider.el.attr({
+            tabindex: -1
+        });
+
+        // Let screen readers know that this div, representing the slider
         // handle, behaves as a slider named 'video position'.
         state.videoProgressSlider.handle.attr({
-            'role': 'slider',
-            'title': gettext('Video position'),
+            role: 'slider',
             'aria-disabled': false,
             'aria-valuetext': getTimeDescription(state.videoProgressSlider
-                .slider.slider('option', 'value'))
+                .slider.slider('option', 'value')),
+            'aria-valuemax': state.videoPlayer.duration(),
+            'aria-valuemin': '0',
+            'aria-valuenow': state.videoPlayer.currentTime,
+            tabindex: '0',
+            'aria-label': gettext('Video position. Press space to toggle playback')
         });
     }
 
@@ -88,11 +116,21 @@ function () {
     // ***************************************************************
 
     function buildSlider() {
+        var sliderContents = edx.HtmlUtils.joinHtml(
+            edx.HtmlUtils.HTML('<div class="ui-slider-handle progress-handle"></div>')
+        );
+
+        // xss-lint: disable=javascript-jquery-append
+        this.videoProgressSlider.el.append(sliderContents.text);
+
         this.videoProgressSlider.slider = this.videoProgressSlider.el
             .slider({
                 range: 'min',
+                min: this.config.startTime,
+                max: this.config.endTime,
                 slide: this.videoProgressSlider.onSlide,
-                stop: this.videoProgressSlider.onStop
+                stop: this.videoProgressSlider.onStop,
+                step: 5
             });
 
         this.videoProgressSlider.sliderProgress = this.videoProgressSlider
@@ -104,7 +142,7 @@ function () {
     // whole slider). Remember that endTime === null means the end-time
     // is set to the end of video by default.
     function updateStartEndTimeRegion(params) {
-        var left, width, start, end, duration, rangeParams;
+        var start, end, duration, rangeParams;
 
         // We must have a duration in order to determine the area of range.
         // It also must be non-zero.
@@ -144,25 +182,6 @@ function () {
         // with actual starting and ending point of the video.
 
         rangeParams = getRangeParams(start, end, duration);
-
-        if (!this.videoProgressSlider.sliderRange) {
-            this.videoProgressSlider.sliderRange = $('<div />', {
-                    'class': 'ui-slider-range ' +
-                             'ui-widget-header ' +
-                             'ui-corner-all ' +
-                             'slider-range'
-                })
-                .css({
-                    left: rangeParams.left,
-                    width: rangeParams.width
-                });
-
-            this.videoProgressSlider.sliderProgress
-                .after(this.videoProgressSlider.sliderRange);
-        } else {
-            this.videoProgressSlider.sliderRange
-                .css(rangeParams);
-        }
     }
 
     function getRangeParams(startTime, endTime, duration) {
@@ -178,7 +197,11 @@ function () {
 
     function onSlide(event, ui) {
         var time = ui.value,
-            duration = this.videoPlayer.duration();
+            endTime = this.videoPlayer.duration();
+
+        if (this.config.endTime) {
+            endTime = Math.min(this.config.endTime, endTime);
+        }
 
         this.videoProgressSlider.frozen = true;
 
@@ -190,13 +213,13 @@ function () {
             'videoControl.updateVcrVidTime',
             {
                 time: time,
-                duration: duration
+                duration: endTime
             }
         );
 
         this.trigger(
             'videoPlayer.onSlideSeek',
-            {'type': 'onSlideSeek', 'time': time}
+            {type: 'onSlideSeek', time: time}
         );
 
         // ARIA
@@ -217,7 +240,7 @@ function () {
         if (this.videoProgressSlider.lastSeekValue !== ui.value) {
             this.trigger(
                 'videoPlayer.onSlideSeek',
-                {'type': 'onSlideSeek', 'time': ui.value}
+                {type: 'onSlideSeek', time: ui.value}
             );
         }
 
@@ -232,17 +255,30 @@ function () {
     }
 
     function updatePlayTime(params) {
-        var time = Math.floor(params.time),
-            duration = Math.floor(params.duration);
+        var time = Math.floor(params.time);
+        // params.duration could accidentally be construed as a floating
+        // point double. Since we're displaying this number, round down
+        // to nearest second
+        var endTime = Math.floor(params.duration);
+
+        if (this.config.endTime !== null) {
+            endTime = Math.min(this.config.endTime, endTime);
+        }
 
         if (
             this.videoProgressSlider.slider &&
             !this.videoProgressSlider.frozen
         ) {
             this.videoProgressSlider.slider
-                .slider('option', 'max', duration)
+                .slider('option', 'max', endTime)
                 .slider('option', 'value', time);
         }
+
+        // Update aria values.
+        this.videoProgressSlider.handle.attr({
+            'aria-valuemax': endTime,
+            'aria-valuenow': time
+        });
     }
 
     // When the video stops playing (either because the end was reached, or
@@ -279,38 +315,52 @@ function () {
         var seconds = Math.floor(time),
             minutes = Math.floor(seconds / 60),
             hours = Math.floor(minutes / 60),
-            i18n = function (value, word) {
+            i18n = function(value, word) {
                 var msg;
 
-                switch(word) {
-                    case 'hour':
-                        msg = ngettext('%(value)s hour', '%(value)s hours', value);
-                        break;
-                    case 'minute':
-                        msg = ngettext('%(value)s minute', '%(value)s minutes', value);
-                        break;
-                    case 'second':
-                        msg = ngettext('%(value)s second', '%(value)s seconds', value);
-                        break;
+                switch (word) {
+                case 'hour':
+                    msg = ngettext('%(value)s hour', '%(value)s hours', value);
+                    break;
+                case 'minute':
+                    msg = ngettext('%(value)s minute', '%(value)s minutes', value);
+                    break;
+                case 'second':
+                    msg = ngettext('%(value)s second', '%(value)s seconds', value);
+                    break;
                 }
-                return interpolate(msg, {'value': value}, true);
+                return interpolate(msg, {value: value}, true);
             };
 
         seconds = seconds % 60;
         minutes = minutes % 60;
 
         if (hours) {
-            return  i18n(hours, 'hour') + ' ' +
+            return i18n(hours, 'hour') + ' ' +
                     i18n(minutes, 'minute') + ' ' +
                     i18n(seconds, 'second');
         } else if (minutes) {
-            return  i18n(minutes, 'minute') + ' ' +
+            return i18n(minutes, 'minute') + ' ' +
                     i18n(seconds, 'second');
         }
 
         return i18n(seconds, 'second');
     }
 
-});
+    // Shift focus to the progress slider container element.
+    function focusSlider() {
+        this.videoProgressSlider.handle.attr(
+            'aria-valuetext', getTimeDescription(this.videoPlayer.currentTime)
+        );
+        this.videoProgressSlider.el.trigger('focus');
+    }
 
+    // Toggle video playback when the spacebar is pushed.
+    function sliderToggle(e) {
+        if (e.which === 32) {
+            e.preventDefault();
+            this.videoCommands.execute('togglePlayback');
+        }
+    }
+});
 }(RequireJS.requirejs, RequireJS.require, RequireJS.define));

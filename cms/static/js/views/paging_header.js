@@ -1,16 +1,22 @@
-define(["underscore", "gettext", "js/views/baseview"], function(_, gettext, BaseView) {
-
-    var PagingHeader = BaseView.extend({
-        events : {
-            "click .next-page-link": "nextPage",
-            "click .previous-page-link": "previousPage"
+define([
+    'underscore',
+    'backbone',
+    'gettext',
+    'edx-ui-toolkit/js/utils/html-utils',
+    'edx-ui-toolkit/js/utils/string-utils',
+    'text!templates/paging-header.underscore'
+], function(_, Backbone, gettext, HtmlUtils, StringUtils, pagingHeaderTemplate) {
+    'use strict';
+    var PagingHeader = Backbone.View.extend({
+        events: {
+            'click .next-page-link': 'nextPage',
+            'click .previous-page-link': 'previousPage'
         },
 
         initialize: function(options) {
             var view = options.view,
                 collection = view.collection;
             this.view = view;
-            this.template = this.loadTemplate('paging-header');
             collection.bind('add', _.bind(this.render, this));
             collection.bind('remove', _.bind(this.render, this));
             collection.bind('reset', _.bind(this.render, this));
@@ -19,60 +25,99 @@ define(["underscore", "gettext", "js/views/baseview"], function(_, gettext, Base
         render: function() {
             var view = this.view,
                 collection = view.collection,
-                currentPage = collection.currentPage,
-                lastPage = collection.totalPages - 1,
-                messageHtml = this.messageHtml();
-            this.$el.html(this.template({
-                messageHtml: messageHtml
-            }));
-            this.$(".previous-page-link").toggleClass("is-disabled", currentPage === 0);
-            this.$(".next-page-link").toggleClass("is-disabled", currentPage === lastPage);
+                currentPage = collection.getPageNumber(),
+                lastPage = collection.getTotalPages(),
+                messageHtml = this.messageHtml(),
+                isNextDisabled = lastPage === 0 || currentPage === lastPage;
+
+            HtmlUtils.setHtml(this.$el, HtmlUtils.template(pagingHeaderTemplate)({messageHtml: messageHtml}));
+            this.$('.previous-page-link')
+                    .toggleClass('is-disabled', currentPage === 1)
+                    .attr('aria-disabled', currentPage === 1);
+            this.$('.next-page-link')
+                    .toggleClass('is-disabled', isNextDisabled)
+                    .attr('aria-disabled', isNextDisabled);
+
             return this;
         },
 
         messageHtml: function() {
-            var message;
-            if (this.view.collection.sortDirection === 'asc') {
-                // Translators: sample result: "Showing 0-9 out of 25 total, sorted by Date Added ascending"
-                message = gettext('Showing %(current_item_range)s out of %(total_items_count)s, sorted by %(sort_name)s ascending');
+            var message = '',
+                assetType = false;
+
+            if (this.view.collection.assetType) {
+                if (this.view.collection.sortDirection === 'asc') {
+                        // Translators: sample result:
+                        // "Showing 0-9 out of 25 total, filtered by Images, sorted by Date Added ascending"
+                    message = gettext('Showing {currentItemRange} out of {totalItemsCount}, filtered by {assetType}, sorted by {sortName} ascending');  // eslint-disable-line max-len
+                } else {
+                        // Translators: sample result:
+                        // "Showing 0-9 out of 25 total, filtered by Images, sorted by Date Added descending"
+                    message = gettext('Showing {currentItemRange} out of {totalItemsCount}, filtered by {assetType}, sorted by {sortName} descending');  // eslint-disable-line max-len
+                }
+                assetType = this.filterNameLabel();
             } else {
-                // Translators: sample result: "Showing 0-9 out of 25 total, sorted by Date Added descending"
-                message = gettext('Showing %(current_item_range)s out of %(total_items_count)s, sorted by %(sort_name)s descending');
+                if (this.view.collection.sortDirection === 'asc') {
+                        // Translators: sample result:
+                        // "Showing 0-9 out of 25 total, sorted by Date Added ascending"
+                    message = gettext('Showing {currentItemRange} out of {totalItemsCount}, sorted by {sortName} ascending');  // eslint-disable-line max-len
+                } else {
+                        // Translators: sample result:
+                        // "Showing 0-9 out of 25 total, sorted by Date Added descending"
+                    message = gettext('Showing {currentItemRange} out of {totalItemsCount}, sorted by {sortName} descending');  // eslint-disable-line max-len
+                }
             }
-            return '<p>' + interpolate(message, {
-                current_item_range: this.currentItemRangeLabel(),
-                total_items_count: this.totalItemsCountLabel(),
-                sort_name: this.sortNameLabel()
-            }, true) + "</p>";
+
+            return HtmlUtils.interpolateHtml(message, {
+                currentItemRange: this.currentItemRangeLabel(),
+                totalItemsCount: this.totalItemsCountLabel(),
+                assetType: assetType,
+                sortName: this.sortNameLabel()
+            });
         },
 
         currentItemRangeLabel: function() {
             var view = this.view,
                 collection = view.collection,
-                start = collection.start,
+                start = (collection.getPageNumber() - 1) * collection.getPageSize(),
                 count = collection.size(),
-                end = start + count;
-            return interpolate('<span class="count-current-shown">%(start)s-%(end)s</span>', {
+                end = start + count,
+                htmlMessage = HtmlUtils.HTML('<span class="count-current-shown">{start}-{end}</span>');
+
+            return HtmlUtils.interpolateHtml(htmlMessage, {
                 start: Math.min(start + 1, end),
                 end: end
-            }, true);
+            });
         },
 
         totalItemsCountLabel: function() {
-            var totalItemsLabel;
-            // Translators: turns into "25 total" to be used in other sentences, e.g. "Showing 0-9 out of 25 total".
-            totalItemsLabel = interpolate(gettext('%(total_items)s total'), {
-                total_items: this.view.collection.totalCount
-            }, true);
-            return interpolate('<span class="count-total">%(total_items_label)s</span>', {
-                total_items_label: totalItemsLabel
-            }, true);
+            var totalItemsLabel,
+                htmlMessage = HtmlUtils.HTML('<span class="count-total">{totalItemsLabel}</span>');
+
+                // Translators: turns into "25 total" to be used in other sentences, e.g. "Showing 0-9 out of 25 total".
+            totalItemsLabel = StringUtils.interpolate(gettext('{totalItems} total'), {
+                totalItems: this.view.collection.getTotalRecords()
+            });
+
+            return HtmlUtils.interpolateHtml(htmlMessage, {
+                totalItemsLabel: totalItemsLabel
+            });
         },
 
         sortNameLabel: function() {
-            return interpolate('<span class="sort-order">%(sort_name)s</span>', {
-                sort_name: this.view.sortDisplayName()
-            }, true);
+            var htmlMessage = HtmlUtils.HTML('<span class="sort-order">{sortName}</span>');
+
+            return HtmlUtils.interpolateHtml(htmlMessage, {
+                sortName: this.view.sortDisplayName()
+            });
+        },
+
+        filterNameLabel: function() {
+            var htmlMessage = HtmlUtils.HTML('<span class="filter-column">{filterName}</span>');
+
+            return HtmlUtils.interpolateHtml(htmlMessage, {
+                filterName: this.view.filterDisplayName()
+            });
         },
 
         nextPage: function() {
@@ -85,4 +130,4 @@ define(["underscore", "gettext", "js/views/baseview"], function(_, gettext, Base
     });
 
     return PagingHeader;
-}); // end define();
+});

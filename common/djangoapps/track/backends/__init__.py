@@ -6,18 +6,17 @@ backends.
 
 """
 
-from __future__ import absolute_import
 
 import abc
 
+import six
 
-# pylint: disable=unused-argument
-class BaseBackend(object):
+
+class BaseBackend(six.with_metaclass(abc.ABCMeta, object)):
     """
     Abstract Base Class for event tracking backends.
 
     """
-    __metaclass__ = abc.ABCMeta
 
     def __init__(self, **kwargs):
         pass

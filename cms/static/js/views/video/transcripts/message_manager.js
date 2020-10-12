@@ -1,8 +1,8 @@
 define(
     [
-        "jquery", "backbone", "underscore",
-        "js/views/video/transcripts/utils", "js/views/video/transcripts/file_uploader",
-        "gettext"
+        'jquery', 'backbone', 'underscore',
+        'js/views/video/transcripts/utils', 'js/views/video/transcripts/file_uploader',
+        'gettext'
     ],
 function($, Backbone, _, Utils, FileUploader, gettext) {
     var MessageManager = Backbone.View.extend({
@@ -22,26 +22,29 @@ function($, Backbone, _, Utils, FileUploader, gettext) {
             not_found: '#transcripts-not-found',
             found: '#transcripts-found',
             import: '#transcripts-import',
-            replace:  '#transcripts-replace',
-            uploaded:  '#transcripts-uploaded',
+            replace: '#transcripts-replace',
+            uploaded: '#transcripts-uploaded',
             use_existing: '#transcripts-use-existing',
             choose: '#transcripts-choose'
         },
 
-        initialize: function () {
-            _.bindAll(this);
+        initialize: function(options) {
+            _.bindAll(this,
+                'importHandler', 'replaceHandler', 'chooseHandler', 'useExistingHandler', 'showError', 'hideError'
+            );
+
+            this.options = _.extend({}, options);
 
             this.component_locator = this.$el.closest('[data-locator]').data('locator');
 
             this.fileUploader = new FileUploader({
                 el: this.$el,
                 messenger: this,
-                component_locator: this.component_locator,
-                videoListObject: this.options.parent
+                component_locator: this.component_locator
             });
         },
 
-        render: function (template_id, params) {
+        render: function(template_id, params) {
             var tplHtml = $(this.templates[template_id]).text(),
                 videoList = this.options.parent.getVideoObjectsList(),
             // Change list representation format to more convenient and group
@@ -58,7 +61,7 @@ function($, Backbone, _, Utils, FileUploader, gettext) {
             // }
                 groupedList = _.groupBy(
                     videoList,
-                    function (value) {
+                    function(value) {
                         return value.video;
                     }
                 ),
@@ -71,16 +74,15 @@ function($, Backbone, _, Utils, FileUploader, gettext) {
                 return this;
             }
 
-            template = _.template(tplHtml);
+            template = edx.HtmlUtils.template(tplHtml);
 
-            this.$el.find('.transcripts-status')
-                .removeClass('is-invisible')
-                .find(this.elClass).html(template({
-                    component_locator: encodeURIComponent(this.component_locator),
-                    html5_list: html5List,
-                    grouped_list: groupedList,
-                    subs_id: (params) ? params.subs: ''
-                }));
+            edx.HtmlUtils.setHtml(
+            this.$el.find('.transcripts-status').removeClass('is-invisible').find(this.elClass), template({
+                component_locator: encodeURIComponent(this.component_locator),
+                html5_list: html5List,
+                grouped_list: groupedList,
+                subs_id: (params) ? params.subs : ''
+            }));
 
             this.fileUploader.render();
 
@@ -97,17 +99,13 @@ function($, Backbone, _, Utils, FileUploader, gettext) {
         * @param {boolean} hideButtons Hide buttons
         *
         */
-        showError: function (err, hideButtons) {
+        showError: function(err, hideButtons) {
             var $error = this.$el.find('.transcripts-error-message');
 
             if (err) {
                 // Hide any other error messages.
                 this.hideError();
-
-                $error
-                    .html(gettext(err))
-                    .removeClass(this.invisibleClass);
-
+                edx.HtmlUtils.setHtml($error, gettext(err)).removeClass(this.invisibleClass);
                 if (hideButtons) {
                     this.$el.find('.wrapper-transcripts-buttons')
                         .addClass(this.invisibleClass);
@@ -121,7 +119,7 @@ function($, Backbone, _, Utils, FileUploader, gettext) {
         * Hides error message.
         *
         */
-        hideError: function () {
+        hideError: function() {
             this.$el.find('.transcripts-error-message')
                 .addClass(this.invisibleClass);
 
@@ -137,10 +135,10 @@ function($, Backbone, _, Utils, FileUploader, gettext) {
         * @params {object} event Event object.
         *
         */
-        importHandler: function (event) {
+        importHandler: function(event) {
             event.preventDefault();
 
-            this.processCommand('replace', 'Error: Import failed.');
+            this.processCommand('replace', gettext('Error: Import failed.'));
         },
 
         /**
@@ -151,10 +149,10 @@ function($, Backbone, _, Utils, FileUploader, gettext) {
         * @params {object} event Event object.
         *
         */
-        replaceHandler: function (event) {
+        replaceHandler: function(event) {
             event.preventDefault();
 
-            this.processCommand('replace', 'Error: Replacing failed.');
+            this.processCommand('replace', gettext('Error: Replacing failed.'));
         },
 
         /**
@@ -165,12 +163,12 @@ function($, Backbone, _, Utils, FileUploader, gettext) {
         * @params {object} event Event object.
         *
         */
-        chooseHandler: function (event) {
+        chooseHandler: function(event) {
             event.preventDefault();
 
             var videoId = $(event.currentTarget).data('video-id');
 
-            this.processCommand('choose', 'Error: Choosing failed.', videoId);
+            this.processCommand('choose', gettext('Error: Choosing failed.'), videoId);
         },
 
         /**
@@ -181,10 +179,10 @@ function($, Backbone, _, Utils, FileUploader, gettext) {
         * @params {object} event Event object.
         *
         */
-        useExistingHandler: function (event) {
+        useExistingHandler: function(event) {
             event.preventDefault();
 
-            this.processCommand('rename', 'Error: Choosing failed.');
+            this.processCommand('rename', gettext('Error: Choosing failed.'));
         },
 
         /**
@@ -202,24 +200,24 @@ function($, Backbone, _, Utils, FileUploader, gettext) {
         *                          to the server
         *
         */
-        processCommand: function (action, errorMessage, videoId) {
+        processCommand: function(action, errorMessage, videoId) {
             var self = this,
                 component_locator = this.component_locator,
                 videoList = this.options.parent.getVideoObjectsList(),
                 extraParam, xhr;
 
             if (videoId) {
-                extraParam = { html5_id: videoId };
+                extraParam = {html5_id: videoId};
             }
 
             xhr = Utils.command(action, component_locator, videoList, extraParam)
-                .done(function (resp) {
-                        var sub = resp.subs;
+                .done(function(resp) {
+                    var edxVideoID = resp.edx_video_id;
 
-                        self.render('found', resp);
-                        Utils.Storage.set('sub', sub);
+                    self.render('found', resp);
+                    Backbone.trigger('transcripts:basicTabUpdateEdxVideoId', edxVideoID);
                 })
-                .fail(function (resp) {
+                .fail(function(resp) {
                     var message = resp.status || errorMessage;
                     self.showError(message);
                 });

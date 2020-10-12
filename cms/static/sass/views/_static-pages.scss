@@ -6,7 +6,7 @@
   // page structure
   .content-primary,
   .content-supplementary {
-    @include box-sizing(border-box);
+    box-sizing: border-box;
     float: left;
   }
 
@@ -15,21 +15,10 @@
     margin-right: flex-gutter();
 
     .add-pages {
-      @extend %ui-well;
+      @extend %no-content;
+
       margin: ($baseline*1.5) 0;
-      background-color: $gray-l4;
-      padding: ($baseline*2);
-      text-align: center;
-      color: $gray;
-
-      .new-button {
-        @include font-size(14);
-        margin-left: $baseline;
-
-        [class^="icon-"] {
-          margin-right: ($baseline/2);
-        }
-      }
+      color: $gray-d1;
     }
 
     .notice-incontext {
@@ -38,6 +27,7 @@
 
       .copy {
         @extend %t-copy-base;
+
         opacity: 1;
       }
     }
@@ -51,7 +41,6 @@
     top: 6px;
 
     .actions-list {
-
       .action-item {
         position: relative;
         display: inline-block;
@@ -62,6 +51,7 @@
         .action-button,
         .toggle-actions-view {
           @include transition(all $tmg-f2 ease-in-out 0s);
+
           display: inline-block;
           border: 0;
           background: none;
@@ -105,11 +95,12 @@
         }
 
         &.action-visible .toggle-checkbox ~ .action-button {
-          .icon-eye-open {
+          .fa-eye {
             display: inline-block;
+            pointer-events: none;
           }
 
-          .icon-eye-close {
+          .fa-eye-slash {
             display: none;
           }
         }
@@ -118,12 +109,13 @@
           background-color: $gray;
           color: $white;
 
-          .icon-eye-open {
+          .fa-eye {
             display: none;
           }
 
-          .icon-eye-close {
+          .fa-eye-slash {
             display: inline-block;
+            pointer-events: none;
           }
         }
       }
@@ -138,18 +130,20 @@
       display: block !important;
 
       h2 {
-        margin: 0 0 5px 0;
+        margin: 0 0 5px;
       }
     }
 
     .wrapper-component-editor {
-      z-index: 9999;
+      @extend %ui-depth4;
+
       position: relative;
       background: $lightBluishGrey2;
     }
 
     .component-editor {
       @include edit-box;
+
       box-shadow: none;
       display: none;
       padding: 0;
@@ -157,17 +151,17 @@
 
       //Overrides general edit-box mixin
       .row {
-        margin-bottom: 0px;
+        margin-bottom: 0;
       }
 
       // This duplicates the styling from Unit page editing
       .module-actions {
         box-shadow: inset 0 1px 1px $shadow;
-        padding: 0px 0 10px 10px;
+        padding: 0 0 10px 10px;
         background-color: $gray-l6;
 
         .save-button {
-        margin: ($baseline/2) 8px 0 0;
+          margin: ($baseline/2) 8px 0 0;
         }
       }
     }
@@ -208,23 +202,25 @@
       }
 
       .drag-handle {
-        background: url(../img/drag-handles.png) center no-repeat #fff;
+        background: url('#{$static-path}/images/drag-handles.png') center no-repeat #fff;
       }
     }
 
     .drag-handle {
+      @extend %ui-depth1;
+
+      @include right(0);
+
       position: absolute;
       display: block;
       top: 0;
-      right: 0;
-      z-index: 11;
       width: 35px;
       height: 100%;
       border: none;
-      background: url(../img/drag-handles.png) center no-repeat #fff;
+      background: url('#{$static-path}/images/drag-handles.png') center no-repeat #fff;
 
       &:hover {
-        background: url(../img/drag-handles.png) center no-repeat #fff;
+        background: url('#{$static-path}/images/drag-handles.png') center no-repeat #fff;
       }
 
       &.is-fixed {
@@ -236,7 +232,7 @@
 
     // uses similar styling as assets.scss, unit.scss
     .wrapper-component-action-header {
-      @include box-sizing(border-box);
+      box-sizing: border-box;
       position: absolute;
       width: 100%;
       padding: $baseline/4 $baseline/2;
@@ -251,9 +247,11 @@
     .component-actions,
     .course-nav-item-actions {
       display: inline-block;
-      float: right;
-      margin-right: ($baseline*2);
-      padding: 8px 0px;
+
+      @include float(right);
+      @include margin-right($baseline*2);
+
+      padding: 8px 0;
       vertical-align: middle;
       text-align: center;
 
@@ -263,12 +261,13 @@
 
         .action-button {
           @include transition(all $tmg-f2 ease-in-out 0s);
+
           display: block;
           padding: 0 $baseline/2;
           width: auto;
           height: ($baseline*1.5);
           border-radius: 3px;
-          color: $gray-l1;
+          color: $gray-d1;
           text-transform: uppercase;
 
           &:hover {
@@ -287,12 +286,13 @@
           }
         }
 
-        [class^="icon-"] {
+        .icon {
           display: inline-block;
           vertical-align: bottom;
         }
 
-        &.action-duplicate {
+        &.action-duplicate,
+        &.action-move {
           display: none;
         }
       }
@@ -301,18 +301,20 @@
 
   // basic course nav items - overrides from above
   .course-nav-item {
-    padding: ($baseline*.75) ($baseline/4) ($baseline*.75) $baseline;
+    padding: ($baseline*0.75) ($baseline/4) ($baseline*0.75) $baseline;
     background: $white;
 
     &.is-fixed {
       @extend %ui-disabled;
+
       @include transition(opacity $tmg-f2 ease-in-out 0s);
+
       opacity: 0.5;
     }
 
     .course-nav-item-header {
       display: inline-block;
-      width:80%;
+      width: 80%;
 
       .title {
         @extend %t-title4;
@@ -320,7 +322,8 @@
 
       .title-sub {
         @extend %t-title7;
-         color: $gray-l2;
+
+        color: $gray-l2;
       }
     }
 
@@ -345,23 +348,25 @@
 
   .xblock-student_view {
     @include transition(background-color $tmg-s3 linear 0s);
+
+    @extend %t-title4;
+
     padding: 20px 20px 22px;
-    font-size: 24px;
-    background: #fff;
+    background: $white;
   }
 
   .static-page-item {
     position: relative;
-    margin: 10px 0;
+    margin: ($baseline/2) 0;
     padding: 22px 20px;
     border: 1px solid $darkGrey;
     border-radius: 3px;
-    background: #fff;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, .1);
+    background: $white;
+    box-shadow: 0 1px 2px $shadow-l1;
 
     .page-name {
-      font-size: 19px;
-      font-weight: 700;
+      @extend %t-title5;
+      @extend %t-strong;
     }
 
     .item-actions {
@@ -373,11 +378,12 @@
 
 .edit-static-page {
   .main-wrapper {
-    margin-top: 40px;
+    margin-top: ($baseline*2);
   }
 
   .static-page-details {
     @extend %ui-window;
+
     padding: 32px 40px;
 
     .row {
@@ -386,22 +392,26 @@
   }
 
   .page-display-name-input {
+    @extend %t-copy-lead1;
+
     width: 100%;
-    font-size: 20px;
   }
 
   .page-contents {
-    @include box-sizing(border-box);
-    @include linear-gradient(top, rgba(255, 255, 255, 0), rgba(255, 255, 255, .3));
+    box-sizing: border-box;
+
+    @include linear-gradient(top, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.3));
+
+    @extend %t-copy-sub1;
+
     width: 100%;
     height: 360px;
     padding: 15px;
     border: 1px solid #b0b6c2;
     border-radius: 2px;
     background-color: #edf1f5;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, .1) inset;
+    box-shadow: 0 1px 2px $shadow-l1 inset;
     font-family: Monaco, monospace;
-    font-size: 13px;
     color: #3c3c3c;
     outline: 0;
   }

@@ -1,17 +1,26 @@
-import unittest
-import mock
+
+
 import datetime
-import uuid
+import os
 import random
+import unittest
 
-from xmodule.modulestore.inheritance import InheritanceMixin
-from opaque_keys.edx.locator import CourseLocator, BlockUsageLocator
-from xmodule.modulestore.split_mongo.split import SplitMongoModuleStore
-from xmodule.modulestore.mongo import DraftMongoModuleStore
+import mock
+import pytest
+import six
+from opaque_keys.edx.locator import BlockUsageLocator, CourseLocator
+
 from xmodule.modulestore import ModuleStoreEnum
+from xmodule.modulestore.inheritance import InheritanceMixin
+from xmodule.modulestore.mongo import DraftMongoModuleStore
+from xmodule.modulestore.split_mongo.split import SplitMongoModuleStore
+from xmodule.modulestore.tests.mongo_connection import MONGO_HOST, MONGO_PORT_NUM
+from xmodule.modulestore.tests.utils import MemoryCache
+from xmodule.x_module import XModuleMixin
 
 
-class SplitWMongoCourseBoostrapper(unittest.TestCase):
+@pytest.mark.mongo
+class SplitWMongoCourseBootstrapper(unittest.TestCase):
     """
     Helper for tests which need to construct split mongo & old mongo based courses to get interesting internal structure.
     Override _create_course and after invoking the super() _create_course, have it call _create_item for
@@ -25,57 +34,41 @@ class SplitWMongoCourseBoostrapper(unittest.TestCase):
     * split_course_key (CourseLocator): of the new course
     * old_course_key: the SlashSpecifiedCourseKey for the course
     """
-        # Snippet of what would be in the django settings envs file
+    # Snippet of what would be in the django settings envs file
     db_config = {
-        'host': 'localhost',
-        'db': 'test_xmodule',
+        'host': MONGO_HOST,
+        'port': MONGO_PORT_NUM,
+        'db': 'test_xmodule_{}'.format(os.getpid()),
+        'collection': 'modulestore'
     }
 
     modulestore_options = {
         'default_class': 'xmodule.raw_module.RawDescriptor',
         'fs_root': '',
         'render_template': mock.Mock(return_value=""),
-        'xblock_mixins': (InheritanceMixin,)
+        'xblock_mixins': (InheritanceMixin, XModuleMixin)
     }
 
     split_course_key = CourseLocator('test_org', 'test_course', 'runid', branch=ModuleStoreEnum.BranchName.draft)
 
     def setUp(self):
-        self.db_config['collection'] = 'modulestore{0}'.format(uuid.uuid4().hex[:5])
-
         self.user_id = random.getrandbits(32)
-        super(SplitWMongoCourseBoostrapper, self).setUp()
+        super(SplitWMongoCourseBootstrapper, self).setUp()
         self.split_mongo = SplitMongoModuleStore(
             None,
             self.db_config,
             **self.modulestore_options
         )
-        self.addCleanup(self.split_mongo.db.connection.close)
-        self.addCleanup(self.tear_down_split)
+        self.addCleanup(self.split_mongo._drop_database)  # pylint: disable=protected-access
         self.draft_mongo = DraftMongoModuleStore(
-            None, self.db_config, branch_setting_func=lambda: ModuleStoreEnum.Branch.draft_preferred, **self.modulestore_options
+            None, self.db_config, branch_setting_func=lambda: ModuleStoreEnum.Branch.draft_preferred,
+            metadata_inheritance_cache_subsystem=MemoryCache(),
+            **self.modulestore_options
         )
-        self.addCleanup(self.tear_down_mongo)
+        self.addCleanup(self.draft_mongo._drop_database)  # pylint: disable=protected-access
         self.old_course_key = None
         self.runtime = None
         self._create_course()
-
-    def tear_down_split(self):
-        """
-        Remove the test collections, close the db connection
-        """
-        split_db = self.split_mongo.db
-        split_db.drop_collection(split_db.course_index)
-        split_db.drop_collection(split_db.structures)
-        split_db.drop_collection(split_db.definitions)
-
-    def tear_down_mongo(self):
-        """
-        Remove the test collections, close the db connection
-        """
-        split_db = self.split_mongo.db
-        # old_mongo doesn't give a db attr, but all of the dbs are the same
-        split_db.drop_collection(self.draft_mongo.collection)
 
     def _create_item(self, category, name, data, metadata, parent_category, parent_name, draft=True, split=True):
         """
@@ -97,7 +90,7 @@ class SplitWMongoCourseBoostrapper(unittest.TestCase):
         )
         if not draft:
             self.draft_mongo.publish(location, self.user_id)
-        if isinstance(data, basestring):
+        if isinstance(data, six.string_types):
             fields = {'data': data}
         else:
             fields = data.copy()

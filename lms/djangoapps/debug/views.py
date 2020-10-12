@@ -1,16 +1,17 @@
 """Views for debugging and diagnostics"""
 
+
 import pprint
 import traceback
 
-from django.http import Http404, HttpResponse
 from django.contrib.auth.decorators import login_required
+from django.http import Http404, HttpResponse
 from django.utils.html import escape
-
-from django_future.csrf import ensure_csrf_cookie
-from edxmako.shortcuts import render_to_response
+from django.views.decorators.csrf import ensure_csrf_cookie
 
 from codejail.safe_exec import safe_exec
+from edxmako.shortcuts import render_to_response
+from openedx.core.djangolib.markup import HTML
 
 
 @login_required
@@ -27,7 +28,7 @@ def run_python(request):
         g = {}
         try:
             safe_exec(py_code, g)
-        except Exception as e:
+        except Exception:   # pylint: disable=broad-except
             c['results'] = traceback.format_exc()
         else:
             c['results'] = pprint.pformat(g)
@@ -37,9 +38,9 @@ def run_python(request):
 @login_required
 def show_parameters(request):
     """A page that shows what parameters were on the URL and post."""
-    html = []
+    html_list = []
     for name, value in sorted(request.GET.items()):
-        html.append(escape("GET {}: {!r}".format(name, value)))
+        html_list.append(escape(u"GET {}: {!r}".format(name, value)))
     for name, value in sorted(request.POST.items()):
-        html.append(escape("POST {}: {!r}".format(name, value)))
-    return HttpResponse("\n".join("<p>{}</p>".format(h) for h in html))
+        html_list.append(escape(u"POST {}: {!r}".format(name, value)))
+    return HttpResponse("\n".join(HTML("<p>{}</p>").format(h) for h in html_list))

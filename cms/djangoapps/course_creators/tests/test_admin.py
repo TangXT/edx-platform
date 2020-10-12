@@ -2,17 +2,19 @@
 Tests course_creators.admin.py.
 """
 
-from django.test import TestCase
-from django.contrib.auth.models import User
-from django.contrib.admin.sites import AdminSite
-from django.http import HttpRequest
+
 import mock
+from django.contrib.admin.sites import AdminSite
+from django.contrib.auth.models import User
+from django.core import mail
+from django.http import HttpRequest
+from django.test import TestCase
+from six.moves import range
 
 from course_creators.admin import CourseCreatorAdmin
 from course_creators.models import CourseCreator
-from django.core import mail
-from student.roles import CourseCreatorRole
 from student import auth
+from student.roles import CourseCreatorRole
 
 
 def mock_render_to_string(template_name, context):
@@ -27,6 +29,7 @@ class CourseCreatorAdminTest(TestCase):
 
     def setUp(self):
         """ Test case setup """
+        super(CourseCreatorAdminTest, self).setUp()
         self.user = User.objects.create_user('test_user', 'test_user+courses@edx.org', 'foo')
         self.table_entry = CourseCreator(user=self.user)
         self.table_entry.save()
@@ -55,7 +58,7 @@ class CourseCreatorAdminTest(TestCase):
         def change_state_and_verify_email(state, is_creator):
             """ Changes user state, verifies creator status, and verifies e-mail is sent based on transition """
             self._change_state(state)
-            self.assertEqual(is_creator, auth.has_access(self.user, CourseCreatorRole()))
+            self.assertEqual(is_creator, auth.user_has_role(self.user, CourseCreatorRole()))
 
             context = {'studio_request_email': self.studio_request_email}
             if state == CourseCreator.GRANTED:
@@ -73,7 +76,7 @@ class CourseCreatorAdminTest(TestCase):
         with mock.patch.dict('django.conf.settings.FEATURES', self.enable_creator_group_patch):
 
             # User is initially unrequested.
-            self.assertFalse(auth.has_access(self.user, CourseCreatorRole()))
+            self.assertFalse(auth.user_has_role(self.user, CourseCreatorRole()))
 
             change_state_and_verify_email(CourseCreator.GRANTED, True)
 
@@ -104,21 +107,22 @@ class CourseCreatorAdminTest(TestCase):
             # message sent. Admin message will follow.
             base_num_emails = 1 if expect_sent_to_user else 0
             if expect_sent_to_admin:
-                context = {'user_name': "test_user", 'user_email': 'test_user+courses@edx.org'}
-                self.assertEquals(base_num_emails + 1, len(mail.outbox), 'Expected admin message to be sent')
+                context = {'user_name': u'test_user', 'user_email': u'test_user+courses@edx.org'}
+
+                self.assertEqual(base_num_emails + 1, len(mail.outbox), 'Expected admin message to be sent')
                 sent_mail = mail.outbox[base_num_emails]
-                self.assertEquals(
+                self.assertEqual(
                     mock_render_to_string('emails/course_creator_admin_subject.txt', context),
                     sent_mail.subject
                 )
-                self.assertEquals(
+                self.assertEqual(
                     mock_render_to_string('emails/course_creator_admin_user_pending.txt', context),
                     sent_mail.body
                 )
-                self.assertEquals(self.studio_request_email, sent_mail.from_email)
+                self.assertEqual(self.studio_request_email, sent_mail.from_email)
                 self.assertEqual([self.studio_request_email], sent_mail.to)
             else:
-                self.assertEquals(base_num_emails, len(mail.outbox))
+                self.assertEqual(base_num_emails, len(mail.outbox))
 
         with mock.patch.dict('django.conf.settings.FEATURES', self.enable_creator_group_patch):
             # E-mail message should be sent to admin only when new state is PENDING, regardless of what
@@ -164,12 +168,12 @@ class CourseCreatorAdminTest(TestCase):
             post_params = {'username': self.user.username, 'password': 'wrong_password'}
             # try logging in 30 times, the default limit in the number of failed
             # login attempts in one 5 minute period before the rate gets limited
-            for _ in xrange(30):
-                response = self.client.post('/admin/', post_params)
-                self.assertEquals(response.status_code, 200)
+            for _ in range(30):
+                response = self.client.post('/admin/login/', post_params)
+                self.assertEqual(response.status_code, 200)
 
-            response = self.client.post('/admin/', post_params)
+            response = self.client.post('/admin/login/', post_params)
             # Since we are using the default rate limit behavior, we are
             # expecting this to return a 403 error to indicate that there have
             # been too many attempts
-            self.assertEquals(response.status_code, 403)
+            self.assertEqual(response.status_code, 403)

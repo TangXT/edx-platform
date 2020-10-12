@@ -2,13 +2,15 @@
 Unit tests for stub XQueue implementation.
 """
 
-import mock
-import unittest
+
+import ast
 import json
+import unittest
+
+import mock
 import requests
-import time
-import copy
-from ..xqueue import StubXQueueService, StubXQueueHandler
+
+from ..xqueue import StubXQueueService
 
 
 class FakeTimer(object):
@@ -25,6 +27,7 @@ class FakeTimer(object):
 class StubXQueueServiceTest(unittest.TestCase):
 
     def setUp(self):
+        super(StubXQueueServiceTest, self).setUp()
         self.server = StubXQueueService()
         self.url = "http://127.0.0.1:{0}/xqueue/submit".format(self.server.port)
         self.addCleanup(self.server.shutdown)
@@ -116,19 +119,6 @@ class StubXQueueServiceTest(unittest.TestCase):
             self.assertFalse(self.post.called)
             self.assertTrue(logger.error.called)
 
-    def test_register_submission_url(self):
-        # Configure the XQueue stub to notify another service
-        # when it receives a submission.
-        register_url = 'http://127.0.0.1:8000/register_submission'
-        self.server.config['register_submission_url'] = register_url
-
-        callback_url = 'http://127.0.0.1:8000/test_callback'
-        submission = json.dumps({'grader_payload': 'test payload'})
-        self._post_submission(callback_url, 'test_queuekey', 'test_queue', submission)
-
-        # Check that a notification was sent
-        self.post.assert_any_call(register_url, data={'grader_payload': u'test payload'})
-
     def _post_submission(self, callback_url, lms_key, queue_name, xqueue_body):
         """
         Post a submission to the stub XQueue implementation.
@@ -176,6 +166,10 @@ class StubXQueueServiceTest(unittest.TestCase):
             'xqueue_header': expected_header,
             'xqueue_body': expected_body,
         }
-
         # Check that the POST request was made with the correct params
-        self.post.assert_called_with(callback_url, data=expected_callback_dict)
+        self.assertEqual(self.post.call_args[1]['data']['xqueue_body'], expected_callback_dict['xqueue_body'])
+        self.assertEqual(
+            ast.literal_eval(self.post.call_args[1]['data']['xqueue_header']),
+            ast.literal_eval(expected_callback_dict['xqueue_header'])
+        )
+        self.assertEqual(self.post.call_args[0][0], callback_url)

@@ -1,45 +1,82 @@
 """Implements basics of Capa, including class CapaModule."""
-import cgi
+
+
 import copy
 import datetime
 import hashlib
 import json
 import logging
 import os
-import traceback
+import re
 import struct
 import sys
+import traceback
 
-# We don't want to force a dependency on datadog, so make the import conditional
-try:
-    from dogapi import dog_stats_api
-except ImportError:
-    # pylint: disable=invalid-name
-    dog_stats_api = None
-
-from pkg_resources import resource_string
+import six
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
+from django.utils.encoding import smart_text
+from django.utils.functional import cached_property
+from pytz import utc
+from six import text_type
+from xblock.fields import Boolean, Dict, Float, Integer, Scope, String, XMLString
+from xblock.scorable import ScorableXBlockMixin, Score
 
 from capa.capa_problem import LoncapaProblem, LoncapaSystem
-from capa.responsetypes import StudentInputError, \
-    ResponseError, LoncapaProblemError
-from capa.util import convert_files_to_filenames
+from capa.inputtypes import Status
+from capa.responsetypes import LoncapaProblemError, ResponseError, StudentInputError
+from capa.util import convert_files_to_filenames, get_inner_html_from_xpath
+from openedx.core.djangolib.markup import HTML, Text
+from xmodule.exceptions import NotFoundError
+from xmodule.graders import ShowCorrectness
+
+from .fields import Date, ScoreField, Timedelta
 from .progress import Progress
-from xmodule.exceptions import NotFoundError, ProcessingError
-from xblock.fields import Scope, String, Boolean, Dict, Integer, Float
-from .fields import Timedelta, Date
-from django.utils.timezone import UTC
-from .util.duedate import get_extended_due_date
 
 log = logging.getLogger("edx.courseware")
 
-# Make '_' a no-op so we can scrape strings
+# Make '_' a no-op so we can scrape strings. Using lambda instead of
+#  `django.utils.translation.ugettext_noop` because Django cannot be imported in this file
 _ = lambda text: text
-
 
 # Generate this many different variants of problems with rerandomize=per_student
 NUM_RANDOMIZATION_BINS = 20
 # Never produce more than this many different seeds, no matter what.
 MAX_RANDOMIZATION_BINS = 1000
+
+
+try:
+    FEATURES = getattr(settings, 'FEATURES', {})
+except ImproperlyConfigured:
+    FEATURES = {}
+
+
+class SHOWANSWER(object):
+    """
+    Constants for when to show answer
+    """
+    ALWAYS = "always"
+    ANSWERED = "answered"
+    ATTEMPTED = "attempted"
+    CLOSED = "closed"
+    FINISHED = "finished"
+    CORRECT_OR_PAST_DUE = "correct_or_past_due"
+    PAST_DUE = "past_due"
+    NEVER = "never"
+    AFTER_SOME_NUMBER_OF_ATTEMPTS = "after_attempts"
+    AFTER_ALL_ATTEMPTS = "after_all_attempts"
+    AFTER_ALL_ATTEMPTS_OR_CORRECT = "after_all_attempts_or_correct"
+    ATTEMPTED_NO_PAST_DUE = "attempted_no_past_due"
+
+
+class RANDOMIZATION(object):
+    """
+    Constants for problem randomization
+    """
+    ALWAYS = "always"
+    ONRESET = "onreset"
+    NEVER = "never"
+    PER_STUDENT = "per_student"
 
 
 def randomization_bin(seed, problem_id):
@@ -51,8 +88,8 @@ def randomization_bin(seed, problem_id):
     we'll combine the system's per-student seed with the problem id in picking the bin.
     """
     r_hash = hashlib.sha1()
-    r_hash.update(str(seed))
-    r_hash.update(str(problem_id))
+    r_hash.update(six.b(str(seed)))
+    r_hash.update(six.b(str(problem_id)))
     # get the first few digits of the hash, convert to an int, then mod.
     return int(r_hash.hexdigest()[:7], 16) % NUM_RANDOMIZATION_BINS
 
@@ -63,9 +100,9 @@ class Randomization(String):
     """
     def from_json(self, value):
         if value in ("", "true"):
-            return "always"
+            return RANDOMIZATION.ALWAYS
         elif value == "false":
-            return "per_student"
+            return RANDOMIZATION.PER_STUDENT
         return value
 
     to_json = from_json
@@ -75,7 +112,7 @@ class ComplexEncoder(json.JSONEncoder):
     """
     Extend the JSON encoder to correctly handle complex numbers
     """
-    def default(self, obj):
+    def default(self, obj):  # pylint: disable=method-hidden
         """
         Print a nicely formatted complex number, or default to the JSON encoder
         """
@@ -90,76 +127,113 @@ class CapaFields(object):
     """
     display_name = String(
         display_name=_("Display Name"),
-        help=_("This name appears in the horizontal navigation at the top of the page."),
+        help=_("The display name for this component."),
         scope=Scope.settings,
         # it'd be nice to have a useful default but it screws up other things; so,
         # use display_name_with_default for those
-        default="Blank Advanced Problem"
+        default=_("Blank Advanced Problem")
     )
     attempts = Integer(
         help=_("Number of attempts taken by the student on this problem"),
         default=0,
-        scope=Scope.user_state)
+        scope=Scope.user_state
+    )
     max_attempts = Integer(
         display_name=_("Maximum Attempts"),
         help=_("Defines the number of times a student can try to answer this problem. "
-              "If the value is not set, infinite attempts are allowed."),
+               "If the value is not set, infinite attempts are allowed."),
         values={"min": 0}, scope=Scope.settings
     )
     due = Date(help=_("Date that this problem is due by"), scope=Scope.settings)
-    extended_due = Date(
-        help=_("Date that this problem is due by for a particular student. This "
-             "can be set by an instructor, and will override the global due "
-             "date if it is set to a date that is later than the global due "
-             "date."),
-        default=None,
-        scope=Scope.user_state,
-    )
     graceperiod = Timedelta(
         help=_("Amount of time after the due date that submissions will be accepted"),
         scope=Scope.settings
     )
+    show_correctness = String(
+        display_name=_("Show Results"),
+        help=_("Defines when to show whether a learner's answer to the problem is correct. "
+               "Configured on the subsection."),
+        scope=Scope.settings,
+        default=ShowCorrectness.ALWAYS,
+        values=[
+            {"display_name": _("Always"), "value": ShowCorrectness.ALWAYS},
+            {"display_name": _("Never"), "value": ShowCorrectness.NEVER},
+            {"display_name": _("Past Due"), "value": ShowCorrectness.PAST_DUE},
+        ],
+    )
     showanswer = String(
         display_name=_("Show Answer"),
         help=_("Defines when to show the answer to the problem. "
-              "A default value can be set in Advanced Settings."),
+               "A default value can be set in Advanced Settings."),
         scope=Scope.settings,
-        default="finished",
+        default=SHOWANSWER.FINISHED,
         values=[
-            {"display_name": _("Always"), "value": "always"},
-            {"display_name": _("Answered"), "value": "answered"},
-            {"display_name": _("Attempted"), "value": "attempted"},
-            {"display_name": _("Closed"), "value": "closed"},
-            {"display_name": _("Finished"), "value": "finished"},
-            {"display_name": _("Correct or Past Due"), "value": "correct_or_past_due"},
-            {"display_name": _("Past Due"), "value": "past_due"},
-            {"display_name": _("Never"), "value": "never"}]
+            {"display_name": _("Always"), "value": SHOWANSWER.ALWAYS},
+            {"display_name": _("Answered"), "value": SHOWANSWER.ANSWERED},
+            {"display_name": _("Attempted or Past Due"), "value": SHOWANSWER.ATTEMPTED},
+            {"display_name": _("Closed"), "value": SHOWANSWER.CLOSED},
+            {"display_name": _("Finished"), "value": SHOWANSWER.FINISHED},
+            {"display_name": _("Correct or Past Due"), "value": SHOWANSWER.CORRECT_OR_PAST_DUE},
+            {"display_name": _("Past Due"), "value": SHOWANSWER.PAST_DUE},
+            {"display_name": _("Never"), "value": SHOWANSWER.NEVER},
+            {"display_name": _("After Some Number of Attempts"), "value": SHOWANSWER.AFTER_SOME_NUMBER_OF_ATTEMPTS},
+            {"display_name": _("After All Attempts"), "value": SHOWANSWER.AFTER_ALL_ATTEMPTS},
+            {"display_name": _("After All Attempts or Correct"), "value": SHOWANSWER.AFTER_ALL_ATTEMPTS_OR_CORRECT},
+            {"display_name": _("Attempted"), "value": SHOWANSWER.ATTEMPTED_NO_PAST_DUE},
+        ]
+    )
+    attempts_before_showanswer_button = Integer(
+        display_name=_("Show Answer: Number of Attempts"),
+        help=_(
+            "Number of times the student must attempt to answer the question before the Show Answer button appears."
+        ),
+        values={"min": 0},
+        default=0,
+        scope=Scope.settings,
     )
     force_save_button = Boolean(
         help=_("Whether to force the save button to appear on the page"),
         scope=Scope.settings,
         default=False
     )
+    show_reset_button = Boolean(
+        display_name=_("Show Reset Button"),
+        help=_("Determines whether a 'Reset' button is shown so the user may reset their answer. "
+               "A default value can be set in Advanced Settings."),
+        scope=Scope.settings,
+        default=False
+    )
     rerandomize = Randomization(
         display_name=_("Randomization"),
-        help=_("Defines how often inputs are randomized when a student loads the problem. "
-             "This setting only applies to problems that can have randomly generated numeric values. "
-             "A default value can be set in Advanced Settings."),
-        default="never",
+        help=_(
+            'Defines when to randomize the variables specified in the associated Python script. '
+            'For problems that do not randomize values, specify \"Never\". '
+        ),
+        default=RANDOMIZATION.NEVER,
         scope=Scope.settings,
         values=[
-            {"display_name": _("Always"), "value": "always"},
-            {"display_name": _("On Reset"), "value": "onreset"},
-            {"display_name": _("Never"), "value": "never"},
-            {"display_name": _("Per Student"), "value": "per_student"}
+            {"display_name": _("Always"), "value": RANDOMIZATION.ALWAYS},
+            {"display_name": _("On Reset"), "value": RANDOMIZATION.ONRESET},
+            {"display_name": _("Never"), "value": RANDOMIZATION.NEVER},
+            {"display_name": _("Per Student"), "value": RANDOMIZATION.PER_STUDENT}
         ]
     )
-    data = String(help=_("XML data for the problem"), scope=Scope.content, default="<problem></problem>")
+    data = XMLString(
+        help=_("XML data for the problem"),
+        scope=Scope.content,
+        enforce_type=FEATURES.get('ENABLE_XBLOCK_XML_VALIDATION', True),
+        default="<problem></problem>"
+    )
     correct_map = Dict(help=_("Dictionary with the correctness of current student answers"),
                        scope=Scope.user_state, default={})
     input_state = Dict(help=_("Dictionary for maintaining the state of inputtypes"), scope=Scope.user_state)
     student_answers = Dict(help=_("Dictionary with the current student responses"), scope=Scope.user_state)
-    done = Boolean(help=_("Whether the student has answered the problem"), scope=Scope.user_state)
+
+    # enforce_type is set to False here because this field is saved as a dict in the database.
+    score = ScoreField(help=_("Dictionary with the current student score"), scope=Scope.user_state, enforce_type=False)
+    has_saved_answers = Boolean(help=_("Whether or not the answers have been saved since last submit"),
+                                scope=Scope.user_state, default=False)
+    done = Boolean(help=_("Whether the student has answered the problem"), scope=Scope.user_state, default=False)
     seed = Integer(help=_("Random seed for this student"), scope=Scope.user_state)
     last_submission_time = Date(help=_("Last submission time"), scope=Scope.user_state)
     submission_wait_seconds = Integer(
@@ -170,7 +244,7 @@ class CapaFields(object):
     weight = Float(
         display_name=_("Problem Weight"),
         help=_("Defines the number of points each problem is worth. "
-              "If the value is not set, each response field in the problem is worth one point."),
+               "If the value is not set, each response field in the problem is worth one point."),
         values={"min": 0, "step": .1},
         scope=Scope.settings
     )
@@ -179,106 +253,70 @@ class CapaFields(object):
         help=_("Source code for LaTeX and Word problems. This feature is not well-supported."),
         scope=Scope.settings
     )
-    text_customization = Dict(
-        help=_("String customization substitutions for particular locations"),
-        scope=Scope.settings
-        # TODO: someday it should be possible to not duplicate this definition here
-        # and in inheritance.py
-    )
     use_latex_compiler = Boolean(
         help=_("Enable LaTeX templates?"),
         default=False,
         scope=Scope.settings
     )
     matlab_api_key = String(
-        display_name="Matlab API key",
-        help="Enter the API key provided by MathWorks for accessing the MATLAB Hosted Service. "
-             "This key is granted for exclusive use by this course for the specified duration. "
-             "Please do not share the API key with other courses and notify MathWorks immediately "
-             "if you believe the key is exposed or compromised. To obtain a key for your course, "
-             "or to report and issue, please contact moocsupport@mathworks.com",
+        display_name=_("Matlab API key"),
+        help=_("Enter the API key provided by MathWorks for accessing the MATLAB Hosted Service. "
+               "This key is granted for exclusive use by this course for the specified duration. "
+               "Please do not share the API key with other courses and notify MathWorks immediately "
+               "if you believe the key is exposed or compromised. To obtain a key for your course, "
+               "or to report an issue, please contact moocsupport@mathworks.com"),
         scope=Scope.settings
     )
 
 
-class CapaMixin(CapaFields):
+class CapaMixin(ScorableXBlockMixin, CapaFields):
     """
         Core logic for Capa Problem, which can be used by XModules or XBlocks.
     """
-
-    def __init__(self, *args, **kwargs):
-        super(CapaMixin, self).__init__(*args, **kwargs)
-
-        due_date = get_extended_due_date(self)
+    @property
+    def close_date(self):
+        """
+        Return the date submissions should be closed from.
+        """
+        due_date = self.due
 
         if self.graceperiod is not None and due_date:
-            self.close_date = due_date + self.graceperiod
+            return due_date + self.graceperiod
         else:
-            self.close_date = due_date
+            return due_date
 
+    def get_seed(self):
+        """
+        Generate the seed if not set and return it.
+        """
         if self.seed is None:
             self.choose_new_seed()
+        return self.seed
 
-        # Need the problem location in openendedresponse to send out.  Adding
-        # it to the system here seems like the least clunky way to get it
-        # there.
-        self.runtime.set('location', self.location.to_deprecated_string())
-
+    @cached_property
+    def lcp(self):
         try:
-            # TODO (vshnayder): move as much as possible of this work and error
-            # checking to descriptor load time
-            self.lcp = self.new_lcp(self.get_state_for_lcp())
-
-            # At this point, we need to persist the randomization seed
-            # so that when the problem is re-loaded (to check/view/save)
-            # it stays the same.
-            # However, we do not want to write to the database
-            # every time the module is loaded.
-            # So we set the seed ONLY when there is not one set already
-            if self.seed is None:
-                self.seed = self.lcp.seed
-
+            lcp = self.new_lcp(self.get_state_for_lcp())
         except Exception as err:  # pylint: disable=broad-except
             msg = u'cannot create LoncapaProblem {loc}: {err}'.format(
-                loc=self.location.to_deprecated_string(), err=err)
-            # TODO (vshnayder): do modules need error handlers too?
-            # We shouldn't be switching on DEBUG.
-            if self.runtime.DEBUG:
-                log.warning(msg)
-                # TODO (vshnayder): This logic should be general, not here--and may
-                # want to preserve the data instead of replacing it.
-                # e.g. in the CMS
-                msg = u'<p>{msg}</p>'.format(msg=cgi.escape(msg))
-                msg += u'<p><pre>{tb}</pre></p>'.format(
-                    # just the traceback, no message - it is already present above
-                    tb=cgi.escape(
-                        u''.join(['Traceback (most recent call last):\n'] +
-                        traceback.format_tb(sys.exc_info()[2])))
-                    )
-                # create a dummy problem with error message instead of failing
-                problem_text = (u'<problem><text><span class="inline-error">'
-                                u'Problem {url} has an error:</span>{msg}</text></problem>'.format(
-                                    url=self.location.to_deprecated_string(),
-                                    msg=msg)
-                                )
-                self.lcp = self.new_lcp(self.get_state_for_lcp(), text=problem_text)
-            else:
-                # add extra info and raise
-                raise Exception(msg), None, sys.exc_info()[2]
+                loc=text_type(self.location), err=err)
+            six.reraise(Exception, Exception(msg), sys.exc_info()[2])
 
-            self.set_state_from_lcp()
+        if self.score is None:
+            self.set_score(self.score_from_lcp(lcp))
 
         assert self.seed is not None
+        return lcp
 
     def choose_new_seed(self):
         """
         Choose a new seed.
         """
-        if self.rerandomize == 'never':
+        if self.rerandomize == RANDOMIZATION.NEVER:
             self.seed = 1
-        elif self.rerandomize == "per_student" and hasattr(self.runtime, 'seed'):
+        elif self.rerandomize == RANDOMIZATION.PER_STUDENT and hasattr(self.runtime, 'seed'):
             # see comment on randomization_bin
-            self.seed = randomization_bin(self.runtime.seed, unicode(self.location).encode('utf-8'))
+            self.seed = randomization_bin(self.runtime.seed, six.text_type(self.location).encode('utf-8'))
         else:
             self.seed = struct.unpack('i', os.urandom(4))[0]
 
@@ -294,10 +332,11 @@ class CapaMixin(CapaFields):
             text = self.data
 
         capa_system = LoncapaSystem(
-            ajax_url=self.runtime.ajax_url,
+            ajax_url=self.ajax_url,
             anonymous_student_id=self.runtime.anonymous_student_id,
             cache=self.runtime.cache,
             can_execute_unsafe_code=self.runtime.can_execute_unsafe_code,
+            get_python_lib_zip=self.runtime.get_python_lib_zip,
             DEBUG=self.runtime.DEBUG,
             filestore=self.runtime.filestore,
             i18n=self.runtime.service(self, "i18n"),
@@ -313,8 +352,9 @@ class CapaMixin(CapaFields):
             problem_text=text,
             id=self.location.html_id(),
             state=state,
-            seed=self.seed,
+            seed=self.get_seed(),
             capa_system=capa_system,
+            capa_module=self,  # njp
         )
 
     def get_state_for_lcp(self):
@@ -325,8 +365,9 @@ class CapaMixin(CapaFields):
             'done': self.done,
             'correct_map': self.correct_map,
             'student_answers': self.student_answers,
+            'has_saved_answers': self.has_saved_answers,
             'input_state': self.input_state,
-            'seed': self.seed,
+            'seed': self.get_seed(),
         }
 
     def set_state_from_lcp(self):
@@ -338,118 +379,117 @@ class CapaMixin(CapaFields):
         self.correct_map = lcp_state['correct_map']
         self.input_state = lcp_state['input_state']
         self.student_answers = lcp_state['student_answers']
-        self.seed = lcp_state['seed']
+        self.has_saved_answers = lcp_state['has_saved_answers']
 
     def set_last_submission_time(self):
         """
-        Set the module's last submission time (when the problem was checked)
+        Set the module's last submission time (when the problem was submitted)
         """
-        self.last_submission_time = datetime.datetime.now(UTC())
-
-    def get_score(self):
-        """
-        Access the problem's score
-        """
-        return self.lcp.get_score()
-
-    def max_score(self):
-        """
-        Access the problem's max score
-        """
-        return self.lcp.get_max_score()
+        self.last_submission_time = datetime.datetime.now(utc)
 
     def get_progress(self):
         """
-        For now, just return score / max_score
+        For now, just return weighted earned / weighted possible
         """
-        score_dict = self.get_score()
-        score = score_dict['score']
-        total = score_dict['total']
+        if self.score:
+            raw_earned = self.score.raw_earned
+            raw_possible = self.score.raw_possible
+        else:
+            raw_earned = raw_possible = 0
 
-        if total > 0:
+        if raw_possible > 0:
             if self.weight is not None:
                 # Progress objects expect total > 0
                 if self.weight == 0:
                     return None
 
                 # scale score and total by weight/total:
-                score = score * self.weight / total
-                total = self.weight
-
+                weighted_earned = raw_earned * self.weight / raw_possible
+                weighted_possible = self.weight
+            else:
+                weighted_earned = raw_earned
+                weighted_possible = raw_possible
             try:
-                return Progress(score, total)
+                return Progress(weighted_earned, weighted_possible)
             except (TypeError, ValueError):
                 log.exception("Got bad progress")
                 return None
         return None
 
+    def get_display_progress(self):
+        """
+        Return (score, total) to be displayed to the learner.
+        """
+        progress = self.get_progress()
+        score, total = (progress.frac() if progress else (0, 0))
+
+        # Withhold the score if hiding correctness
+        if not self.correctness_available():
+            score = None
+
+        return score, total
+
     def get_html(self):
         """
         Return some html with data about the module
         """
-        progress = self.get_progress()
+        curr_score, total_possible = self.get_display_progress()
+
         return self.runtime.render_template('problem_ajax.html', {
             'element_id': self.location.html_id(),
-            'id': self.location.to_deprecated_string(),
-            'ajax_url': self.runtime.ajax_url,
-            'progress_status': Progress.to_js_status_str(progress),
-            'progress_detail': Progress.to_js_detail_str(progress),
+            'id': text_type(self.location),
+            'ajax_url': self.ajax_url,
+            'current_score': curr_score,
+            'total_possible': total_possible,
+            'attempts_used': self.attempts,
+            'content': self.get_problem_html(encapsulate=False),
+            'graded': self.graded,
         })
 
-    def check_button_name(self):
-        """
-        Determine the name for the "check" button.
+    def handle_fatal_lcp_error(self, error):
+        log.exception(u"LcpFatalError Encountered for {block}".format(block=str(self.location)))
+        if error:
+            return(
+                HTML(u'<p>Error formatting HTML for problem:</p><p><pre style="color:red">{msg}</pre></p>').format(
+                    msg=text_type(error))
+            )
+        else:
+            return HTML(
+                u'<p>Could not format HTML for problem. '
+                u'Contact course staff in the discussion forum for assistance.</p>'
+            )
 
-        Usually it is just "Check", but if this is the student's
-        final attempt, change the name to "Final Check".
-        The text can be customized by the text_customization setting.
+    def submit_button_name(self):
+        """
+        Determine the name for the "submit" button.
         """
         # The logic flow is a little odd so that _('xxx') strings can be found for
         # translation while also running _() just once for each string.
         _ = self.runtime.service(self, "i18n").ugettext
-        check = _('Check')
-        final_check = _('Final Check')
+        submit = _('Submit')
 
-        # Apply customizations if present
-        if 'custom_check' in self.text_customization:
-            check = _(self.text_customization.get('custom_check'))
-        if 'custom_final_check' in self.text_customization:
-            final_check = _(self.text_customization.get('custom_final_check'))
-        # TODO: need a way to get the customized words into the list of
-        # words to be translated
+        return submit
 
-        if self.max_attempts is not None and self.attempts >= self.max_attempts - 1:
-            return final_check
-        else:
-            return check
-
-    def check_button_checking_name(self):
+    def submit_button_submitting_name(self):
         """
-        Return the "checking..." text for the "check" button.
+        Return the "Submitting" text for the "submit" button.
 
-        After the user presses the "check" button, the button will briefly
+        After the user presses the "submit" button, the button will briefly
         display the value returned by this function until a response is
         received by the server.
-
-        The text can be customized by the text_customization setting.
-
         """
-        # Apply customizations if present
-        if 'custom_checking' in self.text_customization:
-            return self.text_customization.get('custom_checking')
-
         _ = self.runtime.service(self, "i18n").ugettext
-        return _('Checking...')
+        return _('Submitting')
 
-    def should_show_check_button(self):
+    def should_enable_submit_button(self):
         """
-        Return True/False to indicate whether to show the "Check" button.
+        Return True/False to indicate whether to enable the "Submit" button.
         """
-        submitted_without_reset = (self.is_submitted() and self.rerandomize == "always")
+        submitted_without_reset = (self.is_submitted() and self.rerandomize == RANDOMIZATION.ALWAYS)
 
         # If the problem is closed (past due / too many attempts)
-        # then we do NOT show the "check" button
-        # Also, do not show the "check" button if we're waiting
+        # then we disable the "submit" button
+        # Also, disable the "submit" button if we're waiting
         # for the user to reset a randomized problem
         if self.closed() or submitted_without_reset:
             return False
@@ -462,19 +502,20 @@ class CapaMixin(CapaFields):
         """
         is_survey_question = (self.max_attempts == 0)
 
-        if self.rerandomize in ["always", "onreset"]:
+        # If the problem is closed (and not a survey question with max_attempts==0),
+        # then do NOT show the reset button.
+        if self.closed() and not is_survey_question:
+            return False
 
-            # If the problem is closed (and not a survey question with max_attempts==0),
-            # then do NOT show the reset button.
-            # If the problem hasn't been submitted yet, then do NOT show
-            # the reset button.
-            if (self.closed() and not is_survey_question) or not self.is_submitted():
+        # Button only shows up for randomized problems if the question has been submitted
+        if self.rerandomize in [RANDOMIZATION.ALWAYS, RANDOMIZATION.ONRESET] and self.is_submitted():
+            return True
+        else:
+            # Do NOT show the button if the problem is correct
+            if self.is_correct():
                 return False
             else:
-                return True
-        # Only randomized problems need a "reset" button
-        else:
-            return False
+                return self.show_reset_button
 
     def should_show_save_button(self):
         """
@@ -488,7 +529,7 @@ class CapaMixin(CapaFields):
             return not self.closed()
         else:
             is_survey_question = (self.max_attempts == 0)
-            needs_reset = self.is_submitted() and self.rerandomize == "always"
+            needs_reset = self.is_submitted() and self.rerandomize == RANDOMIZATION.ALWAYS
 
             # If the student has unlimited attempts, and their answers
             # are not randomized, then we do not need a save button
@@ -502,7 +543,7 @@ class CapaMixin(CapaFields):
             # In those cases. the if statement below is false,
             # and the save button can still be displayed.
             #
-            if self.max_attempts is None and self.rerandomize != "always":
+            if self.max_attempts is None and self.rerandomize != RANDOMIZATION.ALWAYS:
                 return False
 
             # If the problem is closed (and not a survey question with max_attempts==0),
@@ -523,17 +564,25 @@ class CapaMixin(CapaFields):
 
         `err` is the Exception encountered while rendering the problem HTML.
         """
-        log.exception(err.message)
+        problem_display_name = self.display_name_with_default
+        problem_location = text_type(self.location)
+        log.exception(
+            u"ProblemGetHtmlError: %r, %r, %s",
+            problem_display_name,
+            problem_location,
+            text_type(err)
+        )
 
         # TODO (vshnayder): another switch on DEBUG.
         if self.runtime.DEBUG:
-            msg = (
-                u'[courseware.capa.capa_module] <font size="+1" color="red">'
-                u'Failed to generate HTML for problem {url}</font>'.format(
-                    url=cgi.escape(self.location.to_deprecated_string()))
+            msg = HTML(
+                u'[courseware.capa.capa_module] '
+                u'Failed to generate HTML for problem {url}'
+            ).format(
+                url=text_type(self.location)
             )
-            msg += u'<p>Error:</p><p><pre>{msg}</pre></p>'.format(msg=cgi.escape(err.message))
-            msg += u'<p><pre>{tb}</pre></p>'.format(tb=cgi.escape(traceback.format_exc()))
+            msg += HTML(u'<p>Error:</p><p><pre>{msg}</pre></p>').format(msg=text_type(err))
+            msg += HTML(u'<p><pre>{tb}</pre></p>').format(tb=traceback.format_exc())
             html = msg
 
         else:
@@ -542,8 +591,9 @@ class CapaMixin(CapaFields):
 
             # Presumably, student submission has corrupted LoncapaProblem HTML.
             #   First, pull down all student answers
+
             student_answers = self.lcp.student_answers
-            answer_ids = student_answers.keys()
+            answer_ids = list(student_answers.keys())
 
             # Some inputtypes, such as dynamath, have additional "hidden" state that
             #   is not exposed to the student. Keep those hidden
@@ -557,40 +607,121 @@ class CapaMixin(CapaFields):
             # Next, generate a fresh LoncapaProblem
             self.lcp = self.new_lcp(None)
             self.set_state_from_lcp()
-
+            self.set_score(self.score_from_lcp(self.lcp))
             # Prepend a scary warning to the student
             _ = self.runtime.service(self, "i18n").ugettext
-            warning_msg = _("Warning: The problem has been reset to its initial state!")
-            warning = '<div class="capa_reset"> <h2> ' + warning_msg + '</h2>'
+            warning_msg = Text(_("Warning: The problem has been reset to its initial state!"))
+            warning = HTML('<div class="capa_reset"> <h2>{}</h2>').format(warning_msg)
 
             # Translators: Following this message, there will be a bulleted list of items.
             warning_msg = _("The problem's state was corrupted by an invalid submission. The submission consisted of:")
-            warning += warning_msg + '<ul>'
+            warning += HTML('{}<ul>').format(warning_msg)
 
             for student_answer in student_answers.values():
                 if student_answer != '':
-                    warning += '<li>' + cgi.escape(student_answer) + '</li>'
+                    warning += HTML('<li>{}</li>').format(student_answer)
 
             warning_msg = _('If this error persists, please contact the course staff.')
-            warning += '</ul>' + warning_msg + '</div>'
+            warning += HTML('</ul>{}</div>').format(warning_msg)
 
             html = warning
             try:
                 html += self.lcp.get_html()
-            except Exception:  # pylint: disable=broad-except
+            except Exception as error:
                 # Couldn't do it. Give up.
-                log.exception("Unable to generate html from LoncapaProblem")
+                log.exception(
+                    u"ProblemGetHtmlError: Unable to generate html from LoncapaProblem: %r, %r, %s",
+                    problem_display_name,
+                    problem_location,
+                    text_type(error)
+                )
                 raise
 
         return html
 
-    def get_problem_html(self, encapsulate=True):
+    def _should_enable_demand_hint(self, demand_hints, hint_index=None):
+        """
+        Should the demand hint option be enabled?
+
+        Arguments:
+            hint_index (int): The current hint index, or None (default value) if no hint is currently being shown.
+            demand_hints (list): List of hints.
+        Returns:
+            bool: True is the demand hint is possible.
+            bool: True is demand hint should be enabled.
+        """
+        # hint_index is the index of the last hint that will be displayed in this rendering,
+        # so add 1 to check if others exist.
+        if hint_index is None:
+            should_enable = len(demand_hints) > 0
+        else:
+            should_enable = len(demand_hints) > 0 and hint_index + 1 < len(demand_hints)
+        return len(demand_hints) > 0, should_enable
+
+    def get_demand_hint(self, hint_index):
+        """
+        Return html for the problem, including demand hints.
+
+        hint_index (int): (None is the default) if not None, this is the index of the next demand
+            hint to show.
+        """
+        demand_hints = self.lcp.tree.xpath("//problem/demandhint/hint")
+        hint_index = hint_index % len(demand_hints)
+
+        _ = self.runtime.service(self, "i18n").ugettext
+
+        counter = 0
+        total_text = ''
+        while counter <= hint_index:
+            # Translators: {previous_hints} is the HTML of hints that have already been generated, {hint_number_prefix}
+            # is a header for this hint, and {hint_text} is the text of the hint itself.
+            # This string is being passed to translation only for possible reordering of the placeholders.
+            total_text = HTML(_('{previous_hints}{list_start_tag}{strong_text}{hint_text}</li>')).format(
+                previous_hints=HTML(total_text),
+                list_start_tag=HTML('<li class="hint-index-{counter}" tabindex="-1">').format(counter=counter),
+                strong_text=HTML('<strong>{hint_number_prefix}</strong>').format(
+                    # Translators: e.g. "Hint 1 of 3: " meaning we are showing the first of three hints.
+                    # This text is shown in bold before the accompanying hint text.
+                    hint_number_prefix=Text(_("Hint ({hint_num} of {hints_count}): ")).format(
+                        hint_num=counter + 1, hints_count=len(demand_hints)
+                    )
+                ),
+                # Course-authored HTML demand hints are supported.
+                hint_text=HTML(self.runtime.replace_urls(get_inner_html_from_xpath(demand_hints[counter])))
+            )
+            counter += 1
+
+        total_text = HTML('<ol>{hints}</ol>').format(hints=total_text)
+
+        # Log this demand-hint request. Note that this only logs the last hint requested (although now
+        # all previously shown hints are still displayed).
+        event_info = dict()
+        event_info['module_id'] = text_type(self.location)
+        event_info['hint_index'] = hint_index
+        event_info['hint_len'] = len(demand_hints)
+        event_info['hint_text'] = get_inner_html_from_xpath(demand_hints[hint_index])
+        self.runtime.publish(self, 'edx.problem.hint.demandhint_displayed', event_info)
+
+        _, should_enable_next_hint = self._should_enable_demand_hint(demand_hints=demand_hints, hint_index=hint_index)
+
+        # We report the index of this hint, the client works out what index to use to get the next hint
+        return {
+            'success': True,
+            'hint_index': hint_index,
+            'should_enable_next_hint': should_enable_next_hint,
+            'msg': total_text,
+        }
+
+    def get_problem_html(self, encapsulate=True, submit_notification=False):
         """
         Return html for the problem.
 
-        Adds check, reset, save buttons as necessary based on the problem config and state.
-        """
+        Adds submit, reset, save, and hint buttons as necessary based on the problem config
+        and state.
 
+        encapsulate (bool): if True (the default) embed the html in a problem <div>
+        submit_notification (bool): True if the submit notification should be added
+        """
         try:
             html = self.lcp.get_html()
 
@@ -599,41 +730,65 @@ class CapaMixin(CapaFields):
         except Exception as err:  # pylint: disable=broad-except
             html = self.handle_problem_html_error(err)
 
-        # The convention is to pass the name of the check button if we want
-        # to show a check button, and False otherwise This works because
-        # non-empty strings evaluate to True.  We use the same convention
-        # for the "checking" state text.
-        if self.should_show_check_button():
-            check_button = self.check_button_name()
-            check_button_checking = self.check_button_checking_name()
-        else:
-            check_button = False
-            check_button_checking = False
+        html = self.remove_tags_from_html(html)
+        _ = self.runtime.service(self, "i18n").ugettext
+
+        # Enable/Disable Submit button if should_enable_submit_button returns True/False.
+        submit_button = self.submit_button_name()
+        submit_button_submitting = self.submit_button_submitting_name()
+        should_enable_submit_button = self.should_enable_submit_button()
+        submit_disabled_ctas = None
+        if not should_enable_submit_button:
+            cta_service = self.runtime.service(self, "call_to_action")
+            if cta_service:
+                submit_disabled_ctas = cta_service.get_ctas(self, 'capa_submit_disabled')
 
         content = {
             'name': self.display_name_with_default,
-            'html': html,
+            'html': smart_text(html),
             'weight': self.weight,
         }
 
+        # If demand hints are available, emit hint button and div.
+        demand_hints = self.lcp.tree.xpath("//problem/demandhint/hint")
+        demand_hint_possible, should_enable_next_hint = self._should_enable_demand_hint(demand_hints=demand_hints)
+
+        answer_notification_type, answer_notification_message = self._get_answer_notification(
+            render_notifications=submit_notification)
+
+        save_message = None
+        if self.has_saved_answers:
+            save_message = _(
+                u"Your answers were previously saved. Click '{button_name}' to grade them."
+            ).format(button_name=self.submit_button_name())
+
         context = {
             'problem': content,
-            'id': self.location.to_deprecated_string(),
-            'check_button': check_button,
-            'check_button_checking': check_button_checking,
+            'id': text_type(self.location),
+            'short_id': self.location.html_id(),
+            'submit_button': submit_button,
+            'submit_button_submitting': submit_button_submitting,
+            'should_enable_submit_button': should_enable_submit_button,
             'reset_button': self.should_show_reset_button(),
             'save_button': self.should_show_save_button(),
             'answer_available': self.answer_available(),
             'attempts_used': self.attempts,
             'attempts_allowed': self.max_attempts,
+            'demand_hint_possible': demand_hint_possible,
+            'should_enable_next_hint': should_enable_next_hint,
+            'answer_notification_type': answer_notification_type,
+            'answer_notification_message': answer_notification_message,
+            'has_saved_answers': self.has_saved_answers,
+            'save_message': save_message,
+            'submit_disabled_cta': submit_disabled_ctas[0] if submit_disabled_ctas else None,
         }
 
         html = self.runtime.render_template('problem.html', context)
 
         if encapsulate:
-            html = u'<div id="problem_{id}" class="problem" data-url="{ajax_url}">'.format(
-                id=self.location.html_id(), ajax_url=self.runtime.ajax_url
-            ) + html + "</div>"
+            html = HTML(u'<div id="problem_{id}" class="problem" data-url="{ajax_url}">{html}</div>').format(
+                id=self.location.html_id(), ajax_url=self.ajax_url, html=HTML(html)
+            )
 
         # Now do all the substitutions which the LMS module_render normally does, but
         # we need to do here explicitly since we can get called for our HTML via AJAX
@@ -646,18 +801,110 @@ class CapaMixin(CapaFields):
 
         return html
 
+    def _get_answer_notification(self, render_notifications):
+        """
+        Generate the answer notification type and message from the current problem status.
+
+         Arguments:
+             render_notifications (bool): If false the method will return an None for type and message
+        """
+        answer_notification_message = None
+        answer_notification_type = None
+
+        if render_notifications:
+            progress = self.get_progress()
+            id_list = list(self.lcp.correct_map.keys())
+
+            # Show only a generic message if hiding correctness
+            if not self.correctness_available():
+                answer_notification_type = 'submitted'
+            elif len(id_list) == 1:
+                # Only one answer available
+                answer_notification_type = self.lcp.correct_map.get_correctness(id_list[0])
+            elif len(id_list) > 1:
+                # Check the multiple answers that are available
+                answer_notification_type = self.lcp.correct_map.get_correctness(id_list[0])
+                for answer_id in id_list[1:]:
+                    if self.lcp.correct_map.get_correctness(answer_id) != answer_notification_type:
+                        # There is at least 1 of the following combinations of correctness states
+                        # Correct and incorrect, Correct and partially correct, or Incorrect and partially correct
+                        # which all should have a message type of Partially Correct
+                        answer_notification_type = 'partially-correct'
+                        break
+
+            # Build the notification message based on the notification type and translate it.
+            ungettext = self.runtime.service(self, "i18n").ungettext
+            _ = self.runtime.service(self, "i18n").ugettext
+            if answer_notification_type == 'incorrect':
+                if progress is not None:
+                    answer_notification_message = ungettext(
+                        "Incorrect ({progress} point)",
+                        "Incorrect ({progress} points)",
+                        progress.frac()[1]
+                    ).format(progress=str(progress))
+                else:
+                    answer_notification_message = _('Incorrect')
+            elif answer_notification_type == 'correct':
+                if progress is not None:
+                    answer_notification_message = ungettext(
+                        "Correct ({progress} point)",
+                        "Correct ({progress} points)",
+                        progress.frac()[1]
+                    ).format(progress=str(progress))
+                else:
+                    answer_notification_message = _('Correct')
+            elif answer_notification_type == 'partially-correct':
+                if progress is not None:
+                    answer_notification_message = ungettext(
+                        "Partially correct ({progress} point)",
+                        "Partially correct ({progress} points)",
+                        progress.frac()[1]
+                    ).format(progress=str(progress))
+                else:
+                    answer_notification_message = _('Partially Correct')
+            elif answer_notification_type == 'submitted':
+                answer_notification_message = _("Answer submitted.")
+
+        return answer_notification_type, answer_notification_message
+
+    def remove_tags_from_html(self, html):
+        """
+        The capa xml includes many tags such as <additional_answer> or <demandhint> which are not
+        meant to be part of the client html. We strip them all and return the resulting html.
+        """
+        tags = ['demandhint', 'choicehint', 'optionhint', 'stringhint', 'numerichint', 'optionhint',
+                'correcthint', 'regexphint', 'additional_answer', 'stringequalhint', 'compoundhint',
+                'stringequalhint']
+        for tag in tags:
+            html = re.sub(r'<%s.*?>.*?</%s>' % (tag, tag), '', html, flags=re.DOTALL)  # xss-lint: disable=python-interpolate-html
+            # Some of these tags span multiple lines
+        # Note: could probably speed this up by calling sub() once with a big regex
+        # vs. simply calling sub() many times as we have here.
+        return html
+
+    def hint_button(self, data):
+        """
+        Hint button handler, returns new html using hint_index from the client.
+        """
+        hint_index = int(data['hint_index'])
+        return self.get_demand_hint(hint_index)
+
+    def used_all_attempts(self):
+        """ All attempts have been used """
+        return self.max_attempts is not None and self.attempts >= self.max_attempts
+
     def is_past_due(self):
         """
         Is it now past this problem's due date, including grace period?
         """
         return (self.close_date is not None and
-                datetime.datetime.now(UTC()) > self.close_date)
+                datetime.datetime.now(utc) > self.close_date)
 
     def closed(self):
         """
         Is the student still allowed to submit answers?
         """
-        if self.max_attempts is not None and self.attempts >= self.max_attempts:
+        if self.used_all_attempts():
             return True
         if self.is_past_due():
             return True
@@ -687,40 +934,64 @@ class CapaMixin(CapaFields):
         """
         True iff full points
         """
-        score_dict = self.get_score()
-        return score_dict['score'] == score_dict['total']
+        return self.score.raw_earned == self.score.raw_possible
 
     def answer_available(self):
         """
         Is the user allowed to see an answer?
         """
-        if self.showanswer == '':
+        if not self.correctness_available():
+            # If correctness is being withheld, then don't show answers either.
             return False
-        elif self.showanswer == "never":
+        elif self.showanswer == '':
+            return False
+        elif self.showanswer == SHOWANSWER.NEVER:
             return False
         elif self.runtime.user_is_staff:
             # This is after the 'never' check because admins can see the answer
             # unless the problem explicitly prevents it
             return True
-        elif self.showanswer == 'attempted':
-            return self.attempts > 0
-        elif self.showanswer == 'answered':
+        elif self.showanswer == SHOWANSWER.ATTEMPTED:
+            return self.is_attempted() or self.is_past_due()
+        elif self.showanswer == SHOWANSWER.ANSWERED:
             # NOTE: this is slightly different from 'attempted' -- resetting the problems
             # makes lcp.done False, but leaves attempts unchanged.
-            return self.lcp.done
-        elif self.showanswer == 'closed':
+            return self.is_correct()
+        elif self.showanswer == SHOWANSWER.CLOSED:
             return self.closed()
-        elif self.showanswer == 'finished':
+        elif self.showanswer == SHOWANSWER.FINISHED:
             return self.closed() or self.is_correct()
 
-        elif self.showanswer == 'correct_or_past_due':
+        elif self.showanswer == SHOWANSWER.CORRECT_OR_PAST_DUE:
             return self.is_correct() or self.is_past_due()
-        elif self.showanswer == 'past_due':
+        elif self.showanswer == SHOWANSWER.PAST_DUE:
             return self.is_past_due()
-        elif self.showanswer == 'always':
+        elif self.showanswer == SHOWANSWER.AFTER_SOME_NUMBER_OF_ATTEMPTS:
+            required_attempts = self.attempts_before_showanswer_button
+            if self.max_attempts and required_attempts >= self.max_attempts:
+                required_attempts = self.max_attempts
+            return self.attempts >= required_attempts
+        elif self.showanswer == SHOWANSWER.ALWAYS:
             return True
-
+        elif self.showanswer == SHOWANSWER.AFTER_ALL_ATTEMPTS:
+            return self.used_all_attempts()
+        elif self.showanswer == SHOWANSWER.AFTER_ALL_ATTEMPTS_OR_CORRECT:
+            return self.used_all_attempts() or self.is_correct()
+        elif self.showanswer == SHOWANSWER.ATTEMPTED_NO_PAST_DUE:
+            return self.is_attempted()
         return False
+
+    def correctness_available(self):
+        """
+        Is the user allowed to see whether she's answered correctly?
+
+        Limits access to the correct/incorrect flags, messages, and problem score.
+        """
+        return ShowCorrectness.correctness_available(
+            show_correctness=self.show_correctness,
+            due_date=self.close_date,
+            has_staff_access=self.runtime.user_is_staff,
+        )
 
     def update_score(self, data):
         """
@@ -736,7 +1007,8 @@ class CapaMixin(CapaFields):
         score_msg = data['xqueue_body']
         self.lcp.update_score(score_msg, queuekey)
         self.set_state_from_lcp()
-        self.publish_grade()
+        self.set_score(self.score_from_lcp(self.lcp))
+        self.publish_grade(grader_response=True)
 
         return dict()  # No AJAX return is needed
 
@@ -782,10 +1054,15 @@ class CapaMixin(CapaFields):
         """
         For the "show answer" button.
 
-        Returns the answers: {'answers' : answers}
+        Returns the answers and rendered "correct status span" HTML:
+            {'answers' : answers, 'correct_status_html': correct_status_span_html}.
+            The "correct status span" HTML is injected beside the correct answers
+            for radio button and checkmark problems, so that there is a visual
+            indication of the correct answers that is not solely based on color
+            (and also screen reader text).
         """
         event_info = dict()
-        event_info['problem_id'] = self.location.to_deprecated_string()
+        event_info['problem_id'] = text_type(self.location)
         self.track_function_unmask('showanswer', event_info)
         if not self.answer_available():
             raise NotFoundError('Answer is not available')
@@ -798,14 +1075,25 @@ class CapaMixin(CapaFields):
         new_answers = dict()
         for answer_id in answers:
             try:
-                new_answer = {answer_id: self.runtime.replace_urls(answers[answer_id])}
+                answer_content = self.runtime.replace_urls(answers[answer_id])
+                if self.runtime.replace_course_urls:
+                    answer_content = self.runtime.replace_course_urls(answer_content)
+                if self.runtime.replace_jump_to_id_urls:
+                    answer_content = self.runtime.replace_jump_to_id_urls(answer_content)
+                new_answer = {answer_id: answer_content}
             except TypeError:
                 log.debug(u'Unable to perform URL substitution on answers[%s]: %s',
                           answer_id, answers[answer_id])
                 new_answer = {answer_id: answers[answer_id]}
             new_answers.update(new_answer)
 
-        return {'answers': new_answers}
+        return {
+            'answers': new_answers,
+            'correct_status_html': self.runtime.render_template(
+                'status_span.html',
+                {'status': Status('correct', self.runtime.service(self, "i18n").ugettext)}
+            )
+        }
 
     # Figure out if we should move these to capa_problem?
     def get_problem(self, _data):
@@ -816,7 +1104,7 @@ class CapaMixin(CapaFields):
         Used if we want to reconfirm we have the right thing e.g. after
         several AJAX calls.
         """
-        return {'html': self.get_problem_html(encapsulate=False)}
+        return {'html': self.get_problem_html(encapsulate=False, submit_notification=True)}
 
     @staticmethod
     def make_dict_of_responses(data):
@@ -860,7 +1148,7 @@ class CapaMixin(CapaFields):
         # We only want to consider each key a single time, so we use set(data.keys())
         for key in set(data.keys()):
             # e.g. input_resistor_1 ==> resistor_1
-            _, _, name = key.partition('_')  # pylint: disable=redefined-outer-name
+            _, _, name = key.partition('_')
 
             # If key has no underscores, then partition
             # will return (key, '', '')
@@ -901,24 +1189,26 @@ class CapaMixin(CapaFields):
 
         return answers
 
-    def publish_grade(self):
+    def publish_grade(self, score=None, only_if_higher=None, **kwargs):
         """
         Publishes the student's current grade to the system as an event
         """
-        score = self.lcp.get_score()
-        self.runtime.publish(
-            self,
-            'grade',
-            {
-                'value': score['score'],
-                'max_value': score['total'],
-            }
-        )
+        if not score:
+            score = self.score
+        event = {
+            'value': score.raw_earned,
+            'max_value': score.raw_possible,
+            'only_if_higher': only_if_higher,
+        }
+        if kwargs.get('grader_response'):
+            event['grader_response'] = kwargs['grader_response']
 
-        return {'grade': score['score'], 'max_grade': score['total']}
+        self.runtime.publish(self, 'grade', event)
+
+        return {'grade': self.score.raw_earned, 'max_grade': self.score.raw_possible}
 
     # pylint: disable=too-many-statements
-    def check_problem(self, data, override_time=False):
+    def submit_problem(self, data, override_time=False):
         """
         Checks whether answers to a problem are correct
 
@@ -928,15 +1218,16 @@ class CapaMixin(CapaFields):
         """
         event_info = dict()
         event_info['state'] = self.lcp.get_state()
-        event_info['problem_id'] = self.location.to_deprecated_string()
+        event_info['problem_id'] = text_type(self.location)
 
+        self.lcp.has_saved_answers = False
         answers = self.make_dict_of_responses(data)
         answers_without_files = convert_files_to_filenames(answers)
         event_info['answers'] = answers_without_files
 
         metric_name = u'capa.check_problem.{}'.format
         # Can override current time
-        current_time = datetime.datetime.now(UTC())
+        current_time = datetime.datetime.now(utc)
         if override_time is not False:
             current_time = override_time
 
@@ -944,19 +1235,24 @@ class CapaMixin(CapaFields):
 
         # Too late. Cannot submit
         if self.closed():
+            log.error(
+                'ProblemClosedError: Problem %s, close date: %s, due:%s, is_past_due: %s, attempts: %s/%s,',
+                text_type(self.location),
+                self.close_date,
+                self.due,
+                self.is_past_due(),
+                self.attempts,
+                self.max_attempts,
+            )
             event_info['failure'] = 'closed'
             self.track_function_unmask('problem_check_fail', event_info)
-            if dog_stats_api:
-                dog_stats_api.increment(metric_name('checks'), tags=[u'result:failed', u'failure:closed'])
             raise NotFoundError(_("Problem is closed."))
 
         # Problem submitted. Student should reset before checking again
-        if self.done and self.rerandomize == "always":
+        if self.done and self.rerandomize == RANDOMIZATION.ALWAYS:
             event_info['failure'] = 'unreset'
             self.track_function_unmask('problem_check_fail', event_info)
-            if dog_stats_api:
-                dog_stats_api.increment(metric_name('checks'), tags=[u'result:failed', u'failure:unreset'])
-            raise NotFoundError(_("Problem must be reset before it can be checked again."))
+            raise NotFoundError(_("Problem must be reset before it can be submitted again."))
 
         # Problem queued. Students must wait a specified waittime before they are allowed to submit
         # IDEA: consider stealing code from below: pretty-print of seconds, cueing of time remaining
@@ -971,10 +1267,9 @@ class CapaMixin(CapaFields):
 
         # Wait time between resets: check if is too soon for submission.
         if self.last_submission_time is not None and self.submission_wait_seconds != 0:
-             # pylint: disable=maybe-no-member
-             # pylint is unable to verify that .total_seconds() exists
-            if (current_time - self.last_submission_time).total_seconds() < self.submission_wait_seconds:
-                remaining_secs = int(self.submission_wait_seconds - (current_time - self.last_submission_time).total_seconds())
+            seconds_since_submission = (current_time - self.last_submission_time).total_seconds()
+            if seconds_since_submission < self.submission_wait_seconds:
+                remaining_secs = int(self.submission_wait_seconds - seconds_since_submission)
                 msg = _(u'You must wait at least {wait_secs} between submissions. {remaining_secs} remaining.').format(
                     wait_secs=self.pretty_print_seconds(self.submission_wait_seconds),
                     remaining_secs=self.pretty_print_seconds(remaining_secs))
@@ -984,43 +1279,57 @@ class CapaMixin(CapaFields):
                 }
 
         try:
+            # expose the attempt number to a potential python custom grader
+            # self.lcp.context['attempt'] refers to the attempt number (1-based)
+            self.lcp.context['attempt'] = self.attempts + 1
             correct_map = self.lcp.grade_answers(answers)
+            # self.attempts refers to the number of attempts that did not
+            # raise an error (0-based)
             self.attempts = self.attempts + 1
             self.lcp.done = True
             self.set_state_from_lcp()
+            self.set_score(self.score_from_lcp(self.lcp))
             self.set_last_submission_time()
 
         except (StudentInputError, ResponseError, LoncapaProblemError) as inst:
-            log.warning("StudentInputError in capa_module:problem_check",
-                        exc_info=True)
+            if self.runtime.DEBUG:
+                log.warning(
+                    "StudentInputError in capa_module:problem_check",
+                    exc_info=True
+                )
 
             # Save the user's state before failing
             self.set_state_from_lcp()
+            self.set_score(self.score_from_lcp(self.lcp))
 
             # If the user is a staff member, include
             # the full exception, including traceback,
             # in the response
             if self.runtime.user_is_staff:
-                msg = u"Staff debug info: {tb}".format(tb=cgi.escape(traceback.format_exc()))
+                msg = u"Staff debug info: {tb}".format(tb=traceback.format_exc())
 
             # Otherwise, display just an error message,
             # without a stack trace
             else:
-                # Translators: {msg} will be replaced with a problem's error message.
-                msg = _(u"Error: {msg}").format(msg=inst.message)
+                full_error = inst.args[0]
+                try:
+                    # only return the error value of the exception
+                    msg = full_error.split("\\n")[-2].split(": ", 1)[1]
+                except IndexError:
+                    msg = full_error
 
             return {'success': msg}
 
         except Exception as err:
             # Save the user's state before failing
             self.set_state_from_lcp()
+            self.set_score(self.score_from_lcp(self.lcp))
 
             if self.runtime.DEBUG:
-                msg = u"Error checking problem: {}".format(err.message)
+                msg = u"Error checking problem: {}".format(text_type(err))
                 msg += u'\nTraceback:\n{}'.format(traceback.format_exc())
                 return {'success': msg}
             raise
-
         published_grade = self.publish_grade()
 
         # success = correct if ALL questions in this problem are correct
@@ -1039,22 +1348,12 @@ class CapaMixin(CapaFields):
         event_info['submission'] = self.get_submission_metadata_safe(answers_without_files, correct_map)
         self.track_function_unmask('problem_check', event_info)
 
-        if dog_stats_api:
-            dog_stats_api.increment(metric_name('checks'), tags=[u'result:success'])
-            dog_stats_api.histogram(
-                metric_name('correct_pct'),
-                float(published_grade['grade']) / published_grade['max_grade'],
-            )
-            dog_stats_api.histogram(
-                metric_name('attempts'),
-                self.attempts,
-            )
-
-        if hasattr(self.runtime, 'psychometrics_handler'):  # update PsychometricsData using callback
-            self.runtime.psychometrics_handler(self.get_state_for_lcp())
-
         # render problem into HTML
-        html = self.get_problem_html(encapsulate=False)
+        html = self.get_problem_html(encapsulate=False, submit_notification=True)
+
+        # Withhold success indicator if hiding correctness
+        if not self.correctness_available():
+            success = 'submitted'
 
         return {
             'success': success,
@@ -1071,7 +1370,7 @@ class CapaMixin(CapaFields):
         # avoiding problems where an event_info is unmasked twice.
         event_unmasked = copy.deepcopy(event_info)
         self.unmask_event(event_unmasked)
-        self.runtime.track_function(title, event_unmasked)
+        self.runtime.publish(self, title, event_unmasked)
 
     def unmask_event(self, event_info):
         """
@@ -1110,7 +1409,7 @@ class CapaMixin(CapaFields):
 
             if permutation_option is not None:
                 # Add permutation record tuple: (one of:'shuffle'/'answerpool', [as-displayed list])
-                if not 'permutation' in event_info:
+                if 'permutation' not in event_info:
                     event_info['permutation'] = {}
                 event_info['permutation'][response.answer_id] = (permutation_option, response.unmask_order())
 
@@ -1119,25 +1418,25 @@ class CapaMixin(CapaFields):
         Returns time duration nicely formated, e.g. "3 minutes 4 seconds"
         """
         # Here _ is the N variant ungettext that does pluralization with a 3-arg call
-        _ = self.runtime.service(self, "i18n").ungettext
+        ungettext = self.runtime.service(self, "i18n").ungettext
         hours = num_seconds // 3600
         sub_hour = num_seconds % 3600
         minutes = sub_hour // 60
         seconds = sub_hour % 60
         display = ""
         if hours > 0:
-            display += _("{num_hour} hour", "{num_hour} hours", hours).format(num_hour=hours)
+            display += ungettext("{num_hour} hour", "{num_hour} hours", hours).format(num_hour=hours)
         if minutes > 0:
             if display != "":
                 display += " "
             # translators: "minute" refers to a minute of time
-            display += _("{num_minute} minute", "{num_minute} minutes", minutes).format(num_minute=minutes)
+            display += ungettext("{num_minute} minute", "{num_minute} minutes", minutes).format(num_minute=minutes)
         # Taking care to make "0 seconds" instead of "" for 0 time
         if seconds > 0 or (hours == 0 and minutes == 0):
             if display != "":
                 display += " "
             # translators: "second" refers to a second of time
-            display += _("{num_second} second", "{num_second} seconds", seconds).format(num_second=seconds)
+            display += ungettext("{num_second} second", "{num_second} seconds", seconds).format(num_second=seconds)
         return display
 
     def get_submission_metadata_safe(self, answers, correct_map):
@@ -1179,16 +1478,15 @@ class CapaMixin(CapaFields):
         of the problem.  If problem related metadata cannot be located it should be replaced with empty
         strings ''.
         """
-
         input_metadata = {}
-        for input_id, internal_answer in answers.iteritems():
+        for input_id, internal_answer in six.iteritems(answers):
             answer_input = self.lcp.inputs.get(input_id)
 
             if answer_input is None:
                 log.warning('Input id %s is not mapped to an input type.', input_id)
 
             answer_response = None
-            for response, responder in self.lcp.responders.iteritems():
+            for responder in six.itervalues(self.lcp.responders):
                 if input_id in responder.answer_ids:
                     answer_response = responder
 
@@ -1205,106 +1503,25 @@ class CapaMixin(CapaFields):
             # was presented to the user, with values interpolated etc, but that can be done
             # later if necessary.
             variant = ''
-            if self.rerandomize != 'never':
-                variant = self.seed
+            if self.rerandomize != RANDOMIZATION.NEVER:
+                variant = self.get_seed()
 
             is_correct = correct_map.is_correct(input_id)
             if is_correct is None:
                 is_correct = ''
 
+            response_data = getattr(answer_input, 'response_data', {})
             input_metadata[input_id] = {
-                'question': getattr(answer_input, 'loaded_attributes', {}).get('label', ''),
+                'question': response_data.get('label', ''),
                 'answer': user_visible_answer,
                 'response_type': getattr(getattr(answer_response, 'xml', None), 'tag', ''),
                 'input_type': getattr(answer_input, 'tag', ''),
                 'correct': is_correct,
                 'variant': variant,
+                'group_label': response_data.get('group_label', ''),
             }
 
         return input_metadata
-
-    def rescore_problem(self):
-        """
-        Checks whether the existing answers to a problem are correct.
-
-        This is called when the correct answer to a problem has been changed,
-        and the grade should be re-evaluated.
-
-        Returns a dict with one key:
-            {'success' : 'correct' | 'incorrect' | AJAX alert msg string }
-
-        Raises NotFoundError if called on a problem that has not yet been
-        answered, or NotImplementedError if it's a problem that cannot be rescored.
-
-        Returns the error messages for exceptions occurring while performing
-        the rescoring, rather than throwing them.
-        """
-        event_info = {'state': self.lcp.get_state(), 'problem_id': self.location.to_deprecated_string()}
-
-        _ = self.runtime.service(self, "i18n").ugettext
-
-        if not self.lcp.supports_rescoring():
-            event_info['failure'] = 'unsupported'
-            self.track_function_unmask('problem_rescore_fail', event_info)
-            # Translators: 'rescoring' refers to the act of re-submitting a student's solution so it can get a new score.
-            raise NotImplementedError(_("Problem's definition does not support rescoring."))
-
-        if not self.done:
-            event_info['failure'] = 'unanswered'
-            self.track_function_unmask('problem_rescore_fail', event_info)
-            raise NotFoundError(_("Problem must be answered before it can be graded again."))
-
-        # get old score, for comparison:
-        orig_score = self.lcp.get_score()
-        event_info['orig_score'] = orig_score['score']
-        event_info['orig_total'] = orig_score['total']
-
-        try:
-            correct_map = self.lcp.rescore_existing_answers()
-
-        except (StudentInputError, ResponseError, LoncapaProblemError) as inst:
-            log.warning("Input error in capa_module:problem_rescore", exc_info=True)
-            event_info['failure'] = 'input_error'
-            self.track_function_unmask('problem_rescore_fail', event_info)
-            return {'success': u"Error: {0}".format(inst.message)}
-
-        except Exception as err:
-            event_info['failure'] = 'unexpected'
-            self.track_function_unmask('problem_rescore_fail', event_info)
-            if self.runtime.DEBUG:
-                msg = u"Error checking problem: {0}".format(err.message)
-                msg += u'\nTraceback:\n' + traceback.format_exc()
-                return {'success': msg}
-            raise
-
-        # rescoring should have no effect on attempts, so don't
-        # need to increment here, or mark done.  Just save.
-        self.set_state_from_lcp()
-
-        self.publish_grade()
-
-        new_score = self.lcp.get_score()
-        event_info['new_score'] = new_score['score']
-        event_info['new_total'] = new_score['total']
-
-        # success = correct if ALL questions in this problem are correct
-        success = 'correct'
-        for answer_id in correct_map:
-            if not correct_map.is_correct(answer_id):
-                success = 'incorrect'
-
-        # NOTE: We are logging both full grading and queued-grading submissions. In the latter,
-        #       'success' will always be incorrect
-        event_info['correct_map'] = correct_map.get_dict()
-        event_info['success'] = success
-        event_info['attempts'] = self.attempts
-        self.track_function_unmask('problem_rescore', event_info)
-
-        # psychometrics should be called on rescoring requests in the same way as check-problem
-        if hasattr(self.runtime, 'psychometrics_handler'):  # update PsychometricsData using callback
-            self.runtime.psychometrics_handler(self.get_state_for_lcp())
-
-        return {'success': success}
 
     def save_problem(self, data):
         """
@@ -1314,7 +1531,7 @@ class CapaMixin(CapaFields):
         """
         event_info = dict()
         event_info['state'] = self.lcp.get_state()
-        event_info['problem_id'] = self.location.to_deprecated_string()
+        event_info['problem_id'] = text_type(self.location)
 
         answers = self.make_dict_of_responses(data)
         event_info['answers'] = answers
@@ -1326,13 +1543,15 @@ class CapaMixin(CapaFields):
             self.track_function_unmask('save_problem_fail', event_info)
             return {
                 'success': False,
+                # pylint: disable=line-too-long
                 # Translators: 'closed' means the problem's due date has passed. You may no longer attempt to solve the problem.
-                'msg': _("Problem is closed.")
+                'msg': _("Problem is closed."),
+                # pylint: enable=line-too-long
             }
 
         # Problem submitted. Student should reset before saving
         # again.
-        if self.done and self.rerandomize == "always":
+        if self.done and self.rerandomize == RANDOMIZATION.ALWAYS:
             event_info['failure'] = 'done'
             self.track_function_unmask('save_problem_fail', event_info)
             return {
@@ -1341,22 +1560,27 @@ class CapaMixin(CapaFields):
             }
 
         self.lcp.student_answers = answers
+        self.lcp.has_saved_answers = True
 
         self.set_state_from_lcp()
+        self.set_score(self.score_from_lcp(self.lcp))
 
         self.track_function_unmask('save_problem_success', event_info)
         msg = _("Your answers have been saved.")
         if not self.max_attempts == 0:
-            msg = _("Your answers have been saved but not graded. Click 'Check' to grade them.")
+            msg = _(
+                "Your answers have been saved but not graded. Click '{button_name}' to grade them."
+            ).format(button_name=self.submit_button_name())
         return {
             'success': True,
             'msg': msg,
+            'html': self.get_problem_html(encapsulate=False)
         }
 
     def reset_problem(self, _data):
         """
         Changes problem state to unfinished -- removes student answers,
-        and causes problem to rerender itself.
+        Causes problem to rerender itself if randomization is enabled.
 
         Returns a dictionary of the form:
           {'success': True/False,
@@ -1367,7 +1591,7 @@ class CapaMixin(CapaFields):
         """
         event_info = dict()
         event_info['old_state'] = self.lcp.get_state()
-        event_info['problem_id'] = self.location.to_deprecated_string()
+        event_info['problem_id'] = text_type(self.location)
         _ = self.runtime.service(self, "i18n").ugettext
 
         if self.closed():
@@ -1375,19 +1599,21 @@ class CapaMixin(CapaFields):
             self.track_function_unmask('reset_problem_fail', event_info)
             return {
                 'success': False,
+                # pylint: disable=line-too-long
                 # Translators: 'closed' means the problem's due date has passed. You may no longer attempt to solve the problem.
-                'error': _("Problem is closed."),
+                'msg': _("You cannot select Reset for a problem that is closed."),
+                # pylint: enable=line-too-long
             }
 
-        if not self.done:
+        if not self.is_submitted():
             event_info['failure'] = 'not_done'
             self.track_function_unmask('reset_problem_fail', event_info)
             return {
                 'success': False,
-                'error': _("Refresh the page and make an attempt before resetting."),
+                'msg': _("You must submit an answer before you can select Reset."),
             }
 
-        if self.rerandomize in ["always", "onreset"]:
+        if self.is_submitted() and self.rerandomize in [RANDOMIZATION.ALWAYS, RANDOMIZATION.ONRESET]:
             # Reset random number generator seed.
             self.choose_new_seed()
 
@@ -1396,6 +1622,10 @@ class CapaMixin(CapaFields):
 
         # Pull in the new problem seed
         self.set_state_from_lcp()
+        self.set_score(self.score_from_lcp(self.lcp))
+
+        # Grade may have changed, so publish new value
+        self.publish_grade()
 
         event_info['new_state'] = self.lcp.get_state()
         self.track_function_unmask('reset_problem', event_info)
@@ -1404,3 +1634,123 @@ class CapaMixin(CapaFields):
             'success': True,
             'html': self.get_problem_html(encapsulate=False),
         }
+
+    # ScorableXBlockMixin methods
+
+    def rescore(self, only_if_higher=False):
+        """
+        Checks whether the existing answers to a problem are correct.
+
+        This is called when the correct answer to a problem has been changed,
+        and the grade should be re-evaluated.
+
+        If only_if_higher is True, the answer and grade are updated
+        only if the resulting score is higher than before.
+
+        Returns a dict with one key:
+            {'success' : 'correct' | 'incorrect' | AJAX alert msg string }
+
+        Raises NotFoundError if called on a problem that has not yet been
+        answered, or NotImplementedError if it's a problem that cannot be rescored.
+
+        Returns the error messages for exceptions occurring while performing
+        the rescoring, rather than throwing them.
+        """
+        event_info = {'state': self.lcp.get_state(), 'problem_id': text_type(self.location)}
+
+        _ = self.runtime.service(self, "i18n").ugettext
+
+        if not self.lcp.supports_rescoring():
+            event_info['failure'] = 'unsupported'
+            self.track_function_unmask('problem_rescore_fail', event_info)
+            # pylint: disable=line-too-long
+            # Translators: 'rescoring' refers to the act of re-submitting a student's solution so it can get a new score.
+            raise NotImplementedError(_("Problem's definition does not support rescoring."))
+            # pylint: enable=line-too-long
+
+        if not self.done:
+            event_info['failure'] = 'unanswered'
+            self.track_function_unmask('problem_rescore_fail', event_info)
+            raise NotFoundError(_("Problem must be answered before it can be graded again."))
+
+        # get old score, for comparison:
+        orig_score = self.get_score()
+        event_info['orig_score'] = orig_score.raw_earned
+        event_info['orig_total'] = orig_score.raw_possible
+        try:
+            self.update_correctness()
+            calculated_score = self.calculate_score()
+        except (StudentInputError, ResponseError, LoncapaProblemError) as inst:
+            log.warning("Input error in capa_module:problem_rescore", exc_info=True)
+            event_info['failure'] = 'input_error'
+            self.track_function_unmask('problem_rescore_fail', event_info)
+            raise
+
+        except Exception:
+            event_info['failure'] = 'unexpected'
+            self.track_function_unmask('problem_rescore_fail', event_info)
+            raise
+
+        # rescoring should have no effect on attempts, so don't
+        # need to increment here, or mark done.  Just save.
+        self.set_state_from_lcp()
+        self.publish_grade(score=calculated_score, only_if_higher=only_if_higher)
+
+        event_info['new_score'] = calculated_score.raw_earned
+        event_info['new_total'] = calculated_score.raw_possible
+
+        # success = correct if ALL questions in this problem are correct
+        success = 'correct'
+        for answer_id in self.lcp.correct_map:
+            if not self.lcp.correct_map.is_correct(answer_id):
+                success = 'incorrect'
+
+        # NOTE: We are logging both full grading and queued-grading submissions. In the latter,
+        #       'success' will always be incorrect
+        event_info['correct_map'] = self.lcp.correct_map.get_dict()
+        event_info['success'] = success
+        event_info['attempts'] = self.attempts
+        self.track_function_unmask('problem_rescore', event_info)
+
+    def has_submitted_answer(self):
+        return self.done
+
+    def set_score(self, score):
+        """
+        Sets the internal score for the problem. This is not derived directly
+        from the internal LCP in keeping with the ScorableXBlock spec.
+        """
+        self.score = score
+
+    def get_score(self):
+        """
+        Returns the score currently set on the block.
+        """
+        return self.score
+
+    def update_correctness(self):
+        """
+        Updates correct map of the LCP.
+        Operates by creating a new correctness map based on the current
+        state of the LCP, and updating the old correctness map of the LCP.
+        """
+        # Make sure that the attempt number is always at least 1 for grading purposes,
+        # even if the number of attempts have been reset and this problem is regraded.
+        self.lcp.context['attempt'] = max(self.attempts, 1)
+        new_correct_map = self.lcp.get_grade_from_current_answers(None)
+        self.lcp.correct_map.update(new_correct_map)
+
+    def calculate_score(self):
+        """
+        Returns the score calculated from the current problem state.
+        """
+        new_score = self.lcp.calculate_score()
+        return Score(raw_earned=new_score['score'], raw_possible=new_score['total'])
+
+    def score_from_lcp(self, lcp):
+        """
+        Returns the score associated with the correctness map
+        currently stored by the LCP.
+        """
+        lcp_score = lcp.calculate_score()
+        return Score(raw_earned=lcp_score['score'], raw_possible=lcp_score['total'])

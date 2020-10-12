@@ -2,8 +2,11 @@
 Base class for pages in courseware.
 """
 
+
 from bok_choy.page_object import PageObject
-from . import BASE_URL
+
+from common.test.acceptance.pages.lms import BASE_URL
+from common.test.acceptance.pages.lms.tab_nav import TabNavPage
 
 
 class CoursePage(PageObject):
@@ -29,3 +32,11 @@ class CoursePage(PageObject):
         Construct a URL to the page within the course.
         """
         return BASE_URL + "/courses/" + self.course_id + "/" + self.url_path
+
+    def has_tab(self, tab_name):
+        """
+        Returns true if the current page is showing a tab with the given name.
+        :return:
+        """
+        tab_nav = TabNavPage(self.browser)
+        return tab_name in tab_nav.tab_names

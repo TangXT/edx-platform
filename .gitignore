@@ -3,9 +3,15 @@
 
 ### Files private to developers
 
+# Files that should be git-ignored, but are hand-edited or otherwise valued,
+# and so should not be destroyed by "make clean".
+# start-noclean
 requirements/private.txt
+requirements/edx/private.in
+requirements/edx/private.txt
 lms/envs/private.py
 cms/envs/private.py
+# end-noclean
 
 ### Python artifacts
 *.pyc
@@ -19,6 +25,18 @@ cms/envs/private.py
 .redcar/
 codekit-config.json
 .pycharm_helpers/
+/_mac/*
+/IntelliLang.xml
+/conda_packages.xml
+/databaseSettings.xml
+/diff.xml
+/debugger.xml
+/editor.xml
+/ide.general.xml
+/inspection/Default.xml
+/other.xml
+/packages.xml
+/web-browsers.xml
 
 ### NFS artifacts
 .nfs*
@@ -33,20 +51,22 @@ codekit-config.json
 *.mo
 *.po
 *.prob
+*.dup
 !django.po
 !django.mo
 !djangojs.po
 !djangojs.mo
-conf/locale/en/LC_MESSAGES/*.po
 conf/locale/en/LC_MESSAGES/*.mo
 conf/locale/fake*/LC_MESSAGES/*.po
 conf/locale/fake*/LC_MESSAGES/*.mo
+# this was a mistake in i18n_tools, now fixed.
 conf/locale/messages.mo
 
 ### Testing artifacts
 .testids/
 .noseids
 nosetests.xml
+.cache/
 .coverage
 .coverage.*
 coverage.xml
@@ -55,6 +75,19 @@ cover_html/
 reports/
 jscover.log
 jscover.log.*
+.pytest_cache/
+pytest_task*.txt
+.tddium*
+common/test/data/test_unicode/static/
+test_root/courses/
+test_root/data/test_bare.git/
+test_root/export_course_repos/
+test_root/paver_logs/
+test_root/uploads/
+django-pyfs
+.tox/
+common/test/db_cache/bok_choy_*.yaml
+common/test/data/badges/*.png
 
 ### Installation artifacts
 *.egg-info
@@ -62,27 +95,37 @@ jscover.log.*
 .prereqs_cache
 .vagrant/
 node_modules
-.bundle/
 bin/
 
 ### Static assets pipeline artifacts
 *.scssc
 lms/static/css/
+lms/static/certificates/css/
+cms/static/css/
+common/static/common/js/vendor/
+common/static/common/css/vendor/
+common/static/bundles
+webpack-stats.json
+
+### Styling generated from templates
 lms/static/sass/*.css
 lms/static/sass/*.css.map
-lms/static/sass/application.scss
-lms/static/sass/application-extend1.scss
-lms/static/sass/application-extend2.scss
-lms/static/sass/course.scss
+lms/static/certificates/sass/*.css
+lms/static/themed_sass/
 cms/static/css/
 cms/static/sass/*.css
 cms/static/sass/*.css.map
+cms/static/themed_sass/
+themes/**/css
 
 ### Logging artifacts
 log/
 logs
 chromedriver.log
 ghostdriver.log
+
+### Celery artifacts ###
+celerybeat-schedule
 
 ### Unknown artifacts
 database.sqlite
@@ -92,7 +135,14 @@ build
 /src/
 \#*\#
 .env/
-lms/lib/comment_client/python
+openedx/core/djangoapps/django_comment_common/comment_client/python
 autodeploy.properties
 .ws_migrations_complete
 dist
+*.bak
+
+# Visual Studio Code
+.vscode
+
+# Locally generated PII reports
+pii_report

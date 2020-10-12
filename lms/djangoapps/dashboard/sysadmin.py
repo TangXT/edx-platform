@@ -2,47 +2,42 @@
 This module creates a sysadmin dashboard for managing and viewing
 courses.
 """
-import csv
+
+
 import json
 import logging
 import os
 import subprocess
-import time
-import StringIO
 
+import mongoengine
+import unicodecsv as csv
 from django.conf import settings
-from django.contrib.auth import authenticate
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
-from django.core.exceptions import PermissionDenied
+from django.core.paginator import EmptyPage, PageNotAnInteger, Paginator
 from django.db import IntegrityError
-from django.http import HttpResponse, Http404
+from django.http import Http404, HttpResponse
 from django.utils.decorators import method_decorator
 from django.utils.html import escape
-from django.utils import timezone
 from django.utils.translation import ugettext as _
 from django.views.decorators.cache import cache_control
-from django.views.generic.base import TemplateView
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import condition
-from django_future.csrf import ensure_csrf_cookie
-from edxmako.shortcuts import render_to_response
-import mongoengine
-from path import path
+from django.views.generic.base import TemplateView
+from opaque_keys.edx.keys import CourseKey
+from path import Path as path
+from six import StringIO, text_type
 
-from courseware.courses import get_course_by_id
 import dashboard.git_import as git_import
-from dashboard.git_import import GitImportError
-from student.roles import CourseStaffRole, CourseInstructorRole
-from dashboard.models import CourseImportLog
-from external_auth.models import ExternalAuthMap
-from external_auth.views import generate_password
-from student.models import CourseEnrollment, UserProfile, Registration
 import track.views
-from xmodule.modulestore import ModuleStoreEnum
+from dashboard.git_import import GitImportError
+from dashboard.models import CourseImportLog
+from edxmako.shortcuts import render_to_response
+from lms.djangoapps.courseware.courses import get_course_by_id
+from openedx.core.djangolib.markup import HTML
+from student.models import CourseEnrollment, Registration, UserProfile
+from student.roles import CourseInstructorRole, CourseStaffRole
 from xmodule.modulestore.django import modulestore
-from xmodule.modulestore.xml import XMLModuleStore
-from opaque_keys.edx.locations import SlashSeparatedCourseKey
-
 
 log = logging.getLogger(__name__)
 
@@ -59,9 +54,6 @@ class SysadminDashboardView(TemplateView):
         """
 
         self.def_ms = modulestore()
-        self.is_using_mongo = True
-        if isinstance(self.def_ms, XMLModuleStore):
-            self.is_using_mongo = False
         self.msg = u''
         self.datatable = []
         super(SysadminDashboardView, self).__init__(**kwargs)
@@ -85,7 +77,7 @@ class SysadminDashboardView(TemplateView):
         data should be iterable and is used to stream object over http
         """
 
-        csv_file = StringIO.StringIO()
+        csv_file = StringIO()
         writer = csv.writer(csv_file, dialect='excel', quotechar='"',
                             quoting=csv.QUOTE_ALL)
 
@@ -106,8 +98,8 @@ class SysadminDashboardView(TemplateView):
                 writer.writerow(row)
             csv_data = read_and_flush()
             yield csv_data
-        response = HttpResponse(csv_data(), mimetype='text/csv')
-        response['Content-Disposition'] = 'attachment; filename={0}'.format(
+        response = HttpResponse(csv_data(), content_type='text/csv')
+        response['Content-Disposition'] = u'attachment; filename={0}'.format(
             filename)
         return response
 
@@ -118,89 +110,31 @@ class Users(SysadminDashboardView):
     courses loaded, and user statistics
     """
 
-    def fix_external_auth_map_passwords(self):
-        """
-        This corrects any passwords that have drifted from eamap to
-        internal django auth.  Needs to be removed when fixed in external_auth
-        """
-
-        msg = ''
-        for eamap in ExternalAuthMap.objects.all():
-            euser = eamap.user
-            epass = eamap.internal_password
-            if euser is None:
-                continue
-            try:
-                testuser = authenticate(username=euser.username, password=epass)
-            except (TypeError, PermissionDenied, AttributeError), err:
-                # Translators: This message means that the user could not be authenticated (that is, we could
-                # not log them in for some reason - maybe they don't have permission, or their password was wrong)
-                msg += _('Failed in authenticating {username}, error {error}\n').format(
-                    username=euser,
-                    error=err
-                )
-                continue
-            if testuser is None:
-                # Translators: This message means that the user could not be authenticated (that is, we could
-                # not log them in for some reason - maybe they don't have permission, or their password was wrong)
-                msg += _('Failed in authenticating {username}\n').format(username=euser)
-                # Translators: this means that the password has been corrected (sometimes the database needs to be resynchronized)
-                # Translate this as meaning "the password was fixed" or "the password was corrected".
-                msg += _('fixed password')
-                euser.set_password(epass)
-                euser.save()
-                continue
-        if not msg:
-            # Translators: this means everything happened successfully, yay!
-            msg = _('All ok!')
-        return msg
-
     def create_user(self, uname, name, password=None):
-        """ Creates a user (both SSL and regular)"""
+        """ Creates a user """
 
         if not uname:
             return _('Must provide username')
         if not name:
             return _('Must provide full name')
 
-        email_domain = getattr(settings, 'SSL_AUTH_EMAIL_DOMAIN', 'MIT.EDU')
-
         msg = u''
-        if settings.FEATURES['AUTH_USE_CERTIFICATES']:
-            if not '@' in uname:
-                email = '{0}@{1}'.format(uname, email_domain)
-            else:
-                email = uname
-            if not email.endswith('@{0}'.format(email_domain)):
-                # Translators: Domain is an email domain, such as "@gmail.com"
-                msg += _('Email address must end in {domain}').format(domain="@{0}".format(email_domain))
-                return msg
-            mit_domain = 'ssl:MIT'
-            if ExternalAuthMap.objects.filter(external_id=email,
-                                              external_domain=mit_domain):
-                msg += _('Failed - email {email_addr} already exists as {external_id}').format(
-                    email_addr=email,
-                    external_id="external_id"
-                )
-                return msg
-            new_password = generate_password()
-        else:
-            if not password:
-                return _('Password must be supplied if not using certificates')
+        if not password:
+            return _('Password must be supplied')
 
-            email = uname
+        email = uname
 
-            if not '@' in email:
-                msg += _('email address required (not username)')
-                return msg
-            new_password = password
+        if '@' not in email:
+            msg += _('email address required (not username)')
+            return msg
+        new_password = password
 
         user = User(username=uname, email=email, is_active=True)
         user.set_password(new_password)
         try:
             user.save()
         except IntegrityError:
-            msg += _('Oops, failed to create user {user}, {error}').format(
+            msg += _(u'Oops, failed to create user {user}, {error}').format(
                 user=user,
                 error="IntegrityError"
             )
@@ -213,23 +147,7 @@ class Users(SysadminDashboardView):
         profile.name = name
         profile.save()
 
-        if settings.FEATURES['AUTH_USE_CERTIFICATES']:
-            credential_string = getattr(settings, 'SSL_AUTH_DN_FORMAT_STRING',
-                                        '/C=US/ST=Massachusetts/O=Massachusetts Institute of Technology/OU=Client CA v1/CN={0}/emailAddress={1}')
-            credentials = credential_string.format(name, email)
-            eamap = ExternalAuthMap(
-                external_id=email,
-                external_email=email,
-                external_domain=mit_domain,
-                external_name=name,
-                internal_password=new_password,
-                external_credentials=json.dumps(credentials),
-            )
-            eamap.user = user
-            eamap.dtsignup = timezone.now()
-            eamap.save()
-
-        msg += _('User {user} created successfully!').format(user=user)
+        msg += _(u'User {user} created successfully!').format(user=user)
         return msg
 
     def delete_user(self, uname):
@@ -240,52 +158,48 @@ class Users(SysadminDashboardView):
         if '@' in uname:
             try:
                 user = User.objects.get(email=uname)
-            except User.DoesNotExist, err:
-                msg = _('Cannot find user with email address {email_addr}').format(email_addr=uname)
+            except User.DoesNotExist as err:
+                msg = _(u'Cannot find user with email address {email_addr}').format(email_addr=uname)
                 return msg
         else:
             try:
                 user = User.objects.get(username=uname)
-            except User.DoesNotExist, err:
-                msg = _('Cannot find user with username {username} - {error}').format(
+            except User.DoesNotExist as err:
+                msg = _(u'Cannot find user with username {username} - {error}').format(
                     username=uname,
                     error=str(err)
                 )
                 return msg
         user.delete()
-        return _('Deleted user {username}').format(username=uname)
+        return _(u'Deleted user {username}').format(username=uname)
 
-    def make_common_context(self):
-        """Returns the datatable used for this view"""
-
-        self.datatable = {}
-
-        self.datatable = dict(header=[_('Statistic'), _('Value')],
-                              title=_('Site statistics'))
-        self.datatable['data'] = [[_('Total number of users'),
-                                   User.objects.all().count()]]
-
-        self.msg += u'<h2>{0}</h2>'.format(
-            _('Courses loaded in the modulestore')
-        )
-        self.msg += u'<ol>'
-        for course in self.get_courses():
-            self.msg += u'<li>{0} ({1})</li>'.format(
-                escape(course.id.to_deprecated_string()), course.location.to_deprecated_string())
-        self.msg += u'</ol>'
+    def make_datatable(self):
+        """
+        Build the datatable for this view
+        """
+        datatable = {
+            'header': [
+                _('Statistic'),
+                _('Value'),
+            ],
+            'title': _('Site statistics'),
+            'data': [
+                [
+                    _('Total number of users'),
+                    User.objects.all().count(),
+                ],
+            ],
+        }
+        return datatable
 
     def get(self, request):
-
         if not request.user.is_staff:
             raise Http404
-        self.make_common_context()
-
         context = {
-            'datatable': self.datatable,
+            'datatable': self.make_datatable(),
             'msg': self.msg,
             'djangopid': os.getpid(),
             'modeflag': {'users': 'active-section'},
-            'edx_platform_version': getattr(settings, 'EDX_PLATFORM_VERSION_STRING', ''),
         }
         return render_to_response(self.template_name, context)
 
@@ -294,9 +208,6 @@ class Users(SysadminDashboardView):
 
         if not request.user.is_staff:
             raise Http404
-
-        self.make_common_context()
-
         action = request.POST.get('action', '')
         track.views.server_track(request, action, {}, page='user_sysdashboard')
 
@@ -306,30 +217,22 @@ class Users(SysadminDashboardView):
                     (User.objects.all().iterator()))
             return self.return_csv('users_{0}.csv'.format(
                 request.META['SERVER_NAME']), header, data)
-        elif action == 'repair_eamap':
-            self.msg = u'<h4>{0}</h4><pre>{1}</pre>{2}'.format(
-                _('Repair Results'),
-                self.fix_external_auth_map_passwords(),
-                self.msg)
-            self.datatable = {}
         elif action == 'create_user':
             uname = request.POST.get('student_uname', '').strip()
             name = request.POST.get('student_fullname', '').strip()
             password = request.POST.get('student_password', '').strip()
-            self.msg = u'<h4>{0}</h4><p>{1}</p><hr />{2}'.format(
+            self.msg = HTML(u'<h4>{0}</h4><p>{1}</p><hr />{2}').format(
                 _('Create User Results'),
                 self.create_user(uname, name, password), self.msg)
         elif action == 'del_user':
             uname = request.POST.get('student_uname', '').strip()
-            self.msg = u'<h4>{0}</h4><p>{1}</p><hr />{2}'.format(
+            self.msg = HTML(u'<h4>{0}</h4><p>{1}</p><hr />{2}').format(
                 _('Delete User Results'), self.delete_user(uname), self.msg)
-
         context = {
-            'datatable': self.datatable,
+            'datatable': self.make_datatable(),
             'msg': self.msg,
             'djangopid': os.getpid(),
             'modeflag': {'users': 'active-section'},
-            'edx_platform_version': getattr(settings, 'EDX_PLATFORM_VERSION_STRING', ''),
         }
         return render_to_response(self.template_name, context)
 
@@ -349,17 +252,20 @@ class Courses(SysadminDashboardView):
 
         # Try the data dir, then try to find it in the git import dir
         if not gdir.exists():
-            gdir = path(git_import.GIT_REPO_DIR) / cdir
+            git_repo_dir = getattr(settings, 'GIT_REPO_DIR', git_import.DEFAULT_GIT_REPO_DIR)
+            gdir = path(git_repo_dir) / cdir
             if not gdir.exists():
                 return info
 
         cmd = ['git', 'log', '-1',
-               '--format=format:{ "commit": "%H", "author": "%an %ae", "date": "%ad"}', ]
+               u'--format=format:{ "commit": "%H", "author": "%an %ae", "date": "%ad"}', ]
         try:
-            output_json = json.loads(subprocess.check_output(cmd, cwd=gdir))
+            output_json = json.loads(subprocess.check_output(cmd, cwd=gdir).decode('utf-8'))
             info = [output_json['commit'],
                     output_json['date'],
                     output_json['author'], ]
+        except OSError as error:
+            log.warning(text_type(u"Error fetching git data: %s - %s"), text_type(cdir), text_type(error))
         except (ValueError, subprocess.CalledProcessError):
             pass
 
@@ -373,10 +279,7 @@ class Courses(SysadminDashboardView):
             return _("The git repo location should end with '.git', "
                      "and be a valid url")
 
-        if self.is_using_mongo:
-            return self.import_mongo_course(gitloc, branch)
-
-        return self.import_xml_course(gitloc, branch)
+        return self.import_mongo_course(gitloc, branch)
 
     def import_mongo_course(self, gitloc, branch):
         """
@@ -386,10 +289,10 @@ class Courses(SysadminDashboardView):
 
         msg = u''
 
-        log.debug('Adding course using git repo {0}'.format(gitloc))
+        log.debug(u'Adding course using git repo %s', gitloc)
 
         # Grab logging output for debugging imports
-        output = StringIO.StringIO()
+        output = StringIO()
         import_log_handler = logging.StreamHandler(output)
         import_log_handler.setLevel(logging.DEBUG)
 
@@ -424,92 +327,18 @@ class Courses(SysadminDashboardView):
             msg_header = _('Added Course')
             color = 'blue'
 
-        msg = u"<h4 style='color:{0}'>{1}</h4>".format(color, msg_header)
-        msg += "<pre>{0}</pre>".format(escape(ret))
+        msg = HTML(u"<h4 style='color:{0}'>{1}</h4>").format(color, msg_header)
+        msg += HTML(u"<pre>{0}</pre>").format(escape(ret))
         return msg
 
-    def import_xml_course(self, gitloc, branch):
-        """Imports a git course into the XMLModuleStore"""
-
-        msg = u''
-        if not getattr(settings, 'GIT_IMPORT_WITH_XMLMODULESTORE', False):
-            # Translators: "GIT_IMPORT_WITH_XMLMODULESTORE" is a variable name.
-            # "XMLModuleStore" and "MongoDB" are database systems. You should not
-            # translate these names.
-            return _('Refusing to import. GIT_IMPORT_WITH_XMLMODULESTORE is '
-                     'not turned on, and it is generally not safe to import '
-                     'into an XMLModuleStore with multithreaded. We '
-                     'recommend you enable the MongoDB based module store '
-                     'instead, unless this is a development environment.')
-        cdir = (gitloc.rsplit('/', 1)[1])[:-4]
-        gdir = settings.DATA_DIR / cdir
-        if os.path.exists(gdir):
-            msg += _("The course {0} already exists in the data directory! "
-                     "(reloading anyway)").format(cdir)
-            cmd = ['git', 'pull', ]
-            cwd = gdir
-        else:
-            cmd = ['git', 'clone', gitloc, ]
-            cwd = settings.DATA_DIR
-        cwd = os.path.abspath(cwd)
-        try:
-            cmd_output = escape(
-                subprocess.check_output(cmd, stderr=subprocess.STDOUT, cwd=cwd)
-            )
-        except subprocess.CalledProcessError as ex:
-            log.exception('Git pull or clone output was: %r', ex.output)
-            # Translators: unable to download the course content from
-            # the source git repository. Clone occurs if this is brand
-            # new, and pull is when it is being updated from the
-            # source.
-            return _('Unable to clone or pull repository. Please check '
-                     'your url. Output was: {0!r}'.format(ex.output))
-
-        msg += u'<pre>{0}</pre>'.format(cmd_output)
-        if not os.path.exists(gdir):
-            msg += _('Failed to clone repository to {directory_name}').format(directory_name=gdir)
-            return msg
-        # Change branch if specified
-        if branch:
-            try:
-                git_import.switch_branch(branch, gdir)
-            except GitImportError as ex:
-                return str(ex)
-            # Translators: This is a git repository branch, which is a
-            # specific version of a courses content
-            msg += u'<p>{0}</p>'.format(
-                _('Successfully switched to branch: '
-                  '{branch_name}'.format(branch_name=branch)))
-
-        self.def_ms.try_load_course(os.path.abspath(gdir))
-        errlog = self.def_ms.errored_courses.get(cdir, '')
-        if errlog:
-            msg += u'<hr width="50%"><pre>{0}</pre>'.format(escape(errlog))
-        else:
-            course = self.def_ms.courses[os.path.abspath(gdir)]
-            msg += _('Loaded course {course_name}<br/>Errors:').format(
-                course_name="{} {}".format(cdir, course.display_name)
-            )
-            errors = self.def_ms.get_course_errors(course.id)
-            if not errors:
-                msg += u'None'
-            else:
-                msg += u'<ul>'
-                for (summary, err) in errors:
-                    msg += u'<li><pre>{0}: {1}</pre></li>'.format(escape(summary),
-                                                                  escape(err))
-                msg += u'</ul>'
-
-        return msg
-
-    def make_datatable(self):
+    def make_datatable(self, courses=None):
         """Creates course information datatable"""
 
         data = []
-
-        for course in self.get_courses():
+        courses = courses or self.get_courses()
+        for course in courses:
             gdir = course.id.course
-            data.append([course.display_name, course.id.to_deprecated_string()]
+            data.append([course.display_name, text_type(course.id)]
                         + self.git_info_for_course(gdir))
 
         return dict(header=[_('Course Name'),
@@ -532,7 +361,6 @@ class Courses(SysadminDashboardView):
             'msg': self.msg,
             'djangopid': os.getpid(),
             'modeflag': {'courses': 'active-section'},
-            'edx_platform_version': getattr(settings, 'EDX_PLATFORM_VERSION_STRING', ''),
         }
         return render_to_response(self.template_name, context)
 
@@ -554,7 +382,7 @@ class Courses(SysadminDashboardView):
 
         elif action == 'del_course':
             course_id = request.POST.get('course_id', '').strip()
-            course_key = SlashSeparatedCourseKey.from_deprecated_string(course_id)
+            course_key = CourseKey.from_string(course_id)
             course_found = False
             if course_key in courses:
                 course_found = True
@@ -563,44 +391,27 @@ class Courses(SysadminDashboardView):
                 try:
                     course = get_course_by_id(course_key)
                     course_found = True
-                except Exception, err:   # pylint: disable=broad-except
+                except Exception as err:   # pylint: disable=broad-except
                     self.msg += _(
-                        'Error - cannot get course with ID {0}<br/><pre>{1}</pre>'
+                        HTML(u'Error - cannot get course with ID {0}<br/><pre>{1}</pre>')
                     ).format(
                         course_key,
                         escape(str(err))
                     )
 
-            is_xml_course = (modulestore().get_modulestore_type(course_key) == ModuleStoreEnum.Type.xml)
-            if course_found and is_xml_course:
-                cdir = course.data_dir
-                self.def_ms.courses.pop(cdir)
-
-                # now move the directory (don't actually delete it)
-                new_dir = "{course_dir}_deleted_{timestamp}".format(
-                    course_dir=cdir,
-                    timestamp=int(time.time())
-                )
-                os.rename(settings.DATA_DIR / cdir, settings.DATA_DIR / new_dir)
-
-                self.msg += (u"<font color='red'>Deleted "
-                             u"{0} = {1} ({2})</font>".format(
-                                 cdir, course.id, course.display_name))
-
-            elif course_found and not is_xml_course:
+            if course_found:
                 # delete course that is stored with mongodb backend
                 self.def_ms.delete_course(course.id, request.user.id)
                 # don't delete user permission groups, though
                 self.msg += \
-                    u"<font color='red'>{0} {1} = {2} ({3})</font>".format(
-                        _('Deleted'), course.location.to_deprecated_string(), course.id.to_deprecated_string(), course.display_name)
+                    HTML(u"<font color='red'>{0} {1} = {2} ({3})</font>").format(
+                        _('Deleted'), text_type(course.location), text_type(course.id), course.display_name)
 
         context = {
-            'datatable': self.make_datatable(),
+            'datatable': self.make_datatable(list(courses.values())),
             'msg': self.msg,
             'djangopid': os.getpid(),
             'modeflag': {'courses': 'active-section'},
-            'edx_platform_version': getattr(settings, 'EDX_PLATFORM_VERSION_STRING', ''),
         }
         return render_to_response(self.template_name, context)
 
@@ -618,7 +429,7 @@ class Staffing(SysadminDashboardView):
             raise Http404
         data = []
 
-        for course in self.get_courses():  # pylint: disable=unused-variable
+        for course in self.get_courses():
             datum = [course.display_name, course.id]
             datum += [CourseEnrollment.objects.filter(
                 course_id=course.id).count()]
@@ -637,7 +448,6 @@ class Staffing(SysadminDashboardView):
             'msg': self.msg,
             'djangopid': os.getpid(),
             'modeflag': {'staffing': 'active-section'},
-            'edx_platform_version': getattr(settings, 'EDX_PLATFORM_VERSION_STRING', ''),
         }
         return render_to_response(self.template_name, context)
 
@@ -652,11 +462,11 @@ class Staffing(SysadminDashboardView):
             data = []
             roles = [CourseInstructorRole, CourseStaffRole, ]
 
-            for course in self.get_courses():  # pylint: disable=unused-variable
+            for course in self.get_courses():
                 for role in roles:
                     for user in role(course.id).users_with_role():
                         datum = [course.id, role, user.username, user.email,
-                                 user.profile.name]
+                                 user.profile.name.encode('utf-8')]
                         data.append(datum)
             header = [_('course_id'),
                       _('role'), _('username'),
@@ -682,7 +492,9 @@ class GitLogs(TemplateView):
 
         course_id = kwargs.get('course_id')
         if course_id:
-            course_id = SlashSeparatedCourseKey.from_deprecated_string(course_id)
+            course_id = CourseKey.from_string(course_id)
+
+        page_size = 10
 
         # Set mongodb defaults even if it isn't defined in settings
         mongo_db = {
@@ -715,25 +527,37 @@ class GitLogs(TemplateView):
             # Require staff if not going to specific course
             if not request.user.is_staff:
                 raise Http404
-            cilset = CourseImportLog.objects.all().order_by('-created')
+            cilset = CourseImportLog.objects.order_by('-created')
         else:
-            try:
-                course = get_course_by_id(course_id)
-            except Exception:  # pylint: disable=broad-except
-                log.info('Cannot find course {0}'.format(course_id))
-                raise Http404
-
             # Allow only course team, instructors, and staff
             if not (request.user.is_staff or
-                    CourseInstructorRole(course.id).has_user(request.user) or
-                    CourseStaffRole(course.id).has_user(request.user)):
+                    CourseInstructorRole(course_id).has_user(request.user) or
+                    CourseStaffRole(course_id).has_user(request.user)):
                 raise Http404
-            log.debug('course_id={0}'.format(course_id))
-            cilset = CourseImportLog.objects.filter(course_id=course_id).order_by('-created')
-            log.debug('cilset length={0}'.format(len(cilset)))
-        mdb.disconnect()
-        context = {'cilset': cilset,
-                   'course_id': course_id.to_deprecated_string() if course_id else None,
-                   'error_msg': error_msg}
+            log.debug('course_id=%s', course_id)
+            cilset = CourseImportLog.objects.filter(
+                course_id=course_id
+            ).order_by('-created')
+            log.debug(u'cilset length=%s', len(cilset))
+
+        # Paginate the query set
+        paginator = Paginator(cilset, page_size)
+        try:
+            logs = paginator.page(request.GET.get('page'))
+        except PageNotAnInteger:
+            logs = paginator.page(1)
+        except EmptyPage:
+            # If the page is too high or low
+            given_page = int(request.GET.get('page'))
+            page = min(max(1, given_page), paginator.num_pages)
+            logs = paginator.page(page)
+
+        mdb.close()
+        context = {
+            'logs': logs,
+            'course_id': text_type(course_id) if course_id else None,
+            'error_msg': error_msg,
+            'page_size': page_size
+        }
 
         return render_to_response(self.template_name, context)

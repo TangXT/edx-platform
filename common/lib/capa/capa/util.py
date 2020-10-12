@@ -1,14 +1,25 @@
 """
 Utility functions for capa.
 """
-import bleach
 
+
+import logging
+import re
+from cmath import isinf, isnan
+from decimal import Decimal
+
+import bleach
+import six
 from calc import evaluator
-from cmath import isinf
+from lxml import etree
+
+from openedx.core.djangolib.markup import HTML
+
 #-----------------------------------------------------------------------------
 #
 # Utility functions used in CAPA responsetypes
 default_tolerance = '0.001%'
+log = logging.getLogger(__name__)
 
 
 def compare_with_tolerance(student_complex, instructor_complex, tolerance=default_tolerance, relative_tolerance=False):
@@ -64,6 +75,23 @@ def compare_with_tolerance(student_complex, instructor_complex, tolerance=defaul
         # `tolerance` both equal to infinity. Then, below we would have
         # `inf <= inf` which is a fail. Instead, compare directly.
         return student_complex == instructor_complex
+
+    # because student_complex and instructor_complex are not necessarily
+    # complex here, we enforce it here:
+    student_complex = complex(student_complex)
+    instructor_complex = complex(instructor_complex)
+
+    # if both the instructor and student input are real,
+    # compare them as Decimals to avoid rounding errors
+    if not (instructor_complex.imag or student_complex.imag):
+        # if either of these are not a number, short circuit and return False
+        if isnan(instructor_complex.real) or isnan(student_complex.real):
+            return False
+        student_decimal = Decimal(str(student_complex.real))
+        instructor_decimal = Decimal(str(instructor_complex.real))
+        tolerance_decimal = Decimal(str(tolerance))
+        return abs(student_decimal - instructor_decimal) <= tolerance_decimal
+
     else:
         # v1 and v2 are, in general, complex numbers:
         # there are some notes about backward compatibility issue: see responsetypes.get_staff_ans()).
@@ -75,20 +103,28 @@ def contextualize_text(text, context):  # private
     Takes a string with variables. E.g. $a+$b.
     Does a substitution of those variables from the context
     """
+    def convert_to_str(value):
+        """The method tries to convert unicode/non-ascii values into string"""
+        try:
+            return str(value)
+        except UnicodeEncodeError:
+            return value.encode('utf8', errors='ignore')
+
     if not text:
         return text
-    for key in sorted(context, lambda x, y: cmp(len(y), len(x))):
+
+    for key in sorted(context, key=len, reverse=True):
         # TODO (vshnayder): This whole replacement thing is a big hack
         # right now--context contains not just the vars defined in the
         # program, but also e.g. a reference to the numpy module.
         # Should be a separate dict of variables that should be
         # replaced.
-        if '$' + key in text:
-            try:
-                s = str(context[key])
-            except UnicodeEncodeError:
-                s = context[key].encode('utf8', errors='ignore')
-            text = text.replace('$' + key, s)
+        context_key = '$' + key
+        if context_key in (text.decode('utf-8') if six.PY3 and isinstance(text, bytes) else text):
+            text = convert_to_str(text)
+            context_value = convert_to_str(context[key])
+            text = text.replace(context_key, context_value)
+
     return text
 
 
@@ -147,18 +183,41 @@ def sanitize_html(html_code):
     Used to sanitize XQueue responses from Matlab.
     """
     attributes = bleach.ALLOWED_ATTRIBUTES.copy()
-    # Yuck! but bleach does not offer the option of passing in allowed_protocols,
-    # and matlab uses data urls for images
-    if u'data' not in bleach.BleachSanitizer.allowed_protocols:
-        bleach.BleachSanitizer.allowed_protocols.append(u'data')
     attributes.update({
         '*': ['class', 'style', 'id'],
         'audio': ['controls', 'autobuffer', 'autoplay', 'src'],
         'img': ['src', 'width', 'height', 'class']
     })
-    output = bleach.clean(html_code,
+    output = bleach.clean(
+        html_code,
+        protocols=bleach.ALLOWED_PROTOCOLS + ['data'],
         tags=bleach.ALLOWED_TAGS + ['div', 'p', 'audio', 'pre', 'img', 'span'],
         styles=['white-space'],
         attributes=attributes
     )
     return output
+
+
+def get_inner_html_from_xpath(xpath_node):
+    """
+    Returns inner html as string from xpath node.
+
+    """
+    # returns string from xpath node
+    html = etree.tostring(xpath_node).strip().decode('utf-8')
+    # strips outer tag from html string
+    # xss-lint: disable=python-interpolate-html
+    inner_html = re.sub('(?ms)<%s[^>]*>(.*)</%s>' % (xpath_node.tag, xpath_node.tag), '\\1', html)
+    return inner_html.strip()
+
+
+def remove_markup(html):
+    """
+    Return html with markup stripped and text HTML-escaped.
+
+    >>> bleach.clean("<b>Rock & Roll</b>", tags=[], strip=True)
+    u'Rock &amp; Roll'
+    >>> bleach.clean("<b>Rock &amp; Roll</b>", tags=[], strip=True)
+    u'Rock &amp; Roll'
+    """
+    return HTML(bleach.clean(html, tags=[], strip=True))

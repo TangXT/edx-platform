@@ -1,26 +1,32 @@
 """
 Command-line utility to start a stub service.
 """
+
+
+import logging
 import sys
 import time
-import logging
+
+from .catalog import StubCatalogService
 from .comments import StubCommentsService
-from .xqueue import StubXQueueService
-from .youtube import StubYouTubeService
-from .ora import StubOraService
+from .ecommerce import StubEcommerceService
+from .edxnotes import StubEdxNotesService
 from .lti import StubLtiService
 from .video_source import VideoSourceHttpService
-
+from .xqueue import StubXQueueService
+from .youtube import StubYouTubeService
 
 USAGE = "USAGE: python -m stubs.start SERVICE_NAME PORT_NUM [CONFIG_KEY=CONFIG_VAL, ...]"
 
 SERVICES = {
     'xqueue': StubXQueueService,
     'youtube': StubYouTubeService,
-    'ora': StubOraService,
     'comments': StubCommentsService,
     'lti': StubLtiService,
     'video': VideoSourceHttpService,
+    'edxnotes': StubEdxNotesService,
+    'ecommerce': StubEcommerceService,
+    'catalog': StubCatalogService,
 }
 
 # Log to stdout, including debug messages
@@ -33,7 +39,7 @@ def get_args():
     Exits with a message if arguments are invalid.
     """
     if len(sys.argv) < 3:
-        print USAGE
+        print(USAGE)
         sys.exit(1)
 
     service_name = sys.argv[1]
@@ -41,8 +47,8 @@ def get_args():
     config_dict = _parse_config_args(sys.argv[3:])
 
     if service_name not in SERVICES:
-        print "Unrecognized service '{0}'.  Valid choices are: {1}".format(
-            service_name, ", ".join(SERVICES.keys()))
+        print("Unrecognized service '{0}'.  Valid choices are: {1}".format(
+            service_name, ", ".join(list(SERVICES.keys()))))
         sys.exit(1)
 
     try:
@@ -51,7 +57,7 @@ def get_args():
             raise ValueError
 
     except ValueError:
-        print "Port '{0}' must be a positive integer".format(port_num)
+        print("Port '{0}' must be a positive integer".format(port_num))
         sys.exit(1)
 
     return service_name, port_num, config_dict
@@ -73,8 +79,7 @@ def _parse_config_args(args):
                 config_dict[components[0]] = "=".join(components[1:])
 
         except:
-            print "Warning: could not interpret config value '{0}'".format(config_str)
-            pass
+            print("Warning: could not interpret config value '{0}'".format(config_str))
 
     return config_dict
 
@@ -84,7 +89,7 @@ def main():
     Start a server; shut down on keyboard interrupt signal.
     """
     service_name, port_num, config_dict = get_args()
-    print "Starting stub service '{0}' on port {1}...".format(service_name, port_num)
+    print("Starting stub service '{0}' on port {1}...".format(service_name, port_num))
 
     server = SERVICES[service_name](port_num=port_num)
     server.config.update(config_dict)
@@ -94,7 +99,7 @@ def main():
             time.sleep(1)
 
     except KeyboardInterrupt:
-        print "Stopping stub service..."
+        print("Stopping stub service...")
 
     finally:
         server.shutdown()
